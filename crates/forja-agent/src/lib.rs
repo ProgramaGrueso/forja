@@ -1,4 +1,5 @@
 pub mod agy;
+pub mod claude;
 pub mod mock;
 pub mod runner;
 
@@ -10,6 +11,7 @@ use forja_core::{AgentKind, Result, Task};
 use serde::{Deserialize, Serialize};
 
 pub use agy::{build_command, parse_agy_output, AgyAgent, AgyCommandOptions};
+pub use claude::ClaudeAgent;
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
 pub use runner::{CommandResult, Runner};
 

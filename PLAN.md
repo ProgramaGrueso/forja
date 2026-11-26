@@ -104,5 +104,5 @@ Estructura final:
 ## Opcional (solo si sobran tiempo y saldo, en este orden)
 - [x] X1 Prueba real con agy, marcada #[ignore]: un prompt trivial en un worktree temporal.
       Hecho cuando: `cargo test -p forja-agent -- --ignored agy_real` pasa (máximo 1 intento).
-- [ ] X2 Adaptador Claude como stub que devuelve NotConfigured, con test.
+- [x] X2 Adaptador Claude como stub que devuelve NotConfigured, con test.
 - [ ] X3 Streaming de estado con Server-Sent Events en /events.

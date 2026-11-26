@@ -193,11 +193,21 @@
 - Estado: terminada
 - Hora de inicio / fin: 2026-11-26T00:28:45-05:00 / 2026-11-26T00:29:12-05:00
 - Quién la hizo: agente principal
-- Commits: (en commit X1)
+- Commits: 0967e30 X1: prueba real con agy marcada #[ignore] en forja-agent
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
   `cargo test -p forja-agent -- --ignored agy_real && ./scripts/check.sh` -> exit 0; `agy_real_trivial_prompt_in_temp_worktree ... ok` en 6.42s (1 intento); workspace en verde (1 ignored en ejecución normal).
 - Intentos fallidos (máx. 3): ninguno.
-- Notas para retomar: siguiente opcional X2 (`ClaudeAgent` stub -> `NotConfigured`).
+- Notas para retomar: X2 completada.
+
+### X2 — Adaptador Claude stub (NotConfigured)
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:29:35-05:00 / 2026-11-26T00:29:54-05:00
+- Quién la hizo: agente principal
+- Commits: (en commit X2)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-agent claude && ./scripts/check.sh` -> exit 0; `claude_stub_returns_not_configured ... ok`; workspace: 60 tests en verde (1 ignored).
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: siguiente opcional X3 (SSE en `/events`).
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
