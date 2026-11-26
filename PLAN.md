@@ -31,7 +31,7 @@ Estructura final:
       Task{id,titulo,prompt,privacidad}, Privacy{Open,Sensitive}, AgentKind{Mock,Agy,Claude},
       RunStatus{Pending,Running,Done,Failed,Cancelled}, ForjaError con thiserror. Serde en todo.
       Hecho cuando: `cargo test -p forja-core` pasa con >=6 tests (ida y vuelta serde, Display de errores).
-- [ ] T03 forja-core: política de privacidad (30 min)
+- [x] T03 forja-core: política de privacidad (30 min)
       fn allowed_agents(Privacy)->Vec<AgentKind>: Sensitive => solo Claude; Open => Agy, Mock, Claude.
       Hecho cuando: `cargo test -p forja-core policy` pasa, con un test que prueba que Sensitive nunca devuelve Agy.
 

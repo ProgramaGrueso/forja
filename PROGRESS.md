@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T02 — forja-core: tipos y errores
-- Tarea en curso: T03 — forja-core: política de privacidad
+- Última tarea cerrada: T03 — forja-core: política de privacidad
+- Tarea en curso: T04 (forja-git) y T06 (forja-agent) en paralelo vía subagentes
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -24,20 +24,39 @@
 - Estado: terminada
 - Hora de inicio / fin: 2026-11-25T23:58:35-05:00 / 2026-11-25T23:59:42-05:00
 - Quién la hizo: agente principal
-- Commits: (en commit T02)
+- Commits: 77b85ae T02: tipos de dominio y ForjaError en forja-core
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
   `cargo test -p forja-core && ./scripts/check.sh` -> exit 0; `forja-core`: `test result: ok. 7 passed; 0 failed; 0 ignored`; workspace completo en verde.
 - Intentos fallidos (máx. 3): ninguno (solo `cargo fmt` inicial).
 - Notas para retomar: Task, Privacy, AgentKind, RunStatus, RunRecord y ForjaError definidos y exportados.
 
 ### T03 — forja-core: política de privacidad
-- Estado: en curso
-- Hora de inicio / fin: 2026-11-25T23:59:45-05:00 /
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-25T23:59:45-05:00 / 2026-11-26T00:00:16-05:00
 - Quién la hizo: agente principal
+- Commits: (en commit T03)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-core policy && ./scripts/check.sh` -> exit 0; `policy`: `test result: ok. 4 passed; 0 failed; 0 ignored`; `forja-core`: `11 passed`; workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: Fase 0 cerrada. Arranca Fase 1 delegando T04 y T06 en paralelo.
+
+### T04 — forja-git: crear worktree
+- Estado: en curso
+- Hora de inicio / fin: 2026-11-26T00:00:30-05:00 /
+- Quién la hizo: subagente noche/forja-T04
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: implementar allowed_agents(Privacy)->Vec<AgentKind> y check_policy(Privacy, AgentKind)->Result<()>.
+- Notas para retomar: worktree ../forja-wt-T04.
+
+### T06 — forja-agent: trait Agent y MockAgent
+- Estado: en curso
+- Hora de inicio / fin: 2026-11-26T00:00:30-05:00 /
+- Quién la hizo: subagente noche/forja-T06
+- Commits:
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+- Intentos fallidos (máx. 3):
+- Notas para retomar: worktree ../forja-wt-T06.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)

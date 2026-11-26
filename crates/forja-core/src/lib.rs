@@ -1,7 +1,9 @@
 pub mod error;
+pub mod policy;
 pub mod types;
 
 pub use error::{ForjaError, Result};
+pub use policy::{allowed_agents, check_policy, is_agent_allowed};
 pub use types::{AgentKind, Privacy, RunRecord, RunStatus, Task};
 
 #[cfg(test)]
