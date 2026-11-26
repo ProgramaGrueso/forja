@@ -331,4 +331,30 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(out.warnings.is_empty());
     }
+
+    #[tokio::test]
+    #[ignore = "requiere binario agy real y cuota activa"]
+    async fn agy_real_trivial_prompt_in_temp_worktree() {
+        use forja_core::{Privacy, Task};
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let agent = AgyAgent::new("gemini-4-neon-low", "auto");
+        let ctx = RunContext {
+            task: Task::new(
+                "X1 agy real",
+                "Responde únicamente con la palabra OK y no ejecutes ninguna herramienta.",
+                Privacy::Open,
+            ),
+            worktree: dir.path().to_path_buf(),
+            timeout_secs: 90,
+        };
+
+        let out = agent.run(&ctx).await.expect("agy real debe responder");
+        assert_eq!(out.exit_code, Some(0));
+        assert!(
+            !out.text.trim().is_empty(),
+            "la respuesta de agy real no debe estar vacía"
+        );
+    }
 }

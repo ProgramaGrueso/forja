@@ -187,7 +187,17 @@
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: auditar TODO/unwrap/expect fuera de tests y compilar release.
+- Notas para retomar: `cargo build --workspace --release` ok (9.88s), 0 TODO/unimplemented!/unwrap/expect fuera de tests. Cerrando opcionales X1–X3 antes del REPORTE.md final.
+
+### X1 — Prueba real con agy (#[ignore])
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:28:45-05:00 / 2026-11-26T00:29:12-05:00
+- Quién la hizo: agente principal
+- Commits: (en commit X1)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-agent -- --ignored agy_real && ./scripts/check.sh` -> exit 0; `agy_real_trivial_prompt_in_temp_worktree ... ok` en 6.42s (1 intento); workspace en verde (1 ignored en ejecución normal).
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: siguiente opcional X2 (`ClaudeAgent` stub -> `NotConfigured`).
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
