@@ -6,3 +6,15 @@ edition.workspace = true
 [[bin]]
 name = "forja"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+forja-agent = { path = "../forja-agent" }
+forja-core = { path = "../forja-core" }
+forja-sched = { path = "../forja-sched" }
+forja-server = { path = "../forja-server" }
+forja-store = { path = "../forja-store" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
