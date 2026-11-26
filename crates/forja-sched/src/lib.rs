@@ -29,8 +29,8 @@ impl SchedulerConfig {
             worktrees_dir: worktrees_dir.into(),
             repo_path: None,
             base_branch: "main".to_string(),
-            max_retries: 0,
-            retry_backoff: Duration::from_millis(50),
+            max_retries: 2,
+            retry_backoff: Duration::from_millis(20),
         }
     }
 }
@@ -80,6 +80,8 @@ impl Scheduler {
     }
 
     pub async fn submit(&self, task: Task, agent: Arc<dyn Agent>) -> Result<RunRecord> {
+        forja_core::check_policy(task.privacidad, agent.kind())?;
+
         let now = now_ms();
         let run_id = Uuid::new_v4().to_string();
         let record = RunRecord {
@@ -221,7 +223,7 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
                 return;
             }
             record.status = RunStatus::Running;
-            record.attempts = record.attempts.saturating_add(1);
+            record.attempts = 1;
             record.branch = branch.clone();
             record.worktree = Some(wt_path.to_string_lossy().into_owned());
             record.updated_at_ms = now_ms();
@@ -232,7 +234,7 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
     };
 
     let execution_result =
-        execute_in_worktree(&inner, &task, &agent, &wt_path, branch.as_deref()).await;
+        execute_with_retries(&inner, &run_id, &task, &agent, &wt_path, branch.as_deref()).await;
 
     {
         let _store_guard = inner.store_lock.lock().await;
@@ -265,13 +267,11 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
     handles.remove(&run_id);
 }
 
-async fn execute_in_worktree(
+async fn prepare_worktree(
     inner: &SchedulerInner,
-    task: &Task,
-    agent: &Arc<dyn Agent>,
     wt_path: &Path,
     branch: Option<&str>,
-) -> Result<String> {
+) -> Result<()> {
     if let (Some(repo), Some(branch_name)) = (inner.config.repo_path.as_ref(), branch) {
         tokio::fs::create_dir_all(&inner.config.worktrees_dir).await?;
 
@@ -290,13 +290,55 @@ async fn execute_in_worktree(
         tokio::fs::create_dir_all(wt_path).await?;
     }
 
+    Ok(())
+}
+
+async fn execute_with_retries(
+    inner: &SchedulerInner,
+    run_id: &str,
+    task: &Task,
+    agent: &Arc<dyn Agent>,
+    wt_path: &Path,
+    branch: Option<&str>,
+) -> Result<String> {
+    prepare_worktree(inner, wt_path, branch).await?;
+
     let ctx = RunContext {
         task: task.clone(),
         worktree: wt_path.to_path_buf(),
         timeout_secs: inner.config.timeout_secs,
     };
 
-    let agent_output = agent.run(&ctx).await?;
+    let mut attempt: u32 = 1;
+    let agent_output = loop {
+        match agent.run(&ctx).await {
+            Ok(output) => break output,
+            Err(err) => {
+                if attempt <= inner.config.max_retries {
+                    tokio::time::sleep(inner.config.retry_backoff).await;
+                    attempt = attempt.saturating_add(1);
+
+                    let _store_guard = inner.store_lock.lock().await;
+                    let maybe_record = {
+                        let mut runs = inner.runs.write().await;
+                        let Some(record) = runs.get_mut(run_id) else {
+                            return Err(err);
+                        };
+                        if record.status == RunStatus::Cancelled {
+                            return Err(err);
+                        }
+                        record.attempts = attempt;
+                        record.error = Some(err.to_string());
+                        record.updated_at_ms = now_ms();
+                        record.clone()
+                    };
+                    let _ = inner.store.append_run(&maybe_record);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    };
 
     if inner.config.repo_path.is_some() {
         let wt_owned = wt_path.to_path_buf();
@@ -326,11 +368,11 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use forja_agent::{Agent, AgentFuture, AgentOutput, MockAgent, RunContext};
+    use forja_agent::{Agent, AgentFuture, AgentOutput, AgyAgent, MockAgent, RunContext};
     use forja_core::{AgentKind, ForjaError, Privacy, RunStatus, Task};
     use forja_store::JsonlStore;
     use tempfile::TempDir;
@@ -572,6 +614,166 @@ mod tests {
             .expect("get_run")
             .expect("debe existir en store");
         assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(stored.error, finished.error);
+    }
+
+    struct FlakyAgent {
+        calls: AtomicU32,
+        fail_times: u32,
+    }
+
+    impl FlakyAgent {
+        fn new(fail_times: u32) -> Self {
+            Self {
+                calls: AtomicU32::new(0),
+                fail_times,
+            }
+        }
+    }
+
+    impl Agent for FlakyAgent {
+        fn kind(&self) -> AgentKind {
+            AgentKind::Mock
+        }
+
+        fn run<'a>(&'a self, _ctx: &'a RunContext) -> AgentFuture<'a> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail_times = self.fail_times;
+
+            Box::pin(async move {
+                if attempt <= fail_times {
+                    Err(ForjaError::Agent(format!("fallo en intento {attempt}")))
+                } else {
+                    Ok(AgentOutput {
+                        text: format!("exito en intento {attempt}"),
+                        raw_stdout: format!("exito en intento {attempt}"),
+                        raw_stderr: String::new(),
+                        exit_code: Some(0),
+                        warnings: Vec::new(),
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denies_sensitive_with_agy_without_creating_worktree() {
+        let repo_dir = init_temp_repo();
+        let store_dir = TempDir::new().expect("crear store tempdir");
+        let wt_dir = TempDir::new().expect("crear worktrees tempdir");
+        let store = JsonlStore::new(store_dir.path()).expect("crear JsonlStore");
+
+        let mut config = SchedulerConfig::new(wt_dir.path());
+        config.repo_path = Some(repo_dir.path().to_path_buf());
+        config.base_branch = "main".to_string();
+
+        let scheduler = Scheduler::new(store.clone(), config).expect("crear Scheduler");
+        let agent: Arc<dyn Agent> = Arc::new(AgyAgent::default());
+        let task = Task::new("Dato confidencial", "Procesar secreto", Privacy::Sensitive);
+
+        let err = scheduler
+            .submit(task, agent)
+            .await
+            .expect_err("submit debe rechazar Sensitive + Agy");
+
+        assert!(
+            matches!(
+                err,
+                ForjaError::PolicyDenied {
+                    privacy: Privacy::Sensitive,
+                    agent: AgentKind::Agy
+                }
+            ),
+            "error inesperado: {err:?}"
+        );
+
+        assert!(
+            fs::read_dir(wt_dir.path())
+                .expect("leer worktrees_dir")
+                .next()
+                .is_none(),
+            "worktrees_dir debe permanecer vacío tras rechazo de política"
+        );
+
+        let branches_output = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["branch", "--list", "forja/*"])
+            .output()
+            .expect("listar ramas git");
+        assert!(branches_output.status.success());
+        assert!(
+            String::from_utf8_lossy(&branches_output.stdout)
+                .trim()
+                .is_empty(),
+            "no debe haberse creado ninguna rama forja/*"
+        );
+
+        assert!(scheduler.list_runs().await.is_empty());
+        assert!(store.list_runs().expect("listar store").is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_third_attempt() {
+        let store_dir = TempDir::new().expect("crear store tempdir");
+        let wt_dir = TempDir::new().expect("crear worktrees tempdir");
+        let store = JsonlStore::new(store_dir.path()).expect("crear JsonlStore");
+
+        let mut config = SchedulerConfig::new(wt_dir.path());
+        config.max_retries = 2;
+        config.retry_backoff = Duration::from_millis(10);
+
+        let scheduler = Scheduler::new(store.clone(), config).expect("crear Scheduler");
+        let agent: Arc<dyn Agent> = Arc::new(FlakyAgent::new(2));
+        let task = Task::new("Tarea inestable", "Reintentar hasta éxito", Privacy::Open);
+
+        let submitted = scheduler.submit(task, agent).await.expect("submit");
+        let finished = scheduler.wait_run(&submitted.id).await.expect("wait_run");
+
+        assert_eq!(finished.status, RunStatus::Done);
+        assert_eq!(finished.attempts, 3);
+        assert_eq!(finished.output.as_deref(), Some("exito en intento 3"));
+        assert!(finished.error.is_none());
+
+        let stored = store
+            .get_run(&submitted.id)
+            .expect("get_run")
+            .expect("run en store");
+        assert_eq!(stored.status, RunStatus::Done);
+        assert_eq!(stored.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_marks_failed() {
+        let store_dir = TempDir::new().expect("crear store tempdir");
+        let wt_dir = TempDir::new().expect("crear worktrees tempdir");
+        let store = JsonlStore::new(store_dir.path()).expect("crear JsonlStore");
+
+        let mut config = SchedulerConfig::new(wt_dir.path());
+        config.max_retries = 2;
+        config.retry_backoff = Duration::from_millis(10);
+
+        let scheduler = Scheduler::new(store.clone(), config).expect("crear Scheduler");
+        let agent: Arc<dyn Agent> = Arc::new(FlakyAgent::new(u32::MAX));
+        let task = Task::new("Tarea siempre fallida", "Falla siempre", Privacy::Open);
+
+        let submitted = scheduler.submit(task, agent).await.expect("submit");
+        let finished = scheduler.wait_run(&submitted.id).await.expect("wait_run");
+
+        assert_eq!(finished.status, RunStatus::Failed);
+        assert_eq!(finished.attempts, 3);
+        assert!(finished
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fallo en intento 3"));
+
+        let stored = store
+            .get_run(&submitted.id)
+            .expect("get_run")
+            .expect("run en store");
+        assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(stored.attempts, 3);
         assert_eq!(stored.error, finished.error);
     }
 }
