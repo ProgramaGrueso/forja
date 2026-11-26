@@ -47,15 +47,72 @@ pub fn effort_levels(kind: AgentKind) -> &'static [&'static str] {
     }
 }
 
-/// Valida y normaliza (trim + minúsculas) un esfuerzo para la familia `kind`, con
-/// su propio conjunto de valores.
+/// Traduce alias en español y etiquetas del panel (p. ej. "alto", "Muy alto", "Máx")
+/// al valor canónico (`high`, `xhigh`, `max`...). Lo que no es alias se devuelve
+/// recortado y en minúsculas, sin más cambios.
+pub fn normalize_effort_alias(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    let key: String = lower
+        .chars()
+        .map(|c| match c {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            'ú' => 'u',
+            '_' | '-' => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let canonical = match key.as_str() {
+        "minimo" | "minima" => "minimal",
+        "bajo" | "baja" => "low",
+        "med" | "medio" | "media" => "medium",
+        "alto" | "alta" => "high",
+        "muy alto" | "muy alta" | "muyalto" | "extra alto" => "xhigh",
+        "max" | "maximo" | "maxima" => "max",
+        "ninguno" | "ninguna" => "none",
+        _ => return lower,
+    };
+    canonical.to_string()
+}
+
+/// Etiqueta en español de un valor canónico (para mensajes de error).
+fn effort_label_es(level: &str) -> &'static str {
+    match level {
+        "none" => "ninguno",
+        "minimal" => "mínimo",
+        "low" => "bajo",
+        "medium" => "medio",
+        "high" => "alto",
+        "xhigh" => "muy alto",
+        "max" => "máximo",
+        "ultra" => "ultra",
+        _ => "",
+    }
+}
+
+/// Lista de valores válidos de la familia, con su nombre en español.
+pub fn effort_levels_es(kind: AgentKind) -> String {
+    effort_levels(kind)
+        .iter()
+        .map(|l| format!("{l} ({})", effort_label_es(l)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Valida y normaliza un esfuerzo para la familia `kind` (alias en español incluidos),
+/// con su propio conjunto de valores. Devuelve siempre el valor canónico.
 pub fn validate_effort(kind: AgentKind, raw: &str) -> Result<String> {
     if !EFFORT_AGENTS.contains(&kind) {
         return Err(ForjaError::InvalidInput(format!(
             "el agente {kind} no admite esfuerzo de razonamiento"
         )));
     }
-    let effort = raw.trim().to_lowercase();
+    let effort = normalize_effort_alias(raw);
     if effort.is_empty() {
         return Err(ForjaError::InvalidInput(
             "el esfuerzo no puede estar vacío".to_string(),
@@ -73,8 +130,9 @@ pub fn validate_effort(kind: AgentKind, raw: &str) -> Result<String> {
         }
     } else if !effort_levels(kind).contains(&effort.as_str()) {
         return Err(ForjaError::InvalidInput(format!(
-            "esfuerzo \"{effort}\" no válido para {kind} (usa {})",
-            effort_levels(kind).join(", ")
+            "esfuerzo \"{}\" no válido para {kind} (usa {})",
+            raw.trim(),
+            effort_levels_es(kind)
         )));
     }
     Ok(effort)
@@ -90,7 +148,7 @@ pub fn resolve_effort(
     if !EFFORT_AGENTS.contains(&kind) {
         return None;
     }
-    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_lowercase());
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| normalize_effort_alias(s));
     task_override.and_then(nonblank).or_else(|| {
         settings
             .get(&kind.to_string())
@@ -292,6 +350,56 @@ mod tests {
         assert!(effort_levels(AgentKind::Local).is_empty());
         assert!(effort_levels(AgentKind::Mock).is_empty());
         assert_eq!(effort_levels(AgentKind::Hermes).len(), 8);
+    }
+
+    #[test]
+    fn spanish_effort_aliases_normalize_for_every_family() {
+        for (raw, canon) in [
+            ("alto", "high"),
+            (" Alto ", "high"),
+            ("bajo", "low"),
+            ("Med", "medium"),
+            ("medio", "medium"),
+            ("Muy alto", "xhigh"),
+            ("muy_alto", "xhigh"),
+            ("Máx", "max"),
+            ("máximo", "max"),
+            ("maximo", "max"),
+        ] {
+            for k in [AgentKind::Claude, AgentKind::Agy, AgentKind::Hermes] {
+                assert_eq!(validate_effort(k, raw).unwrap(), canon, "{raw} {k}");
+            }
+            assert_eq!(validate_effort(AgentKind::Opencode, raw).unwrap(), canon);
+        }
+        assert_eq!(
+            validate_effort(AgentKind::Hermes, "Mínimo").unwrap(),
+            "minimal"
+        );
+        assert_eq!(
+            validate_effort(AgentKind::Hermes, "minimo").unwrap(),
+            "minimal"
+        );
+        assert_eq!(
+            validate_effort(AgentKind::Hermes, "Ninguno").unwrap(),
+            "none"
+        );
+        // No válido para la familia: error con la lista en español.
+        let e = validate_effort(AgentKind::Claude, "ninguno")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("low (bajo)") && e.contains("xhigh (muy alto)"),
+            "{e}"
+        );
+        assert!(validate_effort(AgentKind::Agy, "mínimo").is_err());
+        assert_eq!(
+            resolve_effort(AgentKind::Claude, Some("alto"), &map(&[])).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            resolve_effort(AgentKind::Claude, None, &map(&[("claude", "Muy alto")])).as_deref(),
+            Some("xhigh")
+        );
     }
 
     #[test]

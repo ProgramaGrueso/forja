@@ -195,8 +195,35 @@ impl Agent for OpencodeAgent {
             let mut argv = build_command(&opts);
             argv[0] = self.program.clone();
 
-            match Runner::run_argv(&argv, &ctx.worktree, ctx.timeout_secs).await {
-                Ok(res) => Ok(parse_opencode_output(&res.stdout, &res.stderr, res.exit_code)),
+            let mut result = Runner::run_argv(&argv, &ctx.worktree, ctx.timeout_secs).await;
+            let mut dropped_variant = false;
+            // No todos los modelos tienen variantes: si opencode lo dice, se reintenta
+            // UNA vez sin la variante (dentro del adaptador, no cuenta como intento).
+            if let Err(ForjaError::Agent(msg)) = &result {
+                if msg.contains("Variant unavailable") && argv[3].contains('#') {
+                    let note = format!("{}\n", crate::EFFORT_NOT_APPLIED_WARNING);
+                    crate::emit_to_sink(crate::OutputStream::Stderr, &note);
+                    argv[3] = argv[3].split('#').next().unwrap_or(&argv[3]).to_string();
+                    dropped_variant = true;
+                    result = Runner::run_argv(&argv, &ctx.worktree, ctx.timeout_secs).await;
+                }
+            }
+
+            match result {
+                Ok(res) => {
+                    let mut out = parse_opencode_output(&res.stdout, &res.stderr, res.exit_code);
+                    if dropped_variant {
+                        out.warnings
+                            .push(crate::EFFORT_NOT_APPLIED_WARNING.to_string());
+                        out.raw_stderr = format!(
+                            "{}\n{}",
+                            crate::EFFORT_NOT_APPLIED_WARNING,
+                            out.raw_stderr
+                        );
+                        out.text = format!("({})\n{}", crate::EFFORT_NOT_APPLIED_WARNING, out.text);
+                    }
+                    Ok(out)
+                }
                 Err(ForjaError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                     Err(ForjaError::Agent(format!(
                         "no se encontró el programa '{}'; verificá que OpenCode esté instalado y en el PATH",
@@ -403,6 +430,47 @@ mod tests {
             }
             other => panic!("esperaba ForjaError::Agent, obtuve: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn opencode_variant_unavailable_retries_once_without_variant() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("fake_opencode_record"), "").unwrap();
+        std::fs::write(dir.path().join("fake_opencode_no_variants"), "").unwrap();
+        let agent = OpencodeAgent::default()
+            .with_program(fake_opencode_path())
+            .with_effort("high");
+        let ctx = ctx_with_prompt(dir.path(), "p", 5);
+        let out = agent
+            .run(&ctx)
+            .await
+            .expect("el reintento sin variante debe pasar");
+        assert!(out.text.contains("se ejecutó sin variante"), "{}", out.text);
+        assert!(out.text.contains("trabajo listo"));
+        assert!(out
+            .warnings
+            .contains(&crate::EFFORT_NOT_APPLIED_WARNING.to_string()));
+        let recorded = std::fs::read_to_string(dir.path().join("fake_opencode_args")).unwrap();
+        let args: Vec<&str> = recorded.split('\0').filter(|a| !a.is_empty()).collect();
+        assert!(
+            args.contains(&"opencode-go/deepseek-v4.1-flash"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains('#')), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn opencode_variant_error_without_variant_is_not_retried() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("fake_opencode_stderr"),
+            "Error: Variant unavailable for x: y\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("fake_opencode_exit"), "1\n").unwrap();
+        let agent = OpencodeAgent::default().with_program(fake_opencode_path());
+        let ctx = ctx_with_prompt(dir.path(), "p", 5);
+        assert!(agent.run(&ctx).await.is_err());
     }
 
     #[tokio::test]

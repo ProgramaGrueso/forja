@@ -25,4 +25,9 @@ esac
 echo
 echo "Listo. Prueba:"
 echo "  forja doctor        # revisa tu entorno"
-echo "  cd tu-repo && forja serve --open"
+echo
+echo "Cómo ejecutarlo:"
+echo "  Terminal:      cd tu-repo && forja serve --open"
+echo "  Lanzador:      forja init --desktop   # luego busca 'Forja' en el lanzador de aplicaciones"
+echo "  Como app:      forja app              # arranca en segundo plano y abre el panel"
+echo "                 forja app --status | --stop"

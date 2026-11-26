@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod app;
 mod friendly;
 pub mod init;
 
@@ -93,7 +94,37 @@ pub enum Command {
         /// No pregunta nada: acepta los valores por defecto.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Instala también el lanzador de escritorio (`forja.desktop` + icono).
+        #[arg(long)]
+        desktop: bool,
     },
+
+    /// Abre Forja como app: arranca el panel en segundo plano (si no está ya) y lo
+    /// abre en el navegador. Config en `app.json`, estado y log en el directorio de estado.
+    App {
+        /// Detiene el Forja lanzado por `forja app`.
+        #[arg(long, conflicts_with = "status")]
+        stop: bool,
+
+        /// Dice si está en marcha.
+        #[arg(long)]
+        status: bool,
+    },
+
+    /// Lanzador de escritorio (`~/.local/share/applications/forja.desktop`).
+    Desktop {
+        #[command(subcommand)]
+        action: DesktopAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum DesktopAction {
+    /// Escribe el `.desktop` y copia el icono.
+    Install,
+    /// Quita el `.desktop` y el icono.
+    Uninstall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -258,16 +289,41 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             }
             Ok(())
         }
-        Command::Init { yes } => {
+        Command::Init { yes, desktop } => {
             let stdin = std::io::stdin();
+            let mut input = stdin.lock();
             init::run_init(
-                &mut stdin.lock(),
+                &mut input,
                 out,
                 &cli.store_dir,
                 yes,
                 &init::InitEnv::detect(),
             )?;
-            Ok(())
+            app::init_app_steps(
+                &mut input,
+                out,
+                &app::AppEnv::detect()?,
+                yes,
+                desktop,
+                friendly::detect_repo(),
+            )
+        }
+        Command::App { stop, status } => {
+            let env = app::AppEnv::detect()?;
+            if stop {
+                app::app_stop(&env, out)
+            } else if status {
+                app::app_status(&env, out).map(|_| ())
+            } else {
+                app::app_start(&env, out, cli.repo.clone().or_else(friendly::detect_repo))
+            }
+        }
+        Command::Desktop { action } => {
+            let env = app::AppEnv::detect()?;
+            match action {
+                DesktopAction::Install => app::desktop_install(&env, out),
+                DesktopAction::Uninstall => app::desktop_uninstall(&env, out),
+            }
         }
         Command::Serve {
             port,
@@ -530,9 +586,9 @@ mod tests {
     #[test]
     fn parse_init_and_doctor_fix() {
         let cli = Cli::try_parse_from(["forja", "init", "--yes"]).expect("init --yes");
-        assert!(matches!(cli.command, Command::Init { yes: true }));
+        assert!(matches!(cli.command, Command::Init { yes: true, .. }));
         let cli = Cli::try_parse_from(["forja", "init"]).expect("init");
-        assert!(matches!(cli.command, Command::Init { yes: false }));
+        assert!(matches!(cli.command, Command::Init { yes: false, .. }));
         let cli = Cli::try_parse_from(["forja", "doctor", "--fix"]).expect("doctor --fix");
         assert!(matches!(cli.command, Command::Doctor { fix: true, .. }));
         let cli = Cli::try_parse_from(["forja", "doctor"]).expect("doctor");

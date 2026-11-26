@@ -218,6 +218,7 @@ dependencies = [
  "forja-sched",
  "forja-server",
  "forja-store",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

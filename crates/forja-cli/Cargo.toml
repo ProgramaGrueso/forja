@@ -14,6 +14,7 @@ forja-core = { path = "../forja-core" }
 forja-sched = { path = "../forja-sched" }
 forja-server = { path = "../forja-server" }
 forja-store = { path = "../forja-store" }
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]

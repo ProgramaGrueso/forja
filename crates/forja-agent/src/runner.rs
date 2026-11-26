@@ -44,6 +44,13 @@ pub async fn with_output_sink<F: std::future::Future>(sink: OutputSink, fut: F) 
     CURRENT_SINK.scope(sink, fut).await
 }
 
+/// Emite una línea al sink activo (si lo hay); para avisos propios del adaptador.
+pub fn emit_to_sink(stream: OutputStream, text: &str) {
+    if let Ok(sink) = CURRENT_SINK.try_with(Arc::clone) {
+        sink(stream, text.to_string());
+    }
+}
+
 async fn pump<R: AsyncRead + Unpin>(
     reader: R,
     stream: OutputStream,

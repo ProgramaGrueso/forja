@@ -21,10 +21,32 @@ forja run --agent mock --privacy open "Crear archivo de prueba"
 
 Sin instalar, desde el repo de Forja: `cargo run -p forja-cli -- doctor`.
 
+### Ejecutar como app
+
+Dos formas de abrir Forja sin dejar una terminal ocupada:
+
+- **Carpeta en terminal**: `cd tu-repo && forja serve --open` (Forja detecta el repo y su rama; Ctrl+C para salir).
+- **Lanzador de aplicaciones**: `forja init --desktop` (o `forja desktop install`) crea `~/.local/share/applications/forja.desktop` y copia el icono a `~/.local/share/icons/forja.webp`. Después busca **Forja** en el lanzador. `forja desktop uninstall` los quita. El lanzador ejecuta `forja app`, que también puedes usar desde la terminal.
+
+`forja app` arranca `forja serve --repo <repo> --port <puerto>` en segundo plano solo si ese puerto no responde ya en `/api/health` (no duplica el servidor), espera a que conteste y abre el panel con `xdg-open`. `forja app --status` dice si está en marcha y `forja app --stop` lo detiene (solo mata el pid guardado si de verdad es un proceso `forja`). Si no hay repo configurado usa el repo git del directorio actual; fuera de uno te pide ejecutar `forja init`, que pregunta (o con `--yes` acepta) el repo por defecto de la app.
+
+Dónde se guarda cada cosa (respeta `XDG_*` si están definidas):
+
+| Qué | Ruta |
+|---|---|
+| Config de la app (`{"repo": "...", "port": 7777}`) | `$XDG_CONFIG_HOME/forja/app.json` o `~/.config/forja/app.json` |
+| PID de `forja app` | `$XDG_STATE_HOME/forja/app.pid` o `~/.local/state/forja/app.pid` |
+| Log del servidor | `$XDG_STATE_HOME/forja/forja.log` o `~/.local/state/forja/forja.log` |
+| Lanzador e icono | `~/.local/share/applications/forja.desktop`, `~/.local/share/icons/forja.webp` |
+| Ajustes del orquestador / historial | `.forja/store/` dentro del repo (ver `--store-dir`) |
+
+El esfuerzo de razonamiento acepta alias en español (`alto`, `muy alto`, `máx`, `mínimo`...) y se guarda siempre como valor canónico (`high`, `xhigh`, `max`, `minimal`...). En opencode, si el modelo no tiene esa variante, la tarea se reintenta una vez sin ella y el registro queda sin esfuerzo.
+
 ### Qué hace cada comando
 
 - `forja doctor`: diagnostica tu entorno y te dice qué falta (si no hay `settings.json`, te sugiere `forja init`; con `--fix` lanza el asistente al terminar).
-- `forja init [--yes]`: asistente de primer arranque, ver [Configuración inicial](#configuración-inicial-forja-init).
+- `forja app [--stop|--status]` y `forja desktop install|uninstall`: ver [Ejecutar como app](#ejecutar-como-app).
+- `forja init [--yes] [--desktop]`: asistente de primer arranque, ver [Configuración inicial](#configuración-inicial-forja-init).
 - `forja serve --open`: levanta el panel web local (solo accesible desde tu máquina).
 - `forja run --agent AGENTE --privacy open|sensitive "tu tarea"`: ejecuta una tarea y muestra el resultado.
 - `forja list`: historial de ejecuciones.

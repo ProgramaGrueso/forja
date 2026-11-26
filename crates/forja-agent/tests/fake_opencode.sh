@@ -13,6 +13,16 @@ if [[ -f ./fake_opencode_record ]]; then
   done
 fi
 
+# Modo "sin variantes": falla como opencode real si el modelo lleva `#variante`.
+if [[ -f ./fake_opencode_no_variants || -n "${FAKE_OPENCODE_NO_VARIANTS:-}" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == */*#* ]]; then
+      printf 'Error: Variant unavailable for %s: %s\n' "${arg%%#*}" "${arg#*#}" >&2
+      exit 1
+    fi
+  done
+fi
+
 sleep_for="${FAKE_OPENCODE_SLEEP:-}"
 if [[ -z "${sleep_for}" && -f ./fake_opencode_sleep ]]; then
   sleep_for="$(cat ./fake_opencode_sleep)"

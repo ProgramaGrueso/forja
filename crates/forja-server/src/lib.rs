@@ -216,7 +216,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .agent_effort
             .get(&kind.to_string())
-            .map(|e| e.trim().to_lowercase())
+            .map(|e| forja_agent::normalize_effort_alias(e))
             .filter(|e| !e.is_empty());
         let explicit_task = task_effort.is_some();
         match task_effort.or(from_settings) {
@@ -359,6 +359,15 @@ const MASCOT_FILES: [(&str, &[u8]); 5] = [
         include_bytes!("../assets/mascot/worried.webp"),
     ),
 ];
+
+/// Bytes de un sprite de la mascota embebido (p. ej. `idle.webp`), para el icono
+/// del lanzador de escritorio.
+pub fn mascot_bytes(name: &str) -> Option<&'static [u8]> {
+    MASCOT_FILES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, bytes)| *bytes)
+}
 
 async fn mascot_handler(Path(name): Path<String>) -> Response {
     match MASCOT_FILES.iter().find(|(n, _)| *n == name) {

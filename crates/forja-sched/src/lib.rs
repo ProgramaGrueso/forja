@@ -544,7 +544,29 @@ async fn execute_with_retries(
             }
         }
         match result {
-            Ok(output) => break output,
+            Ok(output) => {
+                if output
+                    .warnings
+                    .iter()
+                    .any(|w| w == forja_agent::EFFORT_NOT_APPLIED_WARNING)
+                {
+                    // El esfuerzo no se aplicó: el registro no debe mentir.
+                    let _store_guard = inner.store_lock.lock().await;
+                    let updated = {
+                        let mut runs = inner.runs.write().await;
+                        runs.get_mut(run_id).map(|r| {
+                            r.effort = None;
+                            r.updated_at_ms = now_ms();
+                            r.clone()
+                        })
+                    };
+                    if let Some(rec) = updated {
+                        let _ = inner.store.append_run(&rec);
+                        let _ = inner.events.send(rec);
+                    }
+                }
+                break output;
+            }
             Err(err) => {
                 if attempt <= inner.config.max_retries {
                     tokio::time::sleep(inner.config.retry_backoff).await;
@@ -974,6 +996,33 @@ mod tests {
             .expect("run en store");
         assert_eq!(stored.status, RunStatus::Done);
         assert_eq!(stored.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn opencode_variant_fallback_is_not_a_failed_attempt_and_clears_effort() {
+        let store_dir = TempDir::new().expect("store");
+        let wt_dir = TempDir::new().expect("wt");
+        let store = JsonlStore::new(store_dir.path()).expect("JsonlStore");
+        let scheduler =
+            Scheduler::new(store, SchedulerConfig::new(wt_dir.path())).expect("Scheduler");
+        std::env::set_var("FAKE_OPENCODE_NO_VARIANTS", "1");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../forja-agent/tests/fake_opencode.sh");
+        let agent: Arc<dyn Agent> = Arc::new(
+            forja_agent::OpencodeAgent::default()
+                .with_program(script.to_string_lossy())
+                .with_effort("high"),
+        );
+        let task = Task::new("t", "p", Privacy::Open);
+        let submitted = scheduler.submit(task, agent).await.expect("submit");
+        assert_eq!(submitted.effort.as_deref(), Some("high"));
+        let finished = scheduler.wait_run(&submitted.id).await.expect("wait");
+        std::env::remove_var("FAKE_OPENCODE_NO_VARIANTS");
+        assert_eq!(finished.status, RunStatus::Done, "{:?}", finished.error);
+        assert_eq!(finished.attempts, 1);
+        assert_eq!(finished.effort, None);
+        let out = finished.output.unwrap();
+        assert!(out.contains("se ejecutó sin variante"), "{out}");
     }
 
     #[tokio::test]

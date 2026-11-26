@@ -146,7 +146,12 @@ impl Settings {
             .collect();
         self.agent_effort = std::mem::take(&mut self.agent_effort)
             .into_iter()
-            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_lowercase()))
+            .map(|(k, v)| {
+                (
+                    k.trim().to_lowercase(),
+                    forja_agent::normalize_effort_alias(&v),
+                )
+            })
             .filter(|(_, v)| !v.is_empty())
             .collect();
         self.orchestrator_profile = self

@@ -977,7 +977,16 @@ mod tests {
         );
         let (st, _) = post_task(app.clone(), task("mock", Some("high"))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
-        let (st, _) = post_task(app, task("claude", Some("  "))).await;
+        // Alias en español → valor canónico en el registro.
+        let (st, r) = post_task(app.clone(), task("claude", Some("Muy alto"))).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        assert_eq!(r["effort"], "xhigh");
+        let (_, r) = post_task(app.clone(), task("opencode", Some("alto"))).await;
+        assert_eq!(r["effort"], "high");
+        let (st, r) = post_task(app.clone(), task("claude", Some("ninguno"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(r["error"].as_str().unwrap().contains("low (bajo)"), "{r}");
+        let (st, _) = post_task(app.clone(), task("claude", Some("  "))).await;
         assert_eq!(st, StatusCode::CREATED);
     }
 

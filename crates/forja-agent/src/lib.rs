@@ -21,14 +21,15 @@ pub use hermes::HermesAgent;
 pub use local::{build_command as build_local_command, LocalAgent, LocalCommandOptions};
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
 pub use models::{
-    build_agent, default_model, effort_levels, opencode_model_with_effort, resolve_effort,
-    resolve_model, validate_effort, validate_model, EFFORT_AGENTS, MODEL_AGENTS,
+    build_agent, default_model, effort_levels, effort_levels_es, normalize_effort_alias,
+    opencode_model_with_effort, resolve_effort, resolve_model, validate_effort, validate_model,
+    EFFORT_AGENTS, MODEL_AGENTS,
 };
 pub use opencode::{
     build_command as build_opencode_command, parse_opencode_output, OpencodeAgent,
     OpencodeCommandOptions,
 };
-pub use runner::{with_output_sink, CommandResult, OutputSink, OutputStream, Runner};
+pub use runner::{emit_to_sink, with_output_sink, CommandResult, OutputSink, OutputStream, Runner};
 
 #[derive(Debug, Clone)]
 pub struct RunContext {
@@ -45,6 +46,12 @@ pub struct AgentOutput {
     pub exit_code: Option<i32>,
     pub warnings: Vec<String>,
 }
+
+/// Aviso que un agente añade a `AgentOutput.warnings` cuando el esfuerzo pedido no
+/// pudo aplicarse y la tarea se ejecutó sin él. El scheduler lo usa para dejar
+/// `RunRecord.effort` en `None`.
+pub const EFFORT_NOT_APPLIED_WARNING: &str =
+    "esfuerzo no disponible para este modelo; se ejecutó sin variante";
 
 pub type AgentFuture<'a> = Pin<Box<dyn Future<Output = Result<AgentOutput>> + Send + 'a>>;
 
