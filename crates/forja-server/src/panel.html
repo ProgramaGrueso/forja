@@ -375,6 +375,19 @@
       box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
     }
 
+    .mascot-speech.bubble-hidden {
+      display: none;
+    }
+
+    .app-shell.sidebar-collapsed .mascot-speech.bubble-floating {
+      display: block;
+      position: fixed;
+      left: 72px;
+      bottom: 52px;
+      width: 210px;
+      z-index: 75;
+    }
+
     .mascot-speech-state {
       display: block;
       font-size: 9.5px;
@@ -984,6 +997,9 @@
       .workspace { grid-column: 1 / 2; }
       .mobile-menu-btn { display: inline-grid; }
       .desktop-collapse-btn { display: none; }
+      .topbar { padding: 0 10px; gap: 8px; }
+      .view-subtitle { display: none; }
+      .topbar-actions .btn { padding: 5px 9px; font-size: 12px; white-space: nowrap; }
     }
   </style>
 </head>
@@ -1297,7 +1313,7 @@
 
           <div class="card">
             <div class="card-label">Historial 5 min — CPU % (violeta) y RAM % (esmeralda)</div>
-            <svg id="chart-cpuram-svg" class="chart-svg" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+            <svg id="chart-cpuram-svg" class="chart-svg" viewBox="0 0 1000 150" preserveAspectRatio="none"></svg>
           </div>
         </section>
 
@@ -1496,7 +1512,8 @@
         if (!isoStr) return "sin dato";
         const parsed = Date.parse(isoStr);
         if (Number.isNaN(parsed)) return isoStr;
-        return `hace ${relAgeFromMs(parsed)}`;
+        const age = relAgeFromMs(parsed);
+        return age === "ahora" ? "ahora mismo" : `hace ${age}`;
       }
 
       function fmtDuration(ms) {
@@ -1751,7 +1768,10 @@
 
       /* Gráficos SVG puros */
       function renderLineSvg(svgEl, seriesList, showThresholds = false) {
-        const W = 600, H = 150, padL = 34, padR = 10, padT = 12, padB = 20;
+        const vb = svgEl.viewBox && svgEl.viewBox.baseVal;
+        const W = (vb && vb.width) ? vb.width : 600;
+        const H = (vb && vb.height) ? vb.height : 150;
+        const padL = 34, padR = 10, padT = 12, padB = 20;
         const plotW = W - padL - padR;
         const plotH = H - padT - padB;
         let grid = "";
@@ -1910,7 +1930,7 @@
                 <div class="mono muted" style="font-size:11px;">${esc(r.id.slice(0, 8))}</div>
               </td>
               <td class="mono">${esc(r.agent)}</td>
-              <td class="mono">${esc(fmtDuration(runDurationMs(r)))}</td>
+              <td class="mono" ${r.status === "running" ? `data-live-duration="${r.created_at_ms}"` : ""}>${esc(fmtDuration(runDurationMs(r)))}</td>
               <td class="mono">${r.attempts}</td>
               <td class="mono">${esc(r.task.privacidad)}</td>
               <td>
@@ -1942,7 +1962,7 @@
           <span class="muted">Estado:</span><span><span class="badge ${esc(r.status)}">${esc(r.status)}</span></span>
           <span class="muted">Agente:</span><span class="mono">${esc(r.agent)}</span>
           <span class="muted">Privacidad:</span><span class="mono">${esc(r.task.privacidad)}</span>
-          <span class="muted">Duración:</span><span class="mono">${esc(fmtDuration(runDurationMs(r)))}</span>
+          <span class="muted">Duración:</span><span class="mono" ${r.status === "running" ? `data-live-duration="${r.created_at_ms}"` : ""}>${esc(fmtDuration(runDurationMs(r)))}</span>
           <span class="muted">Intentos:</span><span class="mono">${r.attempts}</span>
           <span class="muted">Rama:</span><span class="mono">${esc(r.branch || "sin rama")}</span>
           <span class="muted">Worktree:</span><span class="mono">${esc(r.worktree || "sin worktree")}</span>
@@ -2159,8 +2179,12 @@
         const allowed = (state.policy && state.policy[priv]) || [];
         const banner = $("nt-policy-banner");
         banner.classList.toggle("sensitive", priv === "sensitive");
+        const claudeMeta = (state.agents || []).find((a) => a.name === "claude");
+        const claudeNote = priv === "sensitive" && claudeMeta && !claudeMeta.available
+          ? ` <em>(Aviso: claude aún no está configurado en este servidor).</em>`
+          : "";
         banner.innerHTML = priv === "sensitive"
-          ? `Política <strong>sensitive</strong>: solo se permite <span class="mono">${esc(allowed.join(", "))}</span>. Los agentes externos no autorizados se bloquean antes de crear worktrees.`
+          ? `Política <strong>sensitive</strong>: solo se permite <span class="mono">${esc(allowed.join(", "))}</span>. Los agentes externos no autorizados se bloquean antes de crear worktrees.${claudeNote}`
           : `Política <strong>open</strong>: agentes permitidos → <span class="mono">${esc(allowed.join(", "))}</span>.`;
 
         const sel = $("nt-agent");
@@ -2316,7 +2340,14 @@
       $("mascot-btn").addEventListener("click", () => {
         renderMascot();
         const speech = $("mascot-speech");
-        speech.style.display = speech.style.display === "none" ? "" : speech.style.display;
+        const collapsed = $("app-shell").classList.contains("sidebar-collapsed");
+        if (collapsed) {
+          speech.classList.remove("bubble-hidden");
+          speech.classList.toggle("bubble-floating");
+        } else {
+          speech.classList.remove("bubble-floating");
+          speech.classList.toggle("bubble-hidden");
+        }
       });
 
       document.body.addEventListener("click", (e) => {
@@ -2515,21 +2546,31 @@
       window.addEventListener("hashchange", applyHashRoute);
 
       /* Arranque y bucles de muestreo */
+      const isSnapshot = window.location.search.includes("snapshot=1");
       updateSideTabs();
       applyHashRoute();
       refreshCore();
       refreshTelemetry();
       refreshQuota(true);
-      connectSse();
 
-      setInterval(refreshTelemetry, 2000);
-      setInterval(() => {
-        renderRunsTable();
-        renderDrawer();
-        renderMascot();
-      }, 1000);
-      setInterval(refreshCore, 8000);
-      setInterval(() => refreshQuota(false), 30000);
+      if (isSnapshot) {
+        $("conn-dot").className = "dot ok";
+        $("conn-text").textContent = "Conectado · SSE";
+      } else {
+        connectSse();
+        setInterval(refreshTelemetry, 2000);
+        setInterval(() => {
+          document.querySelectorAll("[data-live-duration]").forEach((el) => {
+            const start = Number(el.dataset.liveDuration);
+            if (Number.isFinite(start)) {
+              el.textContent = fmtDuration(Math.max(0, Date.now() - start));
+            }
+          });
+          renderMascot();
+        }, 1000);
+        setInterval(refreshCore, 8000);
+        setInterval(() => refreshQuota(false), 30000);
+      }
     })();
   </script>
 </body>

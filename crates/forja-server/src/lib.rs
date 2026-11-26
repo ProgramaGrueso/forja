@@ -210,6 +210,19 @@ async fn create_task(
     State(state): State<AppState>,
     Json(req): Json<CreateTaskRequest>,
 ) -> std::result::Result<(StatusCode, Json<RunRecord>), ApiError> {
+    let titulo = req.titulo.trim();
+    let prompt = req.prompt.trim();
+    if titulo.is_empty() {
+        return Err(ApiError(ForjaError::InvalidInput(
+            "el título no puede estar vacío".to_string(),
+        )));
+    }
+    if prompt.is_empty() {
+        return Err(ApiError(ForjaError::InvalidInput(
+            "el prompt no puede estar vacío".to_string(),
+        )));
+    }
+
     let agent = state.get_agent(req.agent).ok_or_else(|| {
         ApiError(ForjaError::NotConfigured(format!(
             "agente {} no configurado",
@@ -217,7 +230,7 @@ async fn create_task(
         )))
     })?;
 
-    let task = Task::new(req.titulo, req.prompt, req.privacidad);
+    let task = Task::new(titulo, prompt, req.privacidad);
     let record = state.scheduler.submit(task, agent).await?;
     Ok((StatusCode::CREATED, Json(record)))
 }
@@ -481,6 +494,26 @@ mod tests {
         let body: Value = read_json(resp.into_body()).await;
         let msg = body["error"].as_str().expect("campo error en JSON");
         assert!(msg.contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn api_post_task_rejects_empty_title_or_prompt() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state);
+
+        for payload in [
+            json!({"titulo": "   ", "prompt": "ok"}),
+            json!({"titulo": "ok", "prompt": "  \n "}),
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/tasks")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("POST vacío");
+            let resp = app.clone().oneshot(req).await.expect("ejecutar POST");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

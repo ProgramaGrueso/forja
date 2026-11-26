@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,32 @@ pub struct Settings {
 
 pub const MAX_CONCURRENCY_LIMIT: usize = 16;
 
+const FORBIDDEN_PATH_SEGMENTS: [&str; 4] = [".hermes", ".ssh", ".gnupg", ".env"];
+
+fn validate_safe_path(field: &str, raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err(format!("{field} no puede estar vacío"));
+    }
+    if raw.contains('\0') {
+        return Err(format!("{field} contiene caracteres nulos inválidos"));
+    }
+    for comp in Path::new(raw).components() {
+        if matches!(comp, Component::ParentDir) {
+            return Err(format!("{field} no puede contener '..'"));
+        }
+        if let Component::Normal(seg) = comp {
+            let s = seg.to_string_lossy();
+            if FORBIDDEN_PATH_SEGMENTS
+                .iter()
+                .any(|f| s.eq_ignore_ascii_case(f))
+            {
+                return Err(format!("{field} apunta a una ruta protegida ({s})"));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_concurrency == 0 || self.max_concurrency > MAX_CONCURRENCY_LIMIT {
@@ -26,12 +52,8 @@ impl Settings {
         if self.port < 1024 {
             return Err("port debe estar entre 1024 y 65535".to_string());
         }
-        if self.store_dir.trim().is_empty() {
-            return Err("store_dir no puede estar vacío".to_string());
-        }
-        if self.quota_path.trim().is_empty() {
-            return Err("quota_path no puede estar vacío".to_string());
-        }
+        validate_safe_path("store_dir", &self.store_dir)?;
+        validate_safe_path("quota_path", &self.quota_path)?;
         if !self.quota_path.ends_with(".json") {
             return Err("quota_path debe apuntar a un archivo .json".to_string());
         }
@@ -114,6 +136,23 @@ mod tests {
 
         let mut s = valid();
         s.quota_path = "/tmp/quota.txt".to_string();
+        assert!(s.validate().is_err());
+
+        // Pruebas adversarias: path traversal y rutas protegidas
+        let mut s = valid();
+        s.quota_path = "/tmp/../etc/quota.json".to_string();
+        assert!(s.validate().is_err());
+
+        let mut s = valid();
+        s.quota_path = "/home/user/.hermes/config.json".to_string();
+        assert!(s.validate().is_err());
+
+        let mut s = valid();
+        s.store_dir = "/home/user/.ssh/store".to_string();
+        assert!(s.validate().is_err());
+
+        let mut s = valid();
+        s.quota_path = "/tmp/bad\0.json".to_string();
         assert!(s.validate().is_err());
     }
 

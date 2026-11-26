@@ -232,6 +232,7 @@ pub struct QuotaService {
     cmd: Arc<dyn UsageCommand>,
     manual_path: Mutex<PathBuf>,
     cache: Mutex<HashMap<String, (Instant, ProviderQuota)>>,
+    refresh_lock: Mutex<()>,
     ttl: Duration,
 }
 
@@ -241,6 +242,7 @@ impl QuotaService {
             cmd,
             manual_path: Mutex::new(manual_path),
             cache: Mutex::new(HashMap::new()),
+            refresh_lock: Mutex::new(()),
             ttl,
         }
     }
@@ -269,33 +271,88 @@ impl QuotaService {
     }
 
     pub fn get_all(&self) -> Vec<ProviderQuota> {
-        let mut results = Vec::with_capacity(PROVIDERS.len());
-        let mut manual_loaded: Option<Result<ManualQuotaFile, String>> = None;
+        let _refresh_guard = self.refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
 
-        for (id, display_name) in PROVIDERS {
-            let now = Instant::now();
-            let cached = {
-                let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.get(id).and_then(|(ts, quota)| {
+        let mut slots: Vec<Option<ProviderQuota>> = vec![None; PROVIDERS.len()];
+        let mut missing: Vec<(usize, &'static str, &'static str)> = Vec::new();
+
+        {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            for (idx, (id, display_name)) in PROVIDERS.iter().enumerate() {
+                if let Some((ts, quota)) = cache.get(*id) {
                     if now.saturating_duration_since(*ts) < self.ttl {
-                        Some(quota.clone())
-                    } else {
-                        None
+                        slots[idx] = Some(quota.clone());
+                        continue;
                     }
-                })
-            };
+                }
+                missing.push((idx, *id, *display_name));
+            }
+        }
 
-            if let Some(quota) = cached {
-                results.push(quota);
+        if missing.is_empty() {
+            return slots.into_iter().flatten().collect();
+        }
+
+        struct ProbeResult {
+            idx: usize,
+            id: &'static str,
+            display_name: &'static str,
+            fetched_at_ms: u64,
+            hermes_res: Result<HermesUsage, String>,
+        }
+
+        // Sondear proveedores no cacheados en paralelo para evitar ~5 s secuenciales en frío.
+        let cmd = Arc::clone(&self.cmd);
+        let probed: Vec<ProbeResult> = std::thread::scope(|scope| {
+            let handles: Vec<_> = missing
+                .iter()
+                .map(|&(idx, id, display_name)| {
+                    let cmd = Arc::clone(&cmd);
+                    scope.spawn(move || {
+                        let fetched_at_ms = now_epoch_ms();
+                        let hermes_res =
+                            cmd.usage_json(id).and_then(|raw| parse_hermes_usage(&raw));
+                        ProbeResult {
+                            idx,
+                            id,
+                            display_name,
+                            fetched_at_ms,
+                            hermes_res,
+                        }
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| match h.join() {
+                    Ok(item) => item,
+                    Err(_) => ProbeResult {
+                        idx: 0,
+                        id: "",
+                        display_name: "",
+                        fetched_at_ms: now_epoch_ms(),
+                        hermes_res: Err("error interno en hilo de sondeo".to_string()),
+                    },
+                })
+                .collect()
+        });
+
+        let mut manual_loaded: Option<Result<ManualQuotaFile, String>> = None;
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+
+        for ProbeResult {
+            idx,
+            id,
+            display_name,
+            fetched_at_ms,
+            hermes_res,
+        } in probed
+        {
+            if id.is_empty() {
                 continue;
             }
-
-            let fetched_at_ms = now_epoch_ms();
-            let hermes_res = self
-                .cmd
-                .usage_json(id)
-                .and_then(|raw| parse_hermes_usage(&raw));
-
             let quota = match hermes_res {
                 Ok(usage) => {
                     let (used_percent, resets_at) = highest_used_window(&usage.windows);
@@ -349,14 +406,13 @@ impl QuotaService {
                 }
             };
 
-            {
-                let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.insert(id.to_string(), (Instant::now(), quota.clone()));
+            cache.insert(id.to_string(), (Instant::now(), quota.clone()));
+            if let Some(slot) = slots.get_mut(idx) {
+                *slot = Some(quota);
             }
-            results.push(quota);
         }
 
-        results
+        slots.into_iter().flatten().collect()
     }
 
     pub fn manual(&self) -> Result<ManualQuotaFile, String> {
@@ -663,5 +719,39 @@ mod tests {
             },
         );
         assert!(validate_manual(&unknown_provider).is_err());
+    }
+
+    #[test]
+    fn quota_concurrent_get_all_deduplicates_calls() {
+        let dir = TempDir::new().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        struct SlowFake(Arc<AtomicUsize>);
+        impl UsageCommand for SlowFake {
+            fn usage_json(&self, _provider: &str) -> Result<String, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                Err("sin dato".to_string())
+            }
+        }
+
+        let svc = Arc::new(QuotaService::new(
+            Arc::new(SlowFake(calls_ref)),
+            dir.path().join("quota.json"),
+            Duration::from_secs(60),
+        ));
+
+        let s1 = Arc::clone(&svc);
+        let s2 = Arc::clone(&svc);
+        let h1 = std::thread::spawn(move || s1.get_all());
+        let h2 = std::thread::spawn(move || s2.get_all());
+        assert_eq!(h1.join().expect("h1").len(), PROVIDERS.len());
+        assert_eq!(h2.join().expect("h2").len(), PROVIDERS.len());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            PROVIDERS.len(),
+            "dos llamadas simultáneas no deben duplicar subprocesos hermes"
+        );
     }
 }
