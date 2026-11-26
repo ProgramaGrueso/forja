@@ -1,5 +1,6 @@
 pub mod agy;
 pub mod mock;
+pub mod runner;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub use agy::{build_command, AgyCommandOptions};
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
+pub use runner::{CommandResult, Runner};
 
 #[derive(Debug, Clone)]
 pub struct RunContext {
