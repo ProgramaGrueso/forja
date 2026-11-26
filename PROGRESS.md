@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T12 (forja-sched: reintentos y privacidad) — Fase 2 completa
-- Tarea en curso: T13 (forja-server: API REST)
+- Última tarea cerrada: T13 (forja-server: API REST)
+- Tarea en curso: T14 (forja-server: panel web) y T15 (forja-cli) en paralelo
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -131,13 +131,32 @@
 - Notas para retomar: Fase 2 cerrada. Arranca Fase 3 con T13 (`forja-server`: API REST).
 
 ### T13 — forja-server: API REST
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:18:50-05:00 / 2026-11-26T00:22:20-05:00
+- Quién la hizo: subagente noche/forja-T13 (verificado e integrado por agente principal)
+- Commits: 1c691a5 T13: API REST con axum en forja-server
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-server api && ./scripts/check.sh` -> exit 0; `api`: `5 passed; 0 failed`; workspace: 52 tests en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: `AppState`, `build_router` y `serve` listos. Lanzando T14 y T15 en paralelo.
+
+### T14 — forja-server: panel web
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:18:50-05:00 /
-- Quién la hizo: subagente noche/forja-T13
+- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 /
+- Quién la hizo: subagente noche/forja-T14
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T13.
+- Notas para retomar: worktree ../forja-wt-T14.
+
+### T15 — forja-cli
+- Estado: en curso
+- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 /
+- Quién la hizo: subagente noche/forja-T15
+- Commits:
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+- Intentos fallidos (máx. 3):
+- Notas para retomar: worktree ../forja-wt-T15.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
@@ -165,6 +184,7 @@
 | 00:09 | T09 | noche/forja-T09 | gemini-4-neon-low | aceptado (5/5 tests parse + AgyAgent + check.sh en verde a la primera) |
 | 00:12 | T11 | noche/forja-T11 | gemini-4-neon-medium | aceptado (4/4 tests forja-sched + concurrencia/cancel/worktree + check.sh en verde) |
 | 00:16 | T12 | noche/forja-T12 | gemini-4-neon-medium | aceptado (3/3 tests policy/retry + 7/7 forja-sched + check.sh en verde) |
+| 00:19 | T13 | noche/forja-T13 | gemini-4-neon-medium | aceptado (5/5 tests api con tower::ServiceExt + check.sh en verde) |
 
 ## Siguiente paso exacto
 Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.

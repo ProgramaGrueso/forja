@@ -74,7 +74,7 @@ Estructura final:
       Hecho cuando: `cargo test -p forja-sched policy retry` pasa; el rechazo ocurre sin crear worktree.
 
 ## Fase 3 — Interfaces
-- [ ] T13 forja-server: API REST (50 min)
+- [x] T13 forja-server: API REST (50 min)
       axum: POST /tasks, GET /runs, GET /runs/:id, POST /runs/:id/cancel. Estado en memoria compartido con el scheduler.
       Hecho cuando: `cargo test -p forja-server api` pasa usando tower::ServiceExt (sin abrir puertos).
 - [ ] T14 forja-server: panel web (40 min)
