@@ -73,5 +73,5 @@ cargo run -p forja-cli -- --repo /ruta/al/repo --base-branch main \
 
 ### Política de privacidad
 
-- `open`: permite `agy`, `mock` y `claude`.
-- `sensitive`: solo permite `claude`. Cualquier intento de ejecutar `agy` o `mock` con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.
+- `open`: permite todos los agentes: `agy`, `mock`, `claude`, `opencode`, `hermes` y `local` (los tres últimos, como `claude`, son stubs que devuelven `NotConfigured` hasta que se implementen).
+- `sensitive`: solo permite `claude`. Cualquier intento de ejecutar otro agente con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.

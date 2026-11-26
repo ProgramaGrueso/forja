@@ -41,11 +41,37 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_agent_kind() {
-        for agent in [AgentKind::Mock, AgentKind::Agy, AgentKind::Claude] {
+        for agent in [
+            AgentKind::Mock,
+            AgentKind::Agy,
+            AgentKind::Claude,
+            AgentKind::Opencode,
+            AgentKind::Hermes,
+            AgentKind::Local,
+        ] {
             let json = serde_json::to_string(&agent).expect("serialize agent");
             let parsed: AgentKind = serde_json::from_str(&json).expect("deserialize agent");
             assert_eq!(agent, parsed);
         }
+        // Serde en minúsculas para todas las variantes.
+        assert_eq!(serde_json::to_string(&AgentKind::Mock).unwrap(), "\"mock\"");
+        assert_eq!(serde_json::to_string(&AgentKind::Agy).unwrap(), "\"agy\"");
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Claude).unwrap(),
+            "\"claude\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Opencode).unwrap(),
+            "\"opencode\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Hermes).unwrap(),
+            "\"hermes\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Local).unwrap(),
+            "\"local\""
+        );
     }
 
     #[test]
@@ -111,6 +137,26 @@ mod tests {
         assert_eq!(AgentKind::from_str("mock").unwrap(), AgentKind::Mock);
         assert_eq!(AgentKind::from_str("agy").unwrap(), AgentKind::Agy);
         assert_eq!(AgentKind::from_str("claude").unwrap(), AgentKind::Claude);
+        assert_eq!(
+            AgentKind::from_str("opencode").unwrap(),
+            AgentKind::Opencode
+        );
+        assert_eq!(AgentKind::from_str("hermes").unwrap(), AgentKind::Hermes);
+        assert_eq!(AgentKind::from_str("local").unwrap(), AgentKind::Local);
         assert!(AgentKind::from_str("otro").is_err());
+
+        // Display y FromStr coherentes para todas las variantes.
+        for agent in [
+            AgentKind::Mock,
+            AgentKind::Agy,
+            AgentKind::Claude,
+            AgentKind::Opencode,
+            AgentKind::Hermes,
+            AgentKind::Local,
+        ] {
+            let text = agent.to_string();
+            assert_eq!(AgentKind::from_str(&text).unwrap(), agent);
+            assert_eq!(AgentKind::from_str(&text.to_uppercase()).unwrap(), agent);
+        }
     }
 }
