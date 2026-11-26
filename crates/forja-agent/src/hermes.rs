@@ -120,10 +120,23 @@ fn is_valid_profile_name(name: &str) -> bool {
         && name.chars().count() <= 64
 }
 
+/// Si `HERMES_HOME` apunta a un perfil (`<base>/profiles/<perfil>`, como dentro de
+/// una sesión de Hermes), la base real es `<base>`; si no, se usa tal cual.
+pub fn base_from_home(home: PathBuf) -> PathBuf {
+    let in_profiles = home
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "profiles");
+    match home.parent().and_then(Path::parent) {
+        Some(base) if in_profiles => base.to_path_buf(),
+        _ => home,
+    }
+}
+
 /// Directorio base de Hermes: `HERMES_HOME` o `~/.hermes`. No toca el disco.
 pub fn hermes_base() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HERMES_HOME").filter(|h| !h.is_empty()) {
-        return Some(PathBuf::from(home));
+        return Some(base_from_home(PathBuf::from(home)));
     }
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -408,7 +421,24 @@ impl Agent for HermesAgent {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn base_from_home_strips_profile_dir() {
+        use super::base_from_home;
+        assert_eq!(
+            base_from_home(PathBuf::from("/h/.hermes/profiles/ana")),
+            PathBuf::from("/h/.hermes")
+        );
+        assert_eq!(
+            base_from_home(PathBuf::from("/h/.hermes")),
+            PathBuf::from("/h/.hermes")
+        );
+        assert_eq!(
+            base_from_home(PathBuf::from("/otra/ruta/ana")),
+            PathBuf::from("/otra/ruta/ana")
+        );
+    }
 
     use forja_core::{AgentKind, ForjaError, Privacy, Task};
     use tempfile::tempdir;
