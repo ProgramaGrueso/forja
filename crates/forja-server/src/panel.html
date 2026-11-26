@@ -1274,6 +1274,11 @@
         <!-- VISTA 3: AGENTES -->
         <section id="view-agentes" class="view-pane" aria-label="Vista Agentes">
           <div id="agents-cards-grid" class="grid-cards"></div>
+          <div class="section-head" style="display:flex;justify-content:space-between;align-items:center;margin:22px 0 10px;">
+            <strong style="font-size:15px;">Modelos detectados en esta máquina</strong>
+            <button id="models-refresh" class="btn" type="button">Redetectar</button>
+          </div>
+          <div id="models-grid" class="grid-cards"></div>
         </section>
 
         <!-- VISTA 4: TELEMETRÍA -->
@@ -1464,6 +1469,7 @@
         sideTab: "runs",
         runs: [],
         agents: [],
+        models: null,
         stats: null,
         telemetry: null,
         quota: null,
@@ -2003,6 +2009,38 @@
         }).join("");
       }
 
+      function renderModels() {
+        const grid = $("models-grid");
+        if (!state.models) { grid.innerHTML = '<div class="card card-gothic muted">Detectando modelos…</div>'; return; }
+        grid.innerHTML = state.models.providers.map((p) => {
+          const ok = p.status === "ok";
+          const items = ok
+            ? p.models.map((m) => `<li><span class="mono">${esc(m.id)}</span>${m.label && m.label !== m.id ? ` <span class="muted" style="font-size:11.5px;">${esc(m.label)}</span>` : ""}</li>`).join("")
+            : "";
+          return `
+            <div class="card card-gothic">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span class="dot ${ok ? "idle" : "error"}"></span>
+                  <strong style="font-size:14px;">${esc(p.display_name)}</strong>
+                </div>
+                <span class="mono muted" style="font-size:11.5px;">${ok ? p.models.length + " modelos" : "sin datos"}</span>
+              </div>
+              ${ok
+                ? `<ul style="margin:0;padding-left:16px;max-height:190px;overflow:auto;font-size:12.5px;line-height:1.6;">${items}</ul>`
+                : `<div class="card-sub" style="color:#fca5a5;">${esc(p.error || "no disponible")}</div>`}
+              <div class="card-sub mono muted" style="margin-top:8px;font-size:11px;">fuente: ${esc(p.source)}</div>
+            </div>`;
+        }).join("");
+      }
+
+      function loadModels(refresh) {
+        return apiFetch(refresh ? "/api/models?refresh=true" : "/api/models")
+          .then((r) => r.ok ? r.json() : null)
+          .then((m) => { if (m) { state.models = m; renderModels(); } })
+          .catch(() => {});
+      }
+
       /* Vista Telemetría */
       function renderTelemetry() {
         const snap = state.telemetry;
@@ -2344,6 +2382,13 @@
           updateSideTabs();
         });
       });
+
+      $("models-refresh").addEventListener("click", () => {
+        $("models-refresh").textContent = "Detectando…";
+        loadModels(true).then(() => { $("models-refresh").textContent = "Redetectar"; });
+      });
+      renderModels();
+      loadModels(false);
 
       $("btn-collapse-sidebar").addEventListener("click", () => {
         $("app-shell").classList.toggle("sidebar-collapsed");

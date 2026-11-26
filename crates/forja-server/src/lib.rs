@@ -1,4 +1,5 @@
 pub mod api;
+pub mod models;
 pub mod quota;
 pub mod settings;
 pub mod telemetry;
@@ -21,6 +22,7 @@ use axum::{Json, Router};
 use forja_agent::{Agent, AgyAgent, MockAgent};
 use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, Task};
 use forja_sched::Scheduler;
+use models::ModelService;
 use quota::{default_manual_path, QuotaService};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
@@ -37,6 +39,7 @@ pub struct AppState {
     pub(crate) metas: Arc<Vec<AgentMeta>>,
     pub telemetry: Telemetry,
     pub quota: Arc<QuotaService>,
+    pub models: Arc<ModelService>,
     pub settings: Arc<RwLock<Settings>>,
     pub settings_path: Option<PathBuf>,
     pub auth_token: Option<String>,
@@ -69,6 +72,7 @@ impl AppState {
             metas: Arc::new(metas),
             telemetry: Telemetry::with_defaults(),
             quota: Arc::new(QuotaService::with_defaults()),
+            models: Arc::new(ModelService::with_defaults()),
             settings: Arc::new(RwLock::new(settings)),
             settings_path: None,
             auth_token: None,
@@ -100,6 +104,11 @@ impl AppState {
 
     pub fn with_quota(mut self, quota: Arc<QuotaService>) -> Self {
         self.quota = quota;
+        self
+    }
+
+    pub fn with_models(mut self, models: Arc<ModelService>) -> Self {
+        self.models = models;
         self
     }
 
@@ -183,6 +192,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/telemetry", get(api::get_telemetry))
         .route("/api/agents", get(api::agents))
         .route("/api/stats", get(api::stats))
+        .route("/api/models", get(api::get_models))
         .route("/api/policy", get(api::policy))
         .route("/api/quota", get(api::get_quota).put(api::put_quota))
         .route(
@@ -760,9 +770,61 @@ mod tests {
             "set-hide-mascot",
             "provider-popover",
             "detail-drawer",
+            "models-grid",
+            "models-refresh",
         ] {
             assert!(html.contains(id), "falta elemento #{id} en panel.html");
         }
+    }
+
+    #[tokio::test]
+    async fn api_models_returns_catalog_from_injected_runner() {
+        use crate::models::{CommandRunner, ModelService};
+        use std::time::Duration;
+
+        struct OnlyAgy;
+        impl CommandRunner for OnlyAgy {
+            fn run(&self, program: &str, _args: &[&str]) -> Result<String, String> {
+                if program == "agy" {
+                    Ok("gemini-4-neon-low\tGemini 4 Neon (Low)\n".to_string())
+                } else {
+                    Err(format!("{program} no está instalado"))
+                }
+            }
+        }
+
+        let (state, _s, _w) = test_state();
+        let state = state.with_models(Arc::new(ModelService::new(
+            Arc::new(OnlyAgy),
+            Duration::from_secs(60),
+        )));
+        let app = build_router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let providers = v["providers"].as_array().unwrap();
+        let gem = providers
+            .iter()
+            .find(|p| p["provider"] == "gemini")
+            .unwrap();
+        assert_eq!(gem["status"], "ok");
+        assert_eq!(gem["models"][0]["id"], "gemini-4-neon-low");
+        let oc = providers
+            .iter()
+            .find(|p| p["provider"] == "opencode")
+            .unwrap();
+        assert_eq!(oc["status"], "unavailable");
     }
 
     #[tokio::test]

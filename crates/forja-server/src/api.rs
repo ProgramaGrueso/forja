@@ -1,11 +1,11 @@
 //! Rutas `/api/*` del dashboard: agentes, estadísticas, política, salud y ajustes.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use forja_core::{allowed_agents, AgentKind, Privacy, RunRecord, RunStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::quota::{ManualQuotaFile, ProviderQuota};
@@ -238,6 +238,25 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 pub async fn agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     let runs = state.scheduler.list_runs().await;
     Json(build_agent_views(&state.metas, &runs))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelsQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Modelos detectados en la máquina (`?refresh=true` ignora la caché).
+pub async fn get_models(State(state): State<AppState>, Query(q): Query<ModelsQuery>) -> Response {
+    let models = state.models.clone();
+    match tokio::task::spawn_blocking(move || models.catalog(q.refresh)).await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("fallo detectando modelos: {err}") })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn stats(State(state): State<AppState>) -> Json<Stats> {
