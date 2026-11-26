@@ -87,7 +87,7 @@ Estructura final:
       Hecho cuando: `cargo test -p forja-cli` pasa y `cargo run -p forja-cli -- list` sale 0 con el store vacío.
 
 ## Fase 4 — Cierre
-- [ ] T16 Prueba de extremo a extremo con mock (45 min)
+- [x] T16 Prueba de extremo a extremo con mock (45 min)
       Test de integración en crates/forja-cli/tests/e2e.rs: repo temporal, 3 tareas en paralelo con MockAgent,
       cada una en su worktree y rama, commit por tarea, estados correctos en el store.
       Hecho cuando: `cargo test -p forja-cli --test e2e` pasa y verifica que las 3 ramas existen.

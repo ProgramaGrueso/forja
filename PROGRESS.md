@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T14 (panel web) y T15 (forja-cli) — Fase 3 completa
-- Tarea en curso: T16 (prueba de extremo a extremo con mock)
+- Última tarea cerrada: T16 (prueba E2E con mock)
+- Tarea en curso: T17 (documentación: README.md y docs/ARQUITECTURA.md)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -161,13 +161,23 @@
 - Notas para retomar: Fase 3 cerrada. Arranca Fase 4 con T16 (`crates/forja-cli/tests/e2e.rs`).
 
 ### T16 — Prueba de extremo a extremo con mock
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:26:05-05:00 / 2026-11-26T00:26:54-05:00
+- Quién la hizo: agente principal
+- Commits: (en commit T16)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-cli --test e2e && ./scripts/check.sh` -> exit 0; `e2e`: `1 passed; 0 failed` (3 tareas paralelas, 3 worktrees, 3 ramas con commit sobre main, 3 registros Done en JsonlStore); workspace: 59 tests en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: arranca T17 (`README.md` y `docs/ARQUITECTURA.md`).
+
+### T17 — Documentación
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:26:05-05:00 /
+- Hora de inicio / fin: 2026-11-26T00:27:05-05:00 /
 - Quién la hizo: agente principal
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: crear crates/forja-cli/tests/e2e.rs con repo temporal, 3 tareas paralelas con MockAgent, 3 worktrees, 3 ramas, 3 commits y estados Done en JsonlStore.
+- Notas para retomar: redactar README.md (con diagrama ASCII, check.sh, uso con agy real) y docs/ARQUITECTURA.md (un párrafo por crate y fronteras).
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
