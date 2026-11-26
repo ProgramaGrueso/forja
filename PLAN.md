@@ -91,7 +91,7 @@ Estructura final:
       Test de integración en crates/forja-cli/tests/e2e.rs: repo temporal, 3 tareas en paralelo con MockAgent,
       cada una en su worktree y rama, commit por tarea, estados correctos en el store.
       Hecho cuando: `cargo test -p forja-cli --test e2e` pasa y verifica que las 3 ramas existen.
-- [ ] T17 Documentación (30 min)
+- [x] T17 Documentación (30 min)
       README.md (qué es, arquitectura en un diagrama ASCII, cómo correr check.sh, cómo usar agy real),
       docs/ARQUITECTURA.md (un párrafo por crate y sus fronteras).
       Hecho cuando: `test -s README.md && test -s docs/ARQUITECTURA.md` sale 0 y todos los comandos del README

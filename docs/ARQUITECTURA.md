@@ -1,0 +1,26 @@
+# Arquitectura de Forja
+
+Forja se organiza como un workspace Rust de 7 crates con dependencias acíclicas y fronteras estrictas. Ningún crate de bajo nivel conoce el planificador, el servidor HTTP ni la interfaz de línea de comandos.
+
+## Crates y fronteras
+
+### `forja-core`
+Define el lenguaje común del dominio: `Task`, `Privacy`, `AgentKind`, `RunStatus`, `RunRecord`, `ForjaError` (con `thiserror`) y la política de privacidad (`allowed_agents`, `is_agent_allowed`, `check_policy`). No realiza operaciones de E/S, red ni procesos; su frontera es puramente de tipos, serialización (`serde`) y reglas de negocio puras, de modo que el resto de crates dependen de él sin ciclos.
+
+### `forja-git`
+Encapsula la interacción con el binario `git` del sistema mediante `std::process::Command` para crear worktrees aislados (`create_worktree`), consultar la rama activa (`current_branch`), verificar el estado limpio (`status_clean`) y registrar commits locales (`commit_all`). Depende únicamente de `forja-core`. Por diseño de seguridad, no existe ninguna función ni invocación de `push` en este crate.
+
+### `forja-agent`
+Define el contrato asíncrono `Agent` (object-safe vía `Pin<Box<dyn Future>>` para soportar `Arc<dyn Agent>` sin macros externas), `RunContext`, `AgentOutput`, la implementación determinista `MockAgent`, el constructor puro de argumentos `build_command` para `agy`, el ejecutor con timeout y captura de salida `Runner` (`tokio::process::Command` sin shell), el parseo tolerante `parse_agy_output` y `AgyAgent`. Depende solo de `forja-core`; nunca conoce repositorios git, políticas de cola ni almacenamiento.
+
+### `forja-store`
+Provee persistencia local append-only en formato JSONL (`JsonlStore` sobre `runs.jsonl` en un directorio configurable) con `append_run`, `list_runs` y `get_run`. Al leer, reconstruye el último estado de cada `run.id` en orden estable y tolera líneas vacías o JSON corrupto sin producir `panic`. Depende exclusivamente de `forja-core`.
+
+### `forja-sched`
+Orquesta el ciclo de vida completo de cada ejecución en `Scheduler`: valida primero la política de privacidad (`check_policy`) antes de persistir o crear worktrees, limita la concurrencia simultánea mediante `tokio::sync::Semaphore` (por defecto `2`), prepara worktrees y commits opcionales con `forja-git`, reintenta fallos con backoff configurable (hasta `2` reintentos por defecto), permite cancelación (`cancel_run`) y persiste cada transición de estado en `forja-store`. Depende de `forja-core`, `forja-git`, `forja-agent` y `forja-store`.
+
+### `forja-server`
+Expone `Scheduler` sobre HTTP con `axum`: API REST (`POST /tasks`, `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/cancel`) y un panel web local autocontenido (`GET /`, embebido con `include_str!("panel.html")`, sin CDN ni recursos externos). Mapea errores de dominio a códigos HTTP adecuados (`403` para `PolicyDenied`, `404` para `NotFound`, `400` para entradas/agentes no configurados). Depende de `forja-core`, `forja-agent`, `forja-store` y `forja-sched`.
+
+### `forja-cli`
+Binario `forja` construido con `clap` que ensambla la configuración local (`--store-dir`, `--worktrees-dir`, `--repo`, `--base-branch`) y ofrece los subcomandos `run`, `list` y `serve`. Es el único crate ejecutable del workspace y el punto de entrada que conecta `forja-store`, `forja-sched`, `forja-agent` y `forja-server`; también aloja las pruebas de integración de extremo a extremo (`tests/e2e.rs`).

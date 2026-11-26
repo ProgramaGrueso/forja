@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T16 (prueba E2E con mock)
-- Tarea en curso: T17 (documentación: README.md y docs/ARQUITECTURA.md)
+- Última tarea cerrada: T17 (documentación)
+- Tarea en curso: T18 (pasada final: release build y auditoría de código)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -171,13 +171,23 @@
 - Notas para retomar: arranca T17 (`README.md` y `docs/ARQUITECTURA.md`).
 
 ### T17 — Documentación
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:27:05-05:00 / 2026-11-26T00:27:55-05:00
+- Quién la hizo: agente principal
+- Commits: (en commit T17)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `test -s README.md && test -s docs/ARQUITECTURA.md && ./scripts/check.sh && cargo build --workspace && cargo test -p forja-cli --test e2e && cargo run -p forja-cli -- list` -> exit 0; todos los comandos del README corrieron sin error.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: arranca T18 (pasada final + auditoría + release build) y luego X1–X3 si procede.
+
+### T18 — Pasada final
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:27:05-05:00 /
+- Hora de inicio / fin: 2026-11-26T00:28:10-05:00 /
 - Quién la hizo: agente principal
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: redactar README.md (con diagrama ASCII, check.sh, uso con agy real) y docs/ARQUITECTURA.md (un párrafo por crate y fronteras).
+- Notas para retomar: auditar TODO/unwrap/expect fuera de tests y compilar release.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
