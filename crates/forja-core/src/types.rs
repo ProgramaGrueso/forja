@@ -42,6 +42,9 @@ pub enum AgentKind {
     Mock,
     Agy,
     Claude,
+    Opencode,
+    Hermes,
+    Local,
 }
 
 impl fmt::Display for AgentKind {
@@ -50,6 +53,9 @@ impl fmt::Display for AgentKind {
             Self::Mock => write!(f, "mock"),
             Self::Agy => write!(f, "agy"),
             Self::Claude => write!(f, "claude"),
+            Self::Opencode => write!(f, "opencode"),
+            Self::Hermes => write!(f, "hermes"),
+            Self::Local => write!(f, "local"),
         }
     }
 }
@@ -62,6 +68,9 @@ impl FromStr for AgentKind {
             "mock" => Ok(Self::Mock),
             "agy" => Ok(Self::Agy),
             "claude" => Ok(Self::Claude),
+            "opencode" => Ok(Self::Opencode),
+            "hermes" => Ok(Self::Hermes),
+            "local" => Ok(Self::Local),
             other => Err(ForjaError::InvalidInput(format!(
                 "agente desconocido: {other}"
             ))),

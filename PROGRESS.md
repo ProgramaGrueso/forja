@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T18 (pasada final) — T01..T18 y X1..X3 completas
-- Tarea en curso: (ninguna — sesión cerrada)
+- Última tarea cerrada: T18 (pasada final) — T01..T18, X1..X3 y sesión UI (U01..U10) completas
+- Tarea en curso: V00 (worktree forja-wt-V00, rama noche/forja-V00) — nuevos tipos de agente Opencode/Hermes/Local
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -338,3 +338,45 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 |------|-------|------|--------|-----------|
 | 05:24 | U02 | noche/forja-ui-U02 | gemini-4-neon-medium | aceptado (7/7 tests telemetry + check.sh en verde) |
 | 05:24 | U03 | noche/forja-ui-U03 | gemini-4-neon-medium | aceptado (7/7 tests quota + fixtures + check.sh en verde) |
+
+---
+
+# Sesión V00 — Nuevos tipos de agente (worktree forja-wt-V00)
+
+## Estado
+- Rama: noche/forja-V00 (desde noche/forja-ui @ eb9674e)
+- Inicio: 2026-11-26T07:05:00-05:00 (aprox.)
+
+## Registro
+### V00 — Opencode, Hermes y Local como AgentKind
+- Estado: terminada
+- Quién la hizo: agente principal
+- Cambios:
+  - `forja-core`: `AgentKind::{Opencode,Hermes,Local}` (serde minúsculas, Display/FromStr);
+    `allowed_agents(Open)` ahora devuelve los 6; `Sensitive` sigue solo `Claude`.
+  - `forja-agent`: `opencode.rs`/`hermes.rs`/`local.rs` con stubs `NotConfigured`
+    (`OpencodeAgent.model="opencode-go/deepseek-v4.1-flash"`, `HermesAgent.profile="yuuki"`,
+    `LocalAgent.model="moe"`), constantes `DEFAULT_*` públicas y export en `lib.rs`.
+  - `forja-server`: registro en `AppState::new` (available=true, claude como estaba);
+    `AgentMeta::default_for` con (OpenCode/Hermes/Local); panel.html actualizado en
+    barra lateral, filtro, modal y defaults; tests de /api/agents (6 entradas) y /api/policy.
+  - `forja-cli`: `CliAgent::{Opencode,Hermes,Local}` + build_agent + ayuda que nombra los 5.
+  - README/ARQUITECTURA: política open y stubs documentados.
+- Comando de verificación y resultado real:
+  `./scripts/check.sh` -> exit 0 (fmt, clippy -D warnings, `cargo test --workspace`:
+  **112 passed; 0 failed; 1 ignored** — forja-agent 26+1 ignored, forja-cli 8, e2e 1,
+  forja-core 12, forja-git 5, forja-sched 8, forja-server 48, forja-store 4).
+  `cargo run -q -p forja-cli -- run --help` -> exit 0; muestra
+  `[possible values: mock, agy, opencode, hermes, local]`.
+  Smoke real en :7791: `/api/agents` 6 agentes (5 available + claude), `/api/policy`
+  open=6/sensitive=[claude], POST opencode+sensitive -> 403, opencode+open -> 201 y run
+  `failed` con "no configurado: adaptador opencode aún no configurado" (stub esperado).
+  `node --check` del JS del panel -> OK.
+- Intentos fallidos (máx. 3): ninguno (todo a la primera; un `pkill` del smoke se mató a sí
+  mismo por coincidir con su propia línea de comandos, verificado y limpio con `ps`).
+- Decisiones propias: orden de `allowed_agents(Open)` conserva los 3 primeros originales y
+  añade opencode/hermes/local al final; constantes `DEFAULT_*` públicas reutilizadas en
+  `AgentMeta::default_for`; agentes nuevos registrados como disponibles pese a devolver
+  `NotConfigured` (lo pedido: "junto a Mock y Agy"); `ENTREGA.md` reescrito para V00.
+- Notas para retomar: base lista para que otros trabajen en paralelo; los stubs devuelven
+  `NotConfigured` hasta que alguien implemente el Runner real de cada adaptador.

@@ -1063,15 +1063,20 @@
         <section id="side-agents-section">
           <div class="side-section-header">
             <span>AGENTES</span>
-            <span id="side-agents-count" class="mono">3</span>
+            <span id="side-agents-count" class="mono">6</span>
           </div>
           <div id="sidebar-agents-list">
             <div class="provider-group-label">Anthropic</div>
             <div class="side-agent-row"><span class="dot unconfigured"></span><div class="side-row-main"><div class="side-row-title">claude</div><div class="side-row-sub">sin configurar</div></div><span class="side-counter">0</span></div>
             <div class="provider-group-label">Gemini</div>
             <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">agy</div><div class="side-row-sub">gemini-4-neon-medium</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">Hermes</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">hermes</div><div class="side-row-sub">yuuki</div></div><span class="side-counter">0</span></div>
             <div class="provider-group-label">Local</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">local</div><div class="side-row-sub">moe</div></div><span class="side-counter">0</span></div>
             <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">mock</div><div class="side-row-sub">mock</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">OpenCode</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">opencode</div><div class="side-row-sub">opencode-go/deepseek-v4.1-flash</div></div><span class="side-counter">0</span></div>
           </div>
         </section>
 
@@ -1245,6 +1250,9 @@
                 <option value="agy">agy</option>
                 <option value="mock">mock</option>
                 <option value="claude">claude</option>
+                <option value="opencode">opencode</option>
+                <option value="hermes">hermes</option>
+                <option value="local">local</option>
               </select>
               <input id="filter-query" class="input" type="search" placeholder="Buscar por título o ID…" aria-label="Buscar ejecución">
             </div>
@@ -1439,7 +1447,7 @@
           </select>
         </div>
         <div id="nt-policy-banner" class="policy-banner">
-          Política <strong>open</strong>: agentes permitidos → <span class="mono">agy, mock, claude</span>.
+          Política <strong>open</strong>: agentes permitidos → <span class="mono">agy, mock, claude, opencode, hermes, local</span>.
         </div>
         <div class="form-field">
           <label for="nt-agent">Agente</label>
@@ -1447,6 +1455,9 @@
             <option value="mock">mock (local determinista)</option>
             <option value="agy">agy (Gemini CLI)</option>
             <option value="claude">claude (Anthropic)</option>
+            <option value="opencode">opencode (OpenCode)</option>
+            <option value="hermes">hermes (Hermes)</option>
+            <option value="local">local (Local)</option>
           </select>
         </div>
         <div class="form-field">
@@ -1473,7 +1484,7 @@
         stats: null,
         telemetry: null,
         quota: null,
-        policy: { open: ["agy", "mock", "claude"], sensitive: ["claude"] },
+        policy: { open: ["agy", "mock", "claude", "opencode", "hermes", "local"], sensitive: ["claude"] },
         settings: null,
         selectedRunId: null,
         openPopoverProvider: null,
@@ -2212,6 +2223,15 @@
       }
 
       /* Política en vivo en modal Nueva tarea */
+      const BASE_AGENT_LABELS = {
+        mock: "mock (local determinista)",
+        agy: "agy (Gemini CLI)",
+        claude: "claude (Anthropic)",
+        opencode: "opencode (OpenCode)",
+        hermes: "hermes (Hermes)",
+        local: "local (Local)",
+      };
+
       function updateModalPolicyPreview() {
         const priv = $("nt-privacy").value;
         const allowed = (state.policy && state.policy[priv]) || [];
@@ -2229,7 +2249,7 @@
         Array.from(sel.options).forEach((opt) => {
           const ok = allowed.includes(opt.value);
           opt.disabled = !ok;
-          const base = opt.dataset.label || (opt.value === "mock" ? "mock (local determinista)" : opt.value === "agy" ? "agy (Gemini CLI)" : "claude (Anthropic)");
+          const base = opt.dataset.label || BASE_AGENT_LABELS[opt.value] || opt.value;
           opt.textContent = ok ? base : `${base} — bloqueado por política`;
         });
         if (!allowed.includes(sel.value) && allowed.length > 0) {

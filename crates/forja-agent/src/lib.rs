@@ -1,6 +1,9 @@
 pub mod agy;
 pub mod claude;
+pub mod hermes;
+pub mod local;
 pub mod mock;
+pub mod opencode;
 pub mod runner;
 
 use std::future::Future;
@@ -12,7 +15,10 @@ use serde::{Deserialize, Serialize};
 
 pub use agy::{build_command, parse_agy_output, AgyAgent, AgyCommandOptions};
 pub use claude::ClaudeAgent;
+pub use hermes::HermesAgent;
+pub use local::LocalAgent;
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
+pub use opencode::OpencodeAgent;
 pub use runner::{CommandResult, Runner};
 
 #[derive(Debug, Clone)]

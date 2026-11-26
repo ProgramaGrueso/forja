@@ -19,7 +19,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use forja_agent::{Agent, AgyAgent, MockAgent};
+use forja_agent::{Agent, AgyAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent};
 use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, Task};
 use forja_sched::Scheduler;
 use models::ModelService;
@@ -50,11 +50,17 @@ impl AppState {
         let mut agents: HashMap<AgentKind, Arc<dyn Agent>> = HashMap::new();
         agents.insert(AgentKind::Mock, Arc::new(MockAgent::default()));
         agents.insert(AgentKind::Agy, Arc::new(AgyAgent::default()));
+        agents.insert(AgentKind::Opencode, Arc::new(OpencodeAgent::default()));
+        agents.insert(AgentKind::Hermes, Arc::new(HermesAgent::default()));
+        agents.insert(AgentKind::Local, Arc::new(LocalAgent::default()));
 
         let metas = vec![
             AgentMeta::default_for(AgentKind::Agy, true),
             AgentMeta::default_for(AgentKind::Claude, false),
+            AgentMeta::default_for(AgentKind::Hermes, true),
+            AgentMeta::default_for(AgentKind::Local, true),
             AgentMeta::default_for(AgentKind::Mock, true),
+            AgentMeta::default_for(AgentKind::Opencode, true),
         ];
 
         let default_quota = default_manual_path();
@@ -724,9 +730,16 @@ mod tests {
             assert!(html.contains(item), "falta ítem de navegación: {item}");
         }
 
-        // Agentes base en barra lateral
-        for ag in ["agy", "claude", "mock"] {
-            assert!(html.contains(ag), "falta agente en HTML: {ag}");
+        // Agentes base en barra lateral y selects (mock, agy, claude + nuevos)
+        for sel in [
+            "<option value=\"agy\">",
+            "<option value=\"mock\">",
+            "<option value=\"claude\">",
+            "<option value=\"opencode\">",
+            "<option value=\"hermes\">",
+            "<option value=\"local\">",
+        ] {
+            assert!(html.contains(sel), "falta opción de agente en HTML: {sel}");
         }
 
         // Barra de proveedores fija abajo

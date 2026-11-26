@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use forja_agent::{Agent, AgyAgent, MockAgent};
+use forja_agent::{Agent, AgyAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent};
 use forja_core::{ForjaError, Privacy, Result, RunRecord, RunStatus, Task};
 use forja_sched::{Scheduler, SchedulerConfig};
 use forja_server::AppState;
@@ -33,6 +33,7 @@ pub struct Cli {
 pub enum Command {
     /// Ejecuta una tarea con un agente y espera su resultado.
     Run {
+        /// Agente que ejecuta la tarea: mock, agy, opencode, hermes o local.
         #[arg(long, value_enum)]
         agent: CliAgent,
 
@@ -63,6 +64,9 @@ pub enum Command {
 pub enum CliAgent {
     Mock,
     Agy,
+    Opencode,
+    Hermes,
+    Local,
 }
 
 impl CliAgent {
@@ -70,6 +74,9 @@ impl CliAgent {
         match self {
             Self::Mock => Arc::new(MockAgent::default()),
             Self::Agy => Arc::new(AgyAgent::default()),
+            Self::Opencode => Arc::new(OpencodeAgent::default()),
+            Self::Hermes => Arc::new(HermesAgent::default()),
+            Self::Local => Arc::new(LocalAgent::default()),
         }
     }
 }
@@ -313,6 +320,46 @@ mod tests {
                 assert!(auth_token.is_none());
             }
             other => panic!("subcomando inesperado: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_accepts_opencode_hermes_and_local() {
+        for (raw, expected) in [
+            ("opencode", CliAgent::Opencode),
+            ("hermes", CliAgent::Hermes),
+            ("local", CliAgent::Local),
+        ] {
+            let cli = Cli::try_parse_from([
+                "forja",
+                "run",
+                "--agent",
+                raw,
+                "--privacy",
+                "open",
+                "prompt",
+            ])
+            .expect("parsear run con agente nuevo");
+
+            match cli.command {
+                Command::Run { agent, .. } => assert_eq!(agent, expected),
+                other => panic!("subcomando inesperado: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_help_mentions_all_five_agents() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").expect("subcomando run");
+        let help = run.render_help().to_string();
+        for name in ["mock", "agy", "opencode", "hermes", "local"] {
+            assert!(
+                help.contains(name),
+                "run --help debe mencionar {name}; ayuda real:\n{help}"
+            );
         }
     }
 

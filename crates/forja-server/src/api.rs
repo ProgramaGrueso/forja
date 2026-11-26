@@ -34,6 +34,9 @@ impl AgentMeta {
             AgentKind::Mock => ("Local", "mock"),
             AgentKind::Agy => ("Gemini", forja_agent::agy::DEFAULT_MODEL),
             AgentKind::Claude => ("Anthropic", "sin configurar"),
+            AgentKind::Opencode => ("OpenCode", forja_agent::opencode::DEFAULT_MODEL),
+            AgentKind::Hermes => ("Hermes", forja_agent::hermes::DEFAULT_PROFILE),
+            AgentKind::Local => ("Local", forja_agent::local::DEFAULT_MODEL),
         };
         Self {
             kind,
@@ -542,10 +545,50 @@ mod tests {
         let (status, policy) = get_json(app.clone(), "/api/policy").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(policy["sensitive"], json!(["claude"]));
+        assert_eq!(
+            policy["open"],
+            json!(["agy", "mock", "claude", "opencode", "hermes", "local"])
+        );
 
         let (status, health) = get_json(app, "/api/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(health["version"], VERSION);
+    }
+
+    #[tokio::test]
+    async fn api_agents_lists_five_available_plus_claude() {
+        let (state, _s, _w) = state();
+        let app = build_router(state);
+
+        let (status, agents) = get_json(app, "/api/agents").await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = agents.as_array().expect("array de agentes");
+        assert_eq!(arr.len(), 6, "deben listar 5 agentes disponibles + claude");
+
+        let by_name = |name: &str| {
+            arr.iter()
+                .find(|a| a["name"] == name)
+                .unwrap_or_else(|| panic!("falta agente {name}"))
+        };
+
+        for name in ["mock", "agy", "opencode", "hermes", "local"] {
+            assert_eq!(
+                by_name(name)["available"],
+                true,
+                "{name} debe estar available"
+            );
+        }
+        assert_eq!(by_name("claude")["available"], false);
+
+        assert_eq!(by_name("opencode")["provider"], "OpenCode");
+        assert_eq!(
+            by_name("opencode")["model"],
+            "opencode-go/deepseek-v4.1-flash"
+        );
+        assert_eq!(by_name("hermes")["provider"], "Hermes");
+        assert_eq!(by_name("hermes")["model"], "yuuki");
+        assert_eq!(by_name("local")["provider"], "Local");
+        assert_eq!(by_name("local")["model"], "moe");
     }
 
     #[tokio::test]
