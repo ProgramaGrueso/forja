@@ -1,5 +1,7 @@
 # Forja
 
+![Panel de Forja](docs/capturas/01-resumen.png)
+
 Orquestador modular de agentes de código escrito en Rust. Lanza y supervisa tareas sobre worktrees de `git` aislados, aplica políticas de privacidad antes de ejecutar cualquier agente, persiste el historial en formato JSONL append-only y expone una API REST junto a un panel web local autocontenido.
 
 ## Inicio rápido
@@ -17,6 +19,22 @@ forja run --agent mock --privacy open "Crear archivo de prueba"
 ```
 
 Sin instalar, desde el repo de Forja: `cargo run -p forja-cli -- doctor`.
+
+### Qué hace cada comando
+
+- `forja doctor`: diagnostica tu entorno y te dice qué falta.
+- `forja serve --open`: levanta el panel web local (solo accesible desde tu máquina).
+- `forja run --agent AGENTE --privacy open|sensitive "tu tarea"`: ejecuta una tarea y muestra el resultado.
+- `forja list`: historial de ejecuciones.
+
+Cada tarea trabaja en un *worktree* (copia aislada) del repo en su propia rama `forja/...`; tu rama de trabajo no se toca hasta que tú decidas fusionar.
+
+### Si algo falla
+
+- `cargo: command not found`: instala Rust desde https://rustup.rs.
+- `forja: command not found` tras instalar: añade `~/.cargo/bin` a tu `PATH`.
+- Puerto ocupado: `forja serve --port 7788`.
+- Un agente aparece como no instalado: instálalo o usa `--agent mock`.
 
 Los datos (historial y worktrees) se guardan en `.forja/` dentro de donde ejecutes el comando; está en `.gitignore`.
 
@@ -43,7 +61,7 @@ Los datos (historial y worktrees) se guardan en `.forja/` dentro de donde ejecut
                         +-------------------+---------------+--------------+
 ```
 
-Para el detalle de cada crate y sus fronteras, consulta [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md).
+Para el detalle de cada crate y sus fronteras, consulta [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md); el historial de desarrollo está en `docs/historial/`.
 
 ## Puerta de calidad
 
@@ -91,5 +109,5 @@ cargo run -p forja-cli -- --repo /ruta/al/repo --base-branch main \
 
 ### Política de privacidad
 
-- `open`: permite todos los agentes: `agy`, `mock`, `claude`, `opencode`, `hermes` y `local` (los tres últimos, como `claude`, son stubs que devuelven `NotConfigured` hasta que se implementen).
+- `open`: permite todos los agentes: `agy`, `mock`, `claude`, `opencode`, `hermes` y `local` (cada uno requiere su CLI instalado; `forja doctor` te dice cuáles tienes).
 - `sensitive`: solo permite `claude`. Cualquier intento de ejecutar otro agente con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.
