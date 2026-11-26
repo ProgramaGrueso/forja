@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod friendly;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use forja_agent::{
     Agent, AgyAgent, ClaudeAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent,
@@ -24,8 +26,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub repo: Option<PathBuf>,
 
-    #[arg(long, global = true, default_value = "main")]
-    pub base_branch: String,
+    /// Rama base de los worktrees. Si no se indica, se usa la rama actual de `--repo` (o `main`).
+    #[arg(long, global = true)]
+    pub base_branch: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -59,6 +62,16 @@ pub enum Command {
         /// Token Bearer opcional para proteger las rutas /api/*, /tasks, /runs y /events.
         #[arg(long)]
         auth_token: Option<String>,
+
+        /// Abre el panel en el navegador al arrancar.
+        #[arg(long)]
+        open: bool,
+    },
+
+    /// Revisa el entorno (git, agentes instalados, repo, puerto) y dice qué falta.
+    Doctor {
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
     },
 }
 
@@ -105,7 +118,19 @@ pub async fn execute(cli: Cli) -> Result<()> {
     execute_with_writer(cli, &mut stdout).await
 }
 
-pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> {
+pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<()> {
+    if matches!(cli.command, Command::Run { .. } | Command::Serve { .. }) {
+        if cli.repo.is_none() {
+            cli.repo = friendly::detect_repo();
+        }
+        if cli.base_branch.is_none() {
+            cli.base_branch = cli.repo.as_deref().and_then(friendly::current_branch);
+        }
+    }
+    let base_branch = cli
+        .base_branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
     match cli.command {
         Command::Run {
             agent,
@@ -113,12 +138,8 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
             title,
             prompt,
         } => {
-            let scheduler = build_scheduler(
-                &cli.store_dir,
-                &cli.worktrees_dir,
-                cli.repo,
-                cli.base_branch,
-            )?;
+            let scheduler =
+                build_scheduler(&cli.store_dir, &cli.worktrees_dir, cli.repo, base_branch)?;
             let titulo = title.unwrap_or_else(|| derive_title(&prompt));
             let task = Task::new(titulo, prompt, privacy.into());
 
@@ -154,7 +175,12 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
             write_runs_table(&runs, out)?;
             Ok(())
         }
-        Command::Serve { port, auth_token } => {
+        Command::Doctor { port } => friendly::doctor(out, cli.repo.as_deref(), port),
+        Command::Serve {
+            port,
+            auth_token,
+            open,
+        } => {
             let settings_path = cli.store_dir.join("settings.json");
             let persisted = forja_server::settings::load_settings(&settings_path)
                 .ok()
@@ -176,8 +202,9 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
             let store = JsonlStore::new(&cli.store_dir)?;
             let mut sched_cfg = SchedulerConfig::new(&cli.worktrees_dir);
             sched_cfg.max_concurrency = max_concurrency;
+            let sched_repo = cli.repo.clone();
             sched_cfg.repo_path = cli.repo;
-            sched_cfg.base_branch = cli.base_branch;
+            sched_cfg.base_branch = base_branch.clone();
             let scheduler = Scheduler::new(store, sched_cfg)?;
 
             let settings = forja_server::settings::Settings {
@@ -195,8 +222,19 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
                 state = state.with_auth_token(token);
             }
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-            writeln!(out, "http://127.0.0.1:{port}")?;
+            let url = format!("http://127.0.0.1:{port}");
+            writeln!(out, "Forja listo en {url}  (Ctrl+C para salir)")?;
+            match &sched_repo {
+                Some(r) => writeln!(out, "Repo: {} (rama base: {base_branch})", r.display())?,
+                None => writeln!(
+                    out,
+                    "Sin repo git: las tareas no crean worktrees. Usa --repo o ejecuta Forja dentro de un repo."
+                )?,
+            }
             out.flush()?;
+            if open {
+                friendly::open_browser(&url);
+            }
             forja_server::serve(addr, state).await
         }
     }
@@ -287,7 +325,7 @@ mod tests {
             cli.repo.as_deref().and_then(|p| p.to_str()),
             Some("/tmp/repo")
         );
-        assert_eq!(cli.base_branch, "develop");
+        assert_eq!(cli.base_branch.as_deref(), Some("develop"));
 
         match cli.command {
             Command::Run {
@@ -311,7 +349,7 @@ mod tests {
         assert_eq!(cli.store_dir.to_str(), Some(".forja/store"));
         assert_eq!(cli.worktrees_dir.to_str(), Some(".forja/worktrees"));
         assert!(cli.repo.is_none());
-        assert_eq!(cli.base_branch, "main");
+        assert!(cli.base_branch.is_none());
         assert!(matches!(cli.command, Command::List));
     }
 
@@ -319,9 +357,14 @@ mod tests {
     fn parse_serve_subcommand() {
         let cli = Cli::try_parse_from(["forja", "serve", "--port", "7777"]).expect("parsear serve");
         match cli.command {
-            Command::Serve { port, auth_token } => {
+            Command::Serve {
+                port,
+                auth_token,
+                open,
+            } => {
                 assert_eq!(port, 7777);
                 assert!(auth_token.is_none());
+                assert!(!open);
             }
             other => panic!("subcomando inesperado: {other:?}"),
         }

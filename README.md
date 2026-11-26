@@ -2,6 +2,24 @@
 
 Orquestador modular de agentes de código escrito en Rust. Lanza y supervisa tareas sobre worktrees de `git` aislados, aplica políticas de privacidad antes de ejecutar cualquier agente, persiste el historial en formato JSONL append-only y expone una API REST junto a un panel web local autocontenido.
 
+## Inicio rápido
+
+Requisitos: [Rust](https://rustup.rs) y `git`. Los agentes (`claude`, `opencode`, `agy`, `hermes`, `llm`) son opcionales; con `mock` puedes probar sin instalar nada.
+
+```bash
+git clone <url-del-repo> forja && cd forja
+./install.sh            # compila e instala el binario `forja`
+forja doctor            # revisa git, agentes instalados, repo y puerto
+
+cd /ruta/a/tu-repo      # Forja detecta el repo y su rama actual solo
+forja serve --open      # panel en http://127.0.0.1:7777
+forja run --agent mock --privacy open "Crear archivo de prueba"
+```
+
+Sin instalar, desde el repo de Forja: `cargo run -p forja-cli -- doctor`.
+
+Los datos (historial y worktrees) se guardan en `.forja/` dentro de donde ejecutes el comando; está en `.gitignore`.
+
 ## Arquitectura
 
 ```text
