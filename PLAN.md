@@ -68,7 +68,7 @@ Estructura final:
       Planificador con máximo N ejecuciones simultáneas (por defecto 2), estados persistidos en el store.
       Hecho cuando: `cargo test -p forja-sched concurrency` pasa; un test lanza 6 tareas mock y comprueba
       que nunca hay más de N a la vez.
-- [ ] T12 forja-sched: reintentos y privacidad (45 min)
+- [x] T12 forja-sched: reintentos y privacidad (45 min)
       Reintento hasta 2 veces con backoff corto en tests; rechaza antes de ejecutar si la política no permite
       el agente pedido (Sensitive + Agy => error ForjaError::PolicyDenied).
       Hecho cuando: `cargo test -p forja-sched policy retry` pasa; el rechazo ocurre sin crear worktree.

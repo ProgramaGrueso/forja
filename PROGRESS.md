@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T11 (forja-sched: cola y concurrencia)
-- Tarea en curso: T12 (forja-sched: reintentos y privacidad)
+- Última tarea cerrada: T12 (forja-sched: reintentos y privacidad) — Fase 2 completa
+- Tarea en curso: T13 (forja-server: API REST)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -121,13 +121,23 @@
 - Notas para retomar: arranca T12 (reintentos hasta 2 veces + rechazo por política antes de crear worktree).
 
 ### T12 — forja-sched: reintentos y privacidad
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:15:20-05:00 / 2026-11-26T00:18:37-05:00
+- Quién la hizo: subagente noche/forja-T12 (verificado e integrado por agente principal)
+- Commits: 4a02231 T12: reintentos con backoff y validación de política en forja-sched
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-sched -- policy retry && ./scripts/check.sh` -> exit 0; `policy retry`: `3 passed`; `forja-sched`: `7 passed`; workspace: 48 tests en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: Fase 2 cerrada. Arranca Fase 3 con T13 (`forja-server`: API REST).
+
+### T13 — forja-server: API REST
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:15:20-05:00 /
-- Quién la hizo: subagente noche/forja-T12
+- Hora de inicio / fin: 2026-11-26T00:18:50-05:00 /
+- Quién la hizo: subagente noche/forja-T13
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T12.
+- Notas para retomar: worktree ../forja-wt-T13.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
@@ -154,6 +164,7 @@
 | 00:07 | T10 | noche/forja-T10 | gemini-4-neon-low | aceptado (4/4 tests forja-store + línea corrupta + check.sh en verde a la primera) |
 | 00:09 | T09 | noche/forja-T09 | gemini-4-neon-low | aceptado (5/5 tests parse + AgyAgent + check.sh en verde a la primera) |
 | 00:12 | T11 | noche/forja-T11 | gemini-4-neon-medium | aceptado (4/4 tests forja-sched + concurrencia/cancel/worktree + check.sh en verde) |
+| 00:16 | T12 | noche/forja-T12 | gemini-4-neon-medium | aceptado (3/3 tests policy/retry + 7/7 forja-sched + check.sh en verde) |
 
 ## Siguiente paso exacto
 Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.
