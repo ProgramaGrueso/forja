@@ -1,8 +1,12 @@
-//! Orquestador conversacional: un agente de Hermes que habla con el usuario,
-//! delega tareas en Forja y revisa sus resultados. El panel lo usa por texto o
-//! por voz (Web Speech API en el navegador).
+//! Orquestador conversacional: un agente (Hermes, claude, opencode, agy o local)
+//! que habla con el usuario, delega tareas en Forja y revisa sus resultados. El
+//! panel lo usa por texto o por voz (Web Speech API en el navegador).
+//!
+//! Hermes mantiene sesión (`--resume`); los demás CLIs se invocan one-shot y no
+//! recuerdan nada, así que el [`Orchestrator`] les reenvía el historial reciente
+//! en cada llamada ([`CliBackend`], [`history_block`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -11,16 +15,28 @@ use std::sync::{Arc, Mutex, RwLock};
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::Json;
-use forja_agent::hermes::validate_profile;
-use forja_agent::Runner;
+use forja_agent::hermes::ProfileRules;
+use forja_agent::{Agent, AgyAgent, ClaudeAgent, LocalAgent, OpencodeAgent, RunContext, Runner};
+use forja_core::{AgentKind, Privacy, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
+use crate::settings::Settings;
 use crate::AppState;
 
 /// Variable de entorno con el perfil de Hermes que hace de orquestador.
 pub const PROFILE_ENV: &str = "FORJA_ORCHESTRATOR_PROFILE";
+/// Variable de entorno con el agente que hace de orquestador.
+pub const AGENT_ENV: &str = "FORJA_ORCHESTRATOR_AGENT";
+/// Agentes que pueden hacer de orquestador.
+pub const ORCHESTRATOR_AGENTS: [&str; 5] = ["hermes", "claude", "opencode", "agy", "local"];
+/// Orden de la elección automática: el primero instalado gana.
+pub const AUTO_ORDER: [&str; 5] = ["claude", "opencode", "agy", "local", "hermes"];
+/// Intercambios (usuario + respuesta) que se reenvían a los CLIs sin sesión.
+pub const HISTORY_EXCHANGES: usize = 20;
+const HISTORY_MSG_CHARS: usize = 1500;
+const HISTORY_TOTAL_CHARS: usize = 30_000;
 const TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,18 +58,46 @@ pub trait ChatBackend: Send + Sync {
 
     /// Cambia el perfil en caliente (no-op si el backend no tiene perfiles).
     fn set_profile(&self, _profile: &str) {}
+
+    /// Agente que hay detrás (`hermes`, `claude`, ...; `custom` en los dobles de prueba).
+    fn agent_name(&self) -> String {
+        "custom".to_string()
+    }
+
+    /// `true` si el backend no conserva sesión entre llamadas: el orquestador
+    /// reenvía entonces el historial reciente con cada mensaje.
+    fn stateless(&self) -> bool {
+        false
+    }
+
+    /// Modelos por agente de los ajustes (no-op si el backend no usa modelos).
+    fn set_models(&self, _models: &BTreeMap<String, String>) {}
 }
 
 /// Backend real: `hermes -p <perfil> chat --query-file <f> -Q --oneshot [--resume <id>]`.
 pub struct HermesBackend {
     profile: RwLock<String>,
+    rules: ProfileRules,
+    program: String,
 }
 
 impl HermesBackend {
     pub fn from_env() -> Self {
+        Self::new(ProfileRules::new())
+    }
+
+    pub fn new(rules: ProfileRules) -> Self {
         Self {
             profile: RwLock::new(resolve_profile(None, env_profile().as_deref())),
+            rules,
+            program: "hermes".to_string(),
         }
+    }
+
+    /// Cambia el programa a ejecutar (los tests apuntan a un script falso).
+    pub fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = program.into();
+        self
     }
 }
 
@@ -110,10 +154,14 @@ impl ChatBackend for HermesBackend {
         }
     }
 
+    fn agent_name(&self) -> String {
+        "hermes".to_string()
+    }
+
     fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
         Box::pin(async move {
             let wanted = self.profile().unwrap_or_default();
-            let profile = validate_profile(&wanted).map_err(|e| e.to_string())?;
+            let profile = self.rules.validate(&wanted).map_err(|e| e.to_string())?;
             let dir = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -122,7 +170,8 @@ impl ChatBackend for HermesBackend {
             let file = dir.join(format!("forja-orq-{}-{nanos}.txt", std::process::id()));
             std::fs::write(&file, &prompt)
                 .map_err(|e| format!("no se pudo escribir la consulta: {e}"))?;
-            let argv = build_argv(&profile, &file, resume.as_deref());
+            let mut argv = build_argv(&profile, &file, resume.as_deref());
+            argv[0] = self.program.clone();
             let result = Runner::run_argv(&argv, &dir, TIMEOUT_SECS).await;
             let _ = std::fs::remove_file(&file);
             let out = result.map_err(|e| e.to_string())?;
@@ -138,6 +187,270 @@ impl ChatBackend for HermesBackend {
                 text,
                 session_id: parse_session_id(&out.stderr),
             })
+        })
+    }
+}
+
+/// Backend one-shot para claude, opencode, agy y local: reutiliza los agentes de
+/// `forja-agent` (mismo argv y parseo que en una tarea) con el modelo resuelto
+/// desde `agent_models`. No guarda sesión: cada llamada lleva el contexto.
+pub struct CliBackend {
+    kind: String,
+    models: RwLock<BTreeMap<String, String>>,
+    /// Programa alternativo (tests con scripts falsos).
+    program: Option<String>,
+}
+
+impl CliBackend {
+    pub fn new(kind: &str, models: BTreeMap<String, String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            models: RwLock::new(models),
+            program: None,
+        }
+    }
+
+    pub fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program = Some(program.into());
+        self
+    }
+
+    /// Agente de `forja-agent` con el modelo efectivo (ajustes > default en código).
+    pub fn make_agent(&self) -> Result<Arc<dyn Agent>, String> {
+        let kind: AgentKind = self
+            .kind
+            .parse()
+            .map_err(|_| format!("agente de orquestador desconocido: {}", self.kind))?;
+        let models = self.models.read().map(|m| m.clone()).unwrap_or_default();
+        let model = forja_agent::resolve_model(kind, None, &models)
+            .ok_or_else(|| format!("el agente {kind} no puede ser orquestador"))?;
+        let program = self.program.clone();
+        Ok(match kind {
+            AgentKind::Claude => {
+                let a = ClaudeAgent::default().with_model(model);
+                Arc::new(match program {
+                    Some(p) => a.with_program(p),
+                    None => a,
+                })
+            }
+            AgentKind::Opencode => {
+                let a = OpencodeAgent::new(model);
+                Arc::new(match program {
+                    Some(p) => a.with_program(p),
+                    None => a,
+                })
+            }
+            AgentKind::Agy => {
+                let a = AgyAgent::new(model, forja_agent::agy::DEFAULT_MODE);
+                Arc::new(match program {
+                    Some(p) => a.with_binary(p),
+                    None => a,
+                })
+            }
+            AgentKind::Local => {
+                let a = LocalAgent::new(model);
+                Arc::new(match program {
+                    Some(p) => a.with_program(p),
+                    None => a,
+                })
+            }
+            AgentKind::Hermes | AgentKind::Mock => {
+                return Err(format!(
+                    "el agente {kind} no puede ser orquestador one-shot"
+                ))
+            }
+        })
+    }
+}
+
+impl ChatBackend for CliBackend {
+    fn agent_name(&self) -> String {
+        self.kind.clone()
+    }
+
+    fn stateless(&self) -> bool {
+        true
+    }
+
+    fn set_models(&self, models: &BTreeMap<String, String>) {
+        if let Ok(mut m) = self.models.write() {
+            *m = models.clone();
+        }
+    }
+
+    fn chat(&self, prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+        Box::pin(async move {
+            let agent = self.make_agent()?;
+            // Directorio propio: el agente trabaja ahí, no en el repo ni en /tmp suelto.
+            let dir = std::env::temp_dir().join("forja-orquestador");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("no se pudo crear {}: {e}", dir.display()))?;
+            let ctx = RunContext {
+                task: Task::new("orquestador", prompt, Privacy::Open),
+                worktree: dir,
+                timeout_secs: TIMEOUT_SECS,
+            };
+            let out = agent.run(&ctx).await.map_err(|e| e.to_string())?;
+            let text = out.text.trim().to_string();
+            if text.is_empty() {
+                return Err(format!(
+                    "el orquestador ({}) no respondió (código {:?}): {}",
+                    self.kind,
+                    out.exit_code,
+                    out.raw_stderr.trim()
+                ));
+            }
+            Ok(ChatReply {
+                text,
+                session_id: None,
+            })
+        })
+    }
+}
+
+/// ¿Está instalado el CLI de este agente? (solo mira el `PATH`).
+pub fn agent_installed(agent: &str) -> bool {
+    use forja_agent::claude::program_available as on_path;
+    match agent {
+        "claude" | "opencode" | "agy" | "hermes" => on_path(agent),
+        "local" => on_path("llm") && on_path("opencode"),
+        _ => false,
+    }
+}
+
+/// Agentes de orquestador instalados, en [`AUTO_ORDER`].
+pub fn installed_agents(probe: &dyn Fn(&str) -> bool) -> Vec<String> {
+    AUTO_ORDER
+        .iter()
+        .filter(|a| probe(a))
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Agente elegido y de dónde sale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChoice {
+    pub agent: String,
+    /// `settings` | `env` | `auto`
+    pub source: &'static str,
+}
+
+fn valid_agent(raw: Option<&str>) -> Option<String> {
+    raw.map(|a| a.trim().to_lowercase())
+        .filter(|a| ORCHESTRATOR_AGENTS.contains(&a.as_str()))
+}
+
+/// Agente del orquestador: ajustes > env `FORJA_ORCHESTRATOR_AGENT` > el primero
+/// instalado en [`AUTO_ORDER`] (si no hay ninguno, `hermes`, como siempre).
+pub fn resolve_agent(
+    setting: Option<&str>,
+    env: Option<&str>,
+    probe: &dyn Fn(&str) -> bool,
+) -> AgentChoice {
+    if let Some(agent) = valid_agent(setting) {
+        return AgentChoice {
+            agent,
+            source: "settings",
+        };
+    }
+    if let Some(agent) = valid_agent(env) {
+        return AgentChoice {
+            agent,
+            source: "env",
+        };
+    }
+    let agent = installed_agents(probe)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "hermes".to_string());
+    AgentChoice {
+        agent,
+        source: "auto",
+    }
+}
+
+fn env_agent() -> Option<String> {
+    std::env::var(AGENT_ENV).ok()
+}
+
+/// Historial reciente para los CLIs sin sesión: hasta [`HISTORY_EXCHANGES`]
+/// intercambios (los mensajes de sistema se omiten), cada mensaje recortado y el
+/// total acotado; lo más antiguo se descarta primero. Vacío si no hay historial.
+pub fn history_block(messages: &[Message]) -> String {
+    let mut lines: Vec<String> = messages
+        .iter()
+        .filter(|m| m.rol != "sistema")
+        .map(|m| {
+            let who = if m.rol == "usuario" {
+                "Usuario"
+            } else {
+                "Orquestador"
+            };
+            let mut text: String = m.texto.chars().take(HISTORY_MSG_CHARS).collect();
+            if m.texto.chars().count() > HISTORY_MSG_CHARS {
+                text.push('…');
+            }
+            format!("{who}: {text}")
+        })
+        .collect();
+    let keep = HISTORY_EXCHANGES * 2;
+    if lines.len() > keep {
+        lines.drain(..lines.len() - keep);
+    }
+    while lines.len() > 1
+        && lines.iter().map(|l| l.chars().count() + 1).sum::<usize>() > HISTORY_TOTAL_CHARS
+    {
+        lines.remove(0);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Historial reciente de la conversación (del más antiguo al más reciente):\n{}\n\n",
+        lines.join("\n")
+    )
+}
+
+/// Cómo se construyen los backends del orquestador y qué agentes están instalados.
+#[derive(Clone)]
+pub struct BackendFactory {
+    pub rules: ProfileRules,
+    pub probe: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Programa alternativo por agente (scripts falsos en tests).
+    pub programs: BTreeMap<String, String>,
+}
+
+impl BackendFactory {
+    pub fn system(rules: ProfileRules) -> Self {
+        Self {
+            rules,
+            probe: Arc::new(agent_installed),
+            programs: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_probe(mut self, probe: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.probe = Arc::new(probe);
+        self
+    }
+
+    pub fn with_program(mut self, agent: &str, program: impl Into<String>) -> Self {
+        self.programs.insert(agent.to_string(), program.into());
+        self
+    }
+
+    pub fn build(&self, agent: &str, models: &BTreeMap<String, String>) -> Arc<dyn ChatBackend> {
+        if agent == "hermes" {
+            let b = HermesBackend::new(self.rules.clone());
+            return Arc::new(match self.programs.get("hermes") {
+                Some(p) => b.with_program(p.clone()),
+                None => b,
+            });
+        }
+        let b = CliBackend::new(agent, models.clone());
+        Arc::new(match self.programs.get(agent) {
+            Some(p) => b.with_program(p.clone()),
+            None => b,
         })
     }
 }
@@ -323,7 +636,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[derive(Clone)]
 pub struct Orchestrator {
-    backend: Arc<dyn ChatBackend>,
+    backend: Arc<RwLock<Arc<dyn ChatBackend>>>,
+    /// Con fábrica, el agente se puede cambiar en caliente; sin ella el backend es fijo.
+    factory: Option<BackendFactory>,
+    rules: ProfileRules,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -332,7 +648,9 @@ impl Orchestrator {
         let mut map = HashMap::new();
         map.insert(PRINCIPAL.to_string(), Conversation::new("Principal"));
         Self {
-            backend,
+            backend: Arc::new(RwLock::new(backend)),
+            factory: None,
+            rules: ProfileRules::new(),
             inner: Arc::new(Mutex::new(Inner {
                 map,
                 counter: 0,
@@ -341,9 +659,104 @@ impl Orchestrator {
         }
     }
 
-    /// Único punto donde se decide el backend (y con él el perfil de Hermes).
+    /// Reglas de perfiles (descubrimiento y ocultos) para validar en `apply_profile`.
+    pub fn with_rules(mut self, rules: ProfileRules) -> Self {
+        self.rules = rules.clone();
+        let agent = self.agent();
+        if let Some(f) = self.factory.as_mut() {
+            f.rules = rules;
+            let fresh = f.build(&agent, &BTreeMap::new());
+            *self.backend.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+        }
+        self
+    }
+
+    /// Orquestador con agente intercambiable. El agente inicial sale de
+    /// `FORJA_ORCHESTRATOR_AGENT` o de la detección automática.
+    pub fn from_factory(factory: BackendFactory) -> Self {
+        let choice = resolve_agent(None, env_agent().as_deref(), &*factory.probe);
+        let backend = factory.build(&choice.agent, &BTreeMap::new());
+        let mut orq = Self::new(backend).with_rules(factory.rules.clone());
+        orq.factory = Some(factory);
+        orq
+    }
+
+    /// Único punto donde se decide el backend inicial.
     pub fn from_env() -> Self {
-        Self::new(Arc::new(HermesBackend::from_env()))
+        Self::from_factory(BackendFactory::system(ProfileRules::new()))
+    }
+
+    pub fn rules(&self) -> &ProfileRules {
+        &self.rules
+    }
+
+    fn backend(&self) -> Arc<dyn ChatBackend> {
+        self.backend
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Agente activo (`hermes`, `claude`, ...).
+    pub fn agent(&self) -> String {
+        self.backend().agent_name()
+    }
+
+    /// Agentes instalados que pueden orquestar (en el orden automático).
+    pub fn agents_available(&self) -> Vec<String> {
+        match &self.factory {
+            Some(f) => installed_agents(&*f.probe),
+            None => installed_agents(&agent_installed),
+        }
+    }
+
+    /// Origen del agente activo según `setting`: `settings` | `env` | `auto`.
+    pub fn agent_source(&self, setting: Option<&str>) -> &'static str {
+        let probe: &dyn Fn(&str) -> bool = match &self.factory {
+            Some(f) => &*f.probe,
+            None => &agent_installed,
+        };
+        resolve_agent(setting, env_agent().as_deref(), probe).source
+    }
+
+    /// Perfiles de Hermes elegibles (descubiertos menos ocultos).
+    pub fn profiles(&self) -> Vec<String> {
+        self.rules.discover()
+    }
+
+    /// Comprueba, SIN aplicar nada, que el perfil de los ajustes existe y no está
+    /// oculto (con los ocultos de los propios ajustes incluidos).
+    pub fn check_settings(&self, s: &Settings) -> Result<(), String> {
+        if let Some(profile) = &s.orchestrator_profile {
+            self.rules
+                .validate_with_extra_hidden(profile, &s.hidden_profiles)
+                .map_err(|e| format!("orchestrator_profile: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Aplica en caliente ocultos, agente, modelos y perfil. Si cambia el agente o
+    /// el perfil se reinician las sesiones. Con ajustes ya validados por
+    /// [`Self::check_settings`] solo falla si el perfil desapareció del disco.
+    pub fn apply_settings(&self, s: &Settings) -> Result<(), String> {
+        self.rules.set_hidden(&s.hidden_profiles);
+        if let Some(f) = &self.factory {
+            let choice = resolve_agent(
+                s.orchestrator_agent.as_deref(),
+                env_agent().as_deref(),
+                &*f.probe,
+            );
+            if self.agent() != choice.agent {
+                let fresh = f.build(&choice.agent, &s.agent_models);
+                *self.backend.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+                self.reset_all_sessions();
+            }
+        }
+        self.backend().set_models(&s.agent_models);
+        if self.backend().profile().is_some() {
+            self.apply_profile(s.orchestrator_profile.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Sesión de Hermes de la conversación principal.
@@ -355,19 +768,20 @@ impl Orchestrator {
     /// perfil cambia, se reinicia la sesión. Devuelve el perfil efectivo.
     pub fn apply_profile(&self, setting: Option<&str>) -> Result<String, String> {
         let wanted = resolve_profile(setting, env_profile().as_deref());
-        let profile = validate_profile(&wanted).map_err(|e| e.to_string())?;
-        if self.backend.profile().as_deref() != Some(profile.as_str()) {
-            self.backend.set_profile(&profile);
+        let profile = self.rules.validate(&wanted).map_err(|e| e.to_string())?;
+        let backend = self.backend();
+        if backend.profile().as_deref() != Some(profile.as_str()) {
+            backend.set_profile(&profile);
             self.reset_all_sessions();
         }
         Ok(profile)
     }
 
     pub fn profile(&self) -> Option<String> {
-        self.backend.profile()
+        self.backend().profile()
     }
 
-    /// Olvida la sesión de Hermes de todas las conversaciones (cambio de perfil).
+    /// Olvida la sesión de Hermes de todas las conversaciones (cambio de perfil o agente).
     fn reset_all_sessions(&self) {
         let mut g = lock(&self.inner);
         for c in g.map.values_mut() {
@@ -518,7 +932,9 @@ impl Orchestrator {
         port: u16,
         token: Option<&str>,
     ) -> Result<String, ChatError> {
-        let (resume, cancel, seq) = {
+        let backend = self.backend();
+        let stateless = backend.stateless();
+        let (resume, cancel, seq, history) = {
             let mut g = lock(&self.inner);
             g.seq += 1;
             let seq = g.seq;
@@ -529,26 +945,42 @@ impl Orchestrator {
             if conv.title.is_empty() {
                 conv.title = auto_title(message);
             }
+            // Los CLIs sin sesión reciben el historial previo (sin el mensaje actual).
+            let history = if stateless {
+                history_block(&conv.messages)
+            } else {
+                String::new()
+            };
             conv.push("usuario", message);
             let cancel = Arc::new(Notify::new());
             conv.in_flight = Some(InFlight {
                 seq,
                 cancel: cancel.clone(),
             });
-            (conv.session_id.clone(), cancel, seq)
+            let resume = if stateless {
+                None
+            } else {
+                conv.session_id.clone()
+            };
+            (resume, cancel, seq, history)
         };
         let _guard = InFlightGuard {
             inner: self.inner.clone(),
             id: id.to_string(),
             seq,
         };
-        let prompt = if resume.is_some() {
+        let prompt = if stateless {
+            format!(
+                "{}{history}Mensaje del usuario:\n{message}",
+                system_prompt(port, token)
+            )
+        } else if resume.is_some() {
             message.to_string()
         } else {
             format!("{}{message}", system_prompt(port, token))
         };
         let outcome = tokio::select! {
-            r = self.backend.chat(prompt, resume) => Some(r),
+            r = backend.chat(prompt, resume) => Some(r),
             _ = cancel.notified() => None,
         };
         let mut g = lock(&self.inner);
@@ -893,10 +1325,32 @@ mod tests {
         assert_eq!(resolve_profile(Some(""), Some(" ")), "default");
     }
 
+    /// Base de Hermes falsa con perfiles: los tests nunca leen el ~/.hermes real.
+    fn fake_rules(profiles: &[&str]) -> (tempfile::TempDir, ProfileRules) {
+        let dir = tempfile::TempDir::new().unwrap();
+        for p in profiles {
+            std::fs::create_dir_all(dir.path().join("profiles").join(p)).unwrap();
+        }
+        let rules = ProfileRules::new().with_base(dir.path());
+        (dir, rules)
+    }
+
+    fn fake_script() -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fake_orch_agent.sh")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn base_settings() -> Settings {
+        Settings::with_defaults("/tmp/forja-test-store")
+    }
+
     #[tokio::test]
     async fn apply_profile_switches_hot_and_resets_session_only_on_change() {
+        let (_home, rules) = fake_rules(&["claudia"]);
         let backend = Arc::new(Profiled(RwLock::new("default".into())));
-        let orq = Orchestrator::new(backend.clone());
+        let orq = Orchestrator::new(backend.clone()).with_rules(rules);
         orq.say("hola", 7777, None).await.unwrap();
         assert!(orq.current_session().is_some());
 
@@ -912,13 +1366,249 @@ mod tests {
     }
 
     #[test]
-    fn apply_profile_rejects_private_and_unknown_profiles() {
+    fn apply_profile_rejects_hidden_and_unknown_profiles() {
+        let (_home, rules) = fake_rules(&["claudia", "privado"]);
+        rules.set_hidden(&["privado".to_string()]);
         let backend = Arc::new(Profiled(RwLock::new("default".into())));
-        let orq = Orchestrator::new(backend.clone());
-        for bad in ["intimo", "mama", "otro"] {
+        let orq = Orchestrator::new(backend.clone()).with_rules(rules);
+        for bad in ["privado", "otro"] {
             assert!(orq.apply_profile(Some(bad)).is_err(), "{bad}");
         }
         assert_eq!(backend.profile().as_deref(), Some("default"));
+        assert!(orq.apply_profile(Some("claudia")).is_ok());
+    }
+
+    #[test]
+    fn check_settings_uses_discovery_and_the_hidden_of_the_same_settings() {
+        let (_home, rules) = fake_rules(&["claudia", "privado"]);
+        let orq = Orchestrator::new(Arc::new(Fake(Mutex::new(vec![])))).with_rules(rules);
+        let mut s = base_settings();
+        s.orchestrator_profile = Some("claudia".into());
+        assert!(orq.check_settings(&s).is_ok());
+        s.orchestrator_profile = Some("fantasma".into());
+        assert!(orq.check_settings(&s).is_err());
+        s.orchestrator_profile = Some("privado".into());
+        s.hidden_profiles = vec!["privado".into()];
+        assert!(orq.check_settings(&s).is_err());
+        assert_eq!(orq.profiles(), vec!["default", "claudia", "privado"]);
+    }
+
+    fn only(list: &'static [&'static str]) -> impl Fn(&str) -> bool + Send + Sync {
+        move |a: &str| list.contains(&a)
+    }
+
+    #[test]
+    fn resolve_agent_priority_settings_env_auto() {
+        let all = only(&["claude", "opencode", "agy", "local", "hermes"]);
+        let c = resolve_agent(Some("agy"), Some("local"), &all);
+        assert_eq!((c.agent.as_str(), c.source), ("agy", "settings"));
+        let c = resolve_agent(Some("  "), Some("Local"), &all);
+        assert_eq!((c.agent.as_str(), c.source), ("local", "env"));
+        // Valores inválidos se ignoran y se cae a automático.
+        let c = resolve_agent(Some("mock"), Some("gpt"), &all);
+        assert_eq!((c.agent.as_str(), c.source), ("claude", "auto"));
+        // Orden automático: claude, opencode, agy, local, hermes.
+        for (installed, want) in [
+            (&["hermes", "local", "agy", "opencode"][..], "opencode"),
+            (&["hermes", "local", "agy"][..], "agy"),
+            (&["hermes", "local"][..], "local"),
+            (&["hermes"][..], "hermes"),
+            (&[][..], "hermes"),
+        ] {
+            let probe = move |a: &str| installed.contains(&a);
+            assert_eq!(resolve_agent(None, None, &probe).agent, want);
+        }
+    }
+
+    #[test]
+    fn history_block_keeps_last_20_exchanges_skips_system_and_clips() {
+        assert_eq!(history_block(&[]), "");
+        let mut msgs = Vec::new();
+        for i in 0..30 {
+            msgs.push(Message {
+                rol: "usuario".into(),
+                texto: format!("pregunta {i}"),
+                ts: 0,
+            });
+            msgs.push(Message {
+                rol: "orquestador".into(),
+                texto: format!("respuesta {i}"),
+                ts: 0,
+            });
+        }
+        msgs.push(Message {
+            rol: "sistema".into(),
+            texto: "Llamada cancelada con /stop.".into(),
+            ts: 0,
+        });
+        let h = history_block(&msgs);
+        assert!(!h.contains("pregunta 9\n") && !h.contains("respuesta 9\n"));
+        assert!(h.contains("Usuario: pregunta 10\n"), "{h}");
+        assert!(h.contains("Orquestador: respuesta 29"));
+        assert!(!h.contains("cancelada"));
+        assert_eq!(h.matches("Usuario:").count(), HISTORY_EXCHANGES);
+
+        let long = Message {
+            rol: "usuario".into(),
+            texto: "x".repeat(5000),
+            ts: 0,
+        };
+        let h = history_block(&[long]);
+        assert!(h.contains('…') && h.chars().count() < 1800);
+    }
+
+    #[tokio::test]
+    async fn cli_backend_runs_each_agent_one_shot_with_resolved_model() {
+        let models: BTreeMap<String, String> = [("claude".to_string(), "opus".to_string())].into();
+        for (kind, model) in [
+            ("claude", "opus"),
+            ("opencode", "opencode-go/deepseek-v4.1-flash"),
+            ("agy", "gemini-4-neon-medium"),
+        ] {
+            let b = CliBackend::new(kind, models.clone()).with_program(fake_script());
+            assert!(b.stateless());
+            assert_eq!(b.agent_name(), kind);
+            let r = b
+                .chat("hola \"mundo\"\nlinea 2".to_string(), None)
+                .await
+                .unwrap();
+            assert!(
+                r.text.contains(&format!("ECO[modelo={model}]")),
+                "{kind}: {}",
+                r.text
+            );
+            assert!(
+                r.text.contains("hola \"mundo\"\nlinea 2"),
+                "{kind}: {}",
+                r.text
+            );
+            assert_eq!(r.session_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_backend_hot_models_missing_program_and_failures() {
+        let b = CliBackend::new("claude", BTreeMap::new()).with_program(fake_script());
+        let r = b.chat("a".into(), None).await.unwrap();
+        assert!(r.text.contains("ECO[modelo=sonnet]"), "{}", r.text);
+        b.set_models(&[("claude".to_string(), "haiku".to_string())].into());
+        let r = b.chat("a".into(), None).await.unwrap();
+        assert!(r.text.contains("ECO[modelo=haiku]"), "{}", r.text);
+
+        let missing = CliBackend::new("opencode", BTreeMap::new())
+            .with_program("/no/existe/forja-falso-orquestador");
+        assert!(missing.chat("a".into(), None).await.is_err());
+
+        // hermes y mock no son orquestadores one-shot.
+        assert!(CliBackend::new("hermes", BTreeMap::new())
+            .make_agent()
+            .is_err());
+        assert!(CliBackend::new("nope", BTreeMap::new())
+            .make_agent()
+            .is_err());
+        // local resuelve su modelo (alias moe) sin ejecutar nada.
+        let local = CliBackend::new("local", BTreeMap::new())
+            .make_agent()
+            .unwrap();
+        assert_eq!(local.model().as_deref(), Some("moe"));
+    }
+
+    #[tokio::test]
+    async fn stateless_backend_gets_history_each_turn_and_never_resumes() {
+        let (_home, rules) = fake_rules(&[]);
+        let factory = BackendFactory::system(rules)
+            .with_probe(only(&["claude"]))
+            .with_program("claude", fake_script());
+        let orq = Orchestrator::from_factory(factory);
+        if std::env::var(AGENT_ENV).is_err() {
+            assert_eq!(orq.agent(), "claude");
+        }
+        orq.apply_settings(&{
+            let mut s = base_settings();
+            s.orchestrator_agent = Some("claude".into());
+            s
+        })
+        .unwrap();
+        let r1 = orq.say("primera pregunta", 7777, Some("tk")).await.unwrap();
+        assert!(
+            r1.contains("delegar y revisar"),
+            "lleva instrucciones: {r1}"
+        );
+        assert!(r1.contains("Bearer tk"));
+        assert!(
+            !r1.contains("Historial reciente"),
+            "sin historial en el turno 1"
+        );
+        let r2 = orq.say("segunda pregunta", 7777, None).await.unwrap();
+        assert!(
+            r2.contains("delegar y revisar"),
+            "cada llamada lleva instrucciones"
+        );
+        assert!(r2.contains("Historial reciente"), "{r2}");
+        assert!(r2.contains("Usuario: primera pregunta"));
+        assert!(r2.contains("Orquestador: ECO[modelo=sonnet]"));
+        assert!(r2.contains("Mensaje del usuario:\nsegunda pregunta"));
+        // El mensaje actual no se duplica dentro del historial.
+        assert_eq!(r2.matches("Usuario: segunda pregunta").count(), 0);
+        assert!(orq.current_session().is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_settings_switches_agent_hot_and_resets_sessions() {
+        let (_home, rules) = fake_rules(&["claudia"]);
+        let factory = BackendFactory::system(rules)
+            .with_probe(only(&["opencode", "hermes"]))
+            .with_program("opencode", fake_script());
+        let orq = Orchestrator::from_factory(factory);
+        let mut s = base_settings();
+        s.orchestrator_agent = Some("opencode".into());
+        orq.apply_settings(&s).unwrap();
+        assert_eq!(orq.agent(), "opencode");
+        assert_eq!(orq.profile(), None);
+        assert_eq!(orq.agents_available(), vec!["opencode", "hermes"]);
+        let r = orq.say("hola", 7777, None).await.unwrap();
+        assert!(
+            r.contains("ECO[modelo=opencode-go/deepseek-v4.1-flash]"),
+            "{r}"
+        );
+
+        // El modelo de los ajustes se aplica en caliente.
+        s.agent_models.insert("opencode".into(), "oc/otro".into());
+        orq.apply_settings(&s).unwrap();
+        let r = orq.say("de nuevo", 7777, None).await.unwrap();
+        assert!(r.contains("ECO[modelo=oc/otro]"), "{r}");
+
+        // Cambiar a hermes aplica el perfil y reinicia sesiones.
+        s.orchestrator_agent = Some("hermes".into());
+        s.orchestrator_profile = Some("claudia".into());
+        orq.apply_settings(&s).unwrap();
+        assert_eq!(orq.agent(), "hermes");
+        assert_eq!(orq.profile().as_deref(), Some("claudia"));
+
+        // Un perfil que no existe falla y no cambia el perfil activo.
+        s.orchestrator_profile = Some("fantasma".into());
+        assert!(orq.apply_settings(&s).is_err());
+        assert_eq!(orq.profile().as_deref(), Some("claudia"));
+
+        // Quitar el ajuste de agente vuelve a automático (opencode instalado).
+        s.orchestrator_agent = None;
+        s.orchestrator_profile = None;
+        if std::env::var(AGENT_ENV).is_err() {
+            orq.apply_settings(&s).unwrap();
+            assert_eq!(orq.agent(), "opencode");
+            assert_eq!(orq.agent_source(None), "auto");
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_profile_in_settings_is_rejected_by_hermes_backend_at_chat_time() {
+        let (_home, rules) = fake_rules(&["privado"]);
+        // Programa inexistente: si el rechazo no ocurriera antes, fallaría distinto.
+        let backend = HermesBackend::new(rules.clone()).with_program("/no/existe/hermes-falso");
+        backend.set_profile("privado");
+        rules.set_hidden(&["privado".to_string()]);
+        let err = backend.chat("hola".into(), None).await.unwrap_err();
+        assert!(err.contains("oculto"), "{err}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ Requisitos: [Rust](https://rustup.rs) y `git`. Los agentes (`claude`, `opencode`
 git clone <url-del-repo> forja && cd forja
 ./install.sh            # compila e instala el binario `forja`
 forja doctor            # revisa git, agentes instalados, repo y puerto
+forja init              # asistente: agente del orquestador, modelos, perfiles ocultos
 
 cd /ruta/a/tu-repo      # Forja detecta el repo y su rama actual solo
 forja serve --open      # panel en http://127.0.0.1:7777
@@ -22,7 +23,8 @@ Sin instalar, desde el repo de Forja: `cargo run -p forja-cli -- doctor`.
 
 ### Qué hace cada comando
 
-- `forja doctor`: diagnostica tu entorno y te dice qué falta.
+- `forja doctor`: diagnostica tu entorno y te dice qué falta (si no hay `settings.json`, te sugiere `forja init`; con `--fix` lanza el asistente al terminar).
+- `forja init [--yes]`: asistente de primer arranque, ver [Configuración inicial](#configuración-inicial-forja-init).
 - `forja serve --open`: levanta el panel web local (solo accesible desde tu máquina).
 - `forja run --agent AGENTE --privacy open|sensitive "tu tarea"`: ejecuta una tarea y muestra el resultado.
 - `forja list`: historial de ejecuciones.
@@ -33,15 +35,41 @@ Cada tarea trabaja en un *worktree* (copia aislada) del repo en su propia rama `
 
 En el panel, pestaña **Orquestador**: conversas por texto o pulsas **Llamar** para hablar y que te responda en voz alta, como una llamada. Él delega el trabajo en los agentes de Forja y revisa el resultado antes de decirte que está listo.
 
-- Usa Hermes como cerebro: `export FORJA_ORCHESTRATOR_PROFILE=tu-perfil` (por defecto `default`; solo perfiles de la lista blanca).
+- El «cerebro» es cualquiera de tus agentes: `hermes`, `claude`, `opencode`, `agy` o `local`. Se resuelve así: ajuste `orchestrator_agent` (panel → Ajustes) > variable `FORJA_ORCHESTRATOR_AGENT` > automático (el primero instalado en este orden: claude, opencode, agy, local, hermes). Cambiarlo en Ajustes se aplica en caliente y reinicia las sesiones.
+- Con `hermes` mantiene sesión y eliges el perfil: ajuste `orchestrator_profile` > `FORJA_ORCHESTRATOR_PROFILE` > `default`. Los perfiles se **descubren** (`default` + subdirectorios de `$HERMES_HOME/profiles`, o `~/.hermes/profiles`); no hay nombres fijos.
+- Con los demás agentes se hace una llamada one-shot a su CLI (mismo modelo que resuelves por agente en Ajustes) y, como esos CLIs no guardan sesión, Forja reenvía en cada mensaje las instrucciones del orquestador y los últimos 20 intercambios de la conversación.
+- Las tareas que el orquestador delega siguen la política de privacidad de siempre (`open`/`sensitive`); elegir otro agente de orquestador no la modifica.
 - La voz usa el navegador (Web Speech API): funciona en Chrome, Edge y Chromium, necesita internet y permiso de micrófono.
 
 ### Orquestador, modelos y terminales en el panel
 
 - **Conversaciones**: en **Orquestador** hay una lista lateral (máx. 20) con un historial independiente por conversación; varias pueden estar «pensando» a la vez. `+ Nueva` crea otra; ✕ la borra (con confirmación). La seleccionada se recuerda.
 - **Comandos `/`**: al escribir `/` aparece el autocompletado. `/new` (conversación nueva), `/help`, `/rename <título>`, `/agents`, `/stop`; `/model` y `/agent` están reservados («disponible pronto»).
-- **Elegir orquestador y modelos** (pestaña **Ajustes**, el selector de perfil también está en la cabecera de Orquestador): perfil de Hermes del orquestador (cambiarlo reinicia sus sesiones) y modelo por agente (`claude`, `agy`, `opencode`, `local`; vacío = default). En **Nueva tarea** el campo opcional «Modelo» lo sobrescribe para esa ejecución (no aplica a `mock` ni `hermes`).
+- **Elegir orquestador y modelos** (pestaña **Ajustes**; el selector de agente —y de perfil si es hermes— también está en la cabecera de Orquestador): agente del orquestador y perfil de Hermes (cambiarlos reinicia sus sesiones), perfiles de Hermes ocultos y modelo por agente (`claude`, `agy`, `opencode`, `local`; vacío = default). En **Nueva tarea** el campo opcional «Modelo» lo sobrescribe para esa ejecución (no aplica a `mock` ni `hermes`).
 - **Terminales**: vista con 1–4 paneles que muestran en vivo la salida de varias ejecuciones a la vez (stderr en rojo, autoscroll que se pausa si subes, cancelar/limpiar/cerrar). Las tareas nuevas se abren solas en un panel libre.
+
+### Configuración inicial (`forja init`)
+
+`forja init` detecta los agentes instalados y te pregunta, con un valor por defecto que aceptas con Enter: qué agente orquesta, qué modelo usar por agente (muestra el default) y, si tienes Hermes, qué perfiles ocultar. Escribe `<store_dir>/settings.json` (por defecto `.forja/store/settings.json`) **fusionando** con lo que ya haya: no pisa otros campos, une los modelos y nunca quita perfiles ocultos. Al final imprime el comando para arrancar. `forja init --yes` no pregunta y acepta los defaults (también útil en scripts).
+
+Todo es opcional: sin `settings.json` Forja funciona con defaults y elige el orquestador automáticamente. `settings.json` admite, además de los campos de siempre:
+
+```json
+{
+  "orchestrator_agent": "claude",
+  "orchestrator_profile": null,
+  "agent_models": { "claude": "sonnet" },
+  "hidden_profiles": []
+}
+```
+
+**Ocultar perfiles privados de Hermes.** Si algún perfil de Hermes no debe verse ni usarse desde Forja, añádelo a `hidden_profiles` (panel → Ajustes → «Perfiles de Hermes ocultos», o a mano en `settings.json`) o expórtalo en el entorno:
+
+```bash
+export FORJA_HIDDEN_PROFILES=privado,personal   # lista separada por comas
+```
+
+La lista efectiva es la unión de ambas. Un perfil oculto no aparece en las listas del panel ni de `/api/orchestrator/profile` y `/api/models`, no se puede elegir, y se rechaza en el orquestador y en el agente `hermes` (`forja run --agent hermes`) antes de ejecutar nada. El código no trae ningún nombre oculto de fábrica: la protección es tuya y está en tu configuración.
 
 ### Si algo falla
 
@@ -49,6 +77,8 @@ En el panel, pestaña **Orquestador**: conversas por texto o pulsas **Llamar** p
 - `forja: command not found` tras instalar: añade `~/.cargo/bin` a tu `PATH`.
 - Puerto ocupado: `forja serve --port 7788`.
 - Un agente aparece como no instalado: instálalo o usa `--agent mock`.
+
+Variables de entorno: `FORJA_ORCHESTRATOR_AGENT`, `FORJA_ORCHESTRATOR_PROFILE`, `FORJA_HIDDEN_PROFILES`, y `HERMES_HOME` (dónde buscar perfiles de Hermes; por defecto `~/.hermes`).
 
 Los datos (historial y worktrees) se guardan en `.forja/` dentro de donde ejecutes el comando; está en `.gitignore`.
 

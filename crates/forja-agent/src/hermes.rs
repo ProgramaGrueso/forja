@@ -6,12 +6,16 @@
 //! íntegro en un archivo temporal con nombre único (uuid v4) creado en
 //! `std::env::temp_dir()` y borrado al terminar, incluso si hay error.
 //!
-//! Los perfiles están restringidos a una lista blanca ([`ALLOWED_PROFILES`]);
-//! cualquier otro (en particular los privados "intimo" y "mama") se rechaza
-//! con `ForjaError::InvalidInput` ANTES de crear archivos o procesos.
+//! Los perfiles se DESCUBREN (`default` + subdirectorios de
+//! `<HERMES_HOME o ~/.hermes>/profiles`, ver [`discover_profiles_in`]) y se
+//! pueden ocultar con la lista configurable de [`ProfileRules`] (ajuste
+//! `hidden_profiles` y variable `FORJA_HIDDEN_PROFILES`). Un perfil inexistente
+//! u oculto se rechaza con `ForjaError::InvalidInput` ANTES de crear archivos o
+//! procesos.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use forja_core::{AgentKind, ForjaError, Result};
 use uuid::Uuid;
@@ -19,17 +23,15 @@ use uuid::Uuid;
 use crate::{Agent, AgentFuture, AgentOutput, RunContext, Runner};
 
 /// Perfil por defecto del adaptador Hermes.
-pub const DEFAULT_PROFILE: &str = "yuuki";
+pub const DEFAULT_PROFILE: &str = "default";
 
-/// Lista blanca de perfiles permitidos. Los perfiles privados ("intimo" y
-/// "mama") quedan fuera a propósito, igual que en el panel del servidor
-/// (`forja_server::models::HIDDEN_HERMES_PROFILES`).
-pub const ALLOWED_PROFILES: [&str; 3] = ["default", "claudia", "yuuki"];
+/// Variable de entorno con perfiles ocultos (lista separada por comas).
+pub const HIDDEN_PROFILES_ENV: &str = "FORJA_HIDDEN_PROFILES";
 
 /// Opciones puras para armar el argv de hermes (no ejecuta nada).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HermesCommandOptions {
-    /// Perfil ya validado contra la lista blanca.
+    /// Perfil ya validado (existente y no oculto).
     pub profile: String,
     /// Ruta del archivo con el prompt; el CLI lo lee tal cual.
     pub query_file: PathBuf,
@@ -66,34 +68,45 @@ pub fn build_command(opts: &HermesCommandOptions) -> Vec<String> {
     ]
 }
 
-/// Normaliza y valida el perfil ANTES de ejecutar nada.
+/// Normaliza y valida el FORMATO del perfil (sin tocar el disco).
 ///
 /// La normalización (recortar y pasar a minúsculas) espeja lo que hace el
-/// propio hermes con `-p`, de modo que "Yuuki" seleccione "yuuki" y "INTIMO"
-/// siga bloqueándose. Un nombre válido solo tiene letras, números, guion y
+/// propio hermes con `-p`. Un nombre válido solo tiene letras, números, guion y
 /// guion bajo, no empieza por guion ni guion bajo y mide como máximo 64
 /// caracteres (espeja la regla interna de hermes `^[a-z0-9][a-z0-9_-]{0,63}$`).
-/// Además debe estar en [`ALLOWED_PROFILES`].
-///
-/// Devuelve el perfil normalizado que usará el comando.
-pub fn validate_profile(profile: &str) -> Result<String> {
+pub fn validate_profile_format(profile: &str) -> Result<String> {
     let normalized = profile.trim().to_lowercase();
-
     if !is_valid_profile_name(&normalized) {
         return Err(ForjaError::InvalidInput(format!(
             "nombre de perfil de hermes inválido: \"{profile}\" \
              (solo letras, números, guion y guion bajo)"
         )));
     }
+    Ok(normalized)
+}
 
-    if !ALLOWED_PROFILES.contains(&normalized.as_str()) {
+/// Valida un perfil contra la lista descubierta y la de ocultos (función pura).
+///
+/// Orden: formato, oculto, existencia. Devuelve el perfil normalizado.
+pub fn validate_profile_with(
+    profile: &str,
+    available: &[String],
+    hidden: &[String],
+) -> Result<String> {
+    let normalized = validate_profile_format(profile)?;
+    if hidden.iter().any(|h| h == &normalized) {
         return Err(ForjaError::InvalidInput(format!(
-            "perfil de hermes no permitido: \"{normalized}\" \
-             (los permitidos son: {})",
-            ALLOWED_PROFILES.join(", ")
+            "perfil de hermes no permitido: \"{normalized}\" está oculto \
+             (hidden_profiles / {HIDDEN_PROFILES_ENV})"
         )));
     }
-
+    if !available.iter().any(|a| a == &normalized) {
+        return Err(ForjaError::InvalidInput(format!(
+            "perfil de hermes no permitido: \"{normalized}\" no existe \
+             (los disponibles son: {})",
+            available.join(", ")
+        )));
+    }
     Ok(normalized)
 }
 
@@ -105,6 +118,134 @@ fn is_valid_profile_name(name: &str) -> bool {
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
         && name.chars().count() <= 64
+}
+
+/// Directorio base de Hermes: `HERMES_HOME` o `~/.hermes`. No toca el disco.
+pub fn hermes_base() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HERMES_HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".hermes"))
+}
+
+/// Descubre perfiles bajo `base`: `default` más cada subdirectorio de
+/// `<base>/profiles` con nombre válido. Ordenados alfabéticamente tras `default`.
+/// Función pura respecto al entorno: solo lista el directorio que recibe.
+pub fn discover_profiles_in(base: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(base.join("profiles"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| is_valid_profile_name(n))
+        .filter(|n| n != "default")
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut out = vec!["default".to_string()];
+    out.extend(names);
+    out
+}
+
+/// Interpreta una lista separada por comas (normaliza, quita vacíos y repetidos).
+pub fn parse_hidden_list(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim().to_lowercase();
+        if !item.is_empty() && !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Reglas de perfiles: dónde descubrirlos y cuáles están ocultos. Los clones
+/// comparten la lista de ocultos, de modo que un cambio en caliente llega al
+/// agente y al orquestador a la vez.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileRules {
+    /// Base de Hermes; `None` => `HERMES_HOME` o `~/.hermes`.
+    base: Option<PathBuf>,
+    /// Ocultos de los ajustes (se suman a los de `FORJA_HIDDEN_PROFILES`).
+    hidden: Arc<RwLock<Vec<String>>>,
+}
+
+impl ProfileRules {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fija la base de Hermes (tests y despliegues con `HERMES_HOME` propio).
+    pub fn with_base(mut self, base: impl Into<PathBuf>) -> Self {
+        self.base = Some(base.into());
+        self
+    }
+
+    /// Reemplaza la lista de ocultos configurada (los ajustes).
+    pub fn set_hidden(&self, hidden: &[String]) {
+        let mut g = self.hidden.write().unwrap_or_else(|e| e.into_inner());
+        *g = hidden.iter().map(|h| h.trim().to_lowercase()).collect();
+    }
+
+    /// Ocultos efectivos: ajustes ∪ `FORJA_HIDDEN_PROFILES`.
+    pub fn hidden(&self) -> Vec<String> {
+        let env = std::env::var(HIDDEN_PROFILES_ENV).unwrap_or_default();
+        self.hidden_with_env(&env)
+    }
+
+    /// Como [`Self::hidden`] pero con el valor del entorno inyectado.
+    pub fn hidden_with_env(&self, env: &str) -> Vec<String> {
+        let mut out = self
+            .hidden
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for h in parse_hidden_list(env) {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    /// Todos los perfiles que existen (incluidos los ocultos).
+    pub fn discover_all(&self) -> Vec<String> {
+        match self.base.clone().or_else(hermes_base) {
+            Some(base) => discover_profiles_in(&base),
+            None => vec!["default".to_string()],
+        }
+    }
+
+    /// Perfiles elegibles: descubiertos menos los ocultos.
+    pub fn discover(&self) -> Vec<String> {
+        let hidden = self.hidden();
+        self.discover_all()
+            .into_iter()
+            .filter(|p| !hidden.contains(p))
+            .collect()
+    }
+
+    /// Valida un perfil: formato, no oculto y existente.
+    pub fn validate(&self, profile: &str) -> Result<String> {
+        self.validate_with_extra_hidden(profile, &[])
+    }
+
+    /// Igual que [`Self::validate`] sumando ocultos propuestos (ajustes que aún
+    /// no se aplicaron).
+    pub fn validate_with_extra_hidden(&self, profile: &str, extra: &[String]) -> Result<String> {
+        let mut hidden = self.hidden();
+        hidden.extend(extra.iter().map(|h| h.trim().to_lowercase()));
+        validate_profile_with(profile, &self.discover_all(), &hidden)
+    }
+}
+
+/// Valida un perfil con las reglas por defecto (entorno real). Para tests y
+/// código con reglas propias usa [`ProfileRules`] o [`validate_profile_with`].
+pub fn validate_profile(profile: &str) -> Result<String> {
+    ProfileRules::new().validate(profile)
 }
 
 /// Parseo tolerante de la salida de hermes: nunca hace panic.
@@ -140,8 +281,10 @@ pub fn parse_hermes_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -
 /// temporal y captura su salida con timeout.
 #[derive(Debug, Clone)]
 pub struct HermesAgent {
-    /// Perfil de hermes (`-p`); se valida contra la lista blanca en cada ejecución.
+    /// Perfil de hermes (`-p`); se valida (existe y no está oculto) en cada ejecución.
     pub profile: String,
+    /// Reglas de descubrimiento y ocultos.
+    pub rules: ProfileRules,
     /// Programa que se ejecuta (por defecto "hermes"); los tests lo apuntan
     /// a un script falso.
     pub program: String,
@@ -158,7 +301,14 @@ impl HermesAgent {
         Self {
             profile: profile.into(),
             program: "hermes".to_string(),
+            rules: ProfileRules::new(),
         }
+    }
+
+    /// Usa reglas de perfiles propias (ocultos compartidos, base de Hermes).
+    pub fn with_rules(mut self, rules: ProfileRules) -> Self {
+        self.rules = rules;
+        self
     }
 
     /// Cambia el programa a ejecutar (p. ej. un script falso en tests).
@@ -218,9 +368,9 @@ impl Agent for HermesAgent {
 
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
         Box::pin(async move {
-            // 1. Validar el perfil ANTES de crear archivos o procesos: la
-            //    lista blanca excluye los perfiles privados.
-            let profile = validate_profile(&self.profile)?;
+            // 1. Validar el perfil ANTES de crear archivos o procesos: debe
+            //    existir y no estar oculto.
+            let profile = self.rules.validate(&self.profile)?;
 
             // 2. Prompt en un archivo temporal único (uuid v4) en temp_dir().
             let prompt_path =
@@ -272,6 +422,22 @@ mod tests {
             .into_owned()
     }
 
+    /// Base de Hermes falsa con los perfiles dados (nunca toca el ~/.hermes real).
+    fn fake_home(profiles: &[&str]) -> (tempfile::TempDir, ProfileRules) {
+        let dir = tempdir().expect("tempdir");
+        for p in profiles {
+            std::fs::create_dir_all(dir.path().join("profiles").join(p)).expect("perfil falso");
+        }
+        let rules = ProfileRules::new().with_base(dir.path());
+        (dir, rules)
+    }
+
+    fn agent_with(profile: &str, rules: &ProfileRules) -> HermesAgent {
+        HermesAgent::new(profile)
+            .with_program(fake_hermes_path())
+            .with_rules(rules.clone())
+    }
+
     fn ctx_for(prompt: &str, worktree: &Path, timeout_secs: u64) -> RunContext {
         RunContext {
             task: Task::new("Tarea Hermes", prompt, Privacy::Open),
@@ -294,7 +460,7 @@ mod tests {
     fn hermes_agent_keeps_profile_and_program_defaults() {
         let agent = HermesAgent::default();
         assert_eq!(agent.profile, DEFAULT_PROFILE);
-        assert_eq!(agent.profile, "yuuki");
+        assert_eq!(agent.profile, "default");
         assert_eq!(agent.program, "hermes");
         assert_eq!(HermesAgent::new("otro-perfil").profile, "otro-perfil");
         assert_eq!(
@@ -340,38 +506,89 @@ mod tests {
         assert_eq!(argv[7], "--oneshot");
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn hermes_validate_profile_accepts_whitelisted_and_normalizes() {
-        assert_eq!(validate_profile("yuuki").expect("yuuki permitido"), "yuuki");
+    fn hermes_validate_profile_accepts_discovered_and_normalizes() {
+        let available = names(&["default", "claudia", "yuuki"]);
         assert_eq!(
-            validate_profile("  Yuuki ").expect("mayúsculas y espacios ok"),
+            validate_profile_with("  Yuuki ", &available, &[]).expect("normaliza"),
             "yuuki"
         );
         assert_eq!(
-            validate_profile("claudia").expect("claudia permitido"),
-            "claudia"
-        );
-        assert_eq!(
-            validate_profile("default").expect("default permitido"),
+            validate_profile_with("default", &available, &[]).expect("default"),
             "default"
         );
     }
 
     #[test]
-    fn hermes_validate_profile_rejects_unknown_and_private() {
-        for profile in ["intimo", "mama", "INTIMO", "MaMa", "yuuki2", "trabajo"] {
-            let err = validate_profile(profile).expect_err("perfil fuera de la lista blanca");
+    fn hermes_validate_profile_rejects_unknown_and_hidden() {
+        let available = names(&["default", "claudia", "secreto"]);
+        let hidden = names(&["secreto"]);
+        for (profile, needle) in [("SECRETO", "oculto"), ("trabajo", "no existe")] {
+            let err = validate_profile_with(profile, &available, &hidden)
+                .expect_err("oculto o inexistente");
             match err {
                 ForjaError::InvalidInput(msg) => {
                     assert!(msg.contains("no permitido"), "mensaje poco claro: {msg}");
+                    assert!(msg.contains(needle), "esperaba {needle:?}: {msg}");
                     assert!(
-                        msg.contains(profile.trim().to_lowercase().as_str()),
+                        msg.contains(profile.to_lowercase().as_str()),
                         "debe nombrar el perfil rechazado: {msg}"
                     );
                 }
                 other => panic!("esperaba InvalidInput para {profile}, obtuve {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn hermes_discover_profiles_lists_default_plus_valid_subdirs() {
+        let dir = tempdir().expect("tempdir");
+        let profiles = dir.path().join("profiles");
+        for d in ["zeta", "alfa", "Mayus", "-malo", "con espacio", "default"] {
+            std::fs::create_dir_all(profiles.join(d)).expect("dir");
+        }
+        // Un archivo suelto no es un perfil.
+        std::fs::write(profiles.join("archivo"), "x").expect("archivo");
+        assert_eq!(
+            discover_profiles_in(dir.path()),
+            names(&["default", "alfa", "zeta"])
+        );
+        // Sin directorio profiles: solo default.
+        let vacio = tempdir().expect("tempdir");
+        assert_eq!(discover_profiles_in(vacio.path()), names(&["default"]));
+    }
+
+    #[test]
+    fn hermes_parse_hidden_list_normalizes_and_dedups() {
+        assert_eq!(parse_hidden_list(" A, b ,,a,C "), names(&["a", "b", "c"]));
+        assert!(parse_hidden_list("").is_empty());
+        assert!(parse_hidden_list(" , ").is_empty());
+    }
+
+    #[test]
+    fn hermes_rules_hide_profiles_from_discovery_and_validation() {
+        let (_dir, rules) = fake_home(&["claudia", "privado"]);
+        assert_eq!(rules.discover(), names(&["default", "claudia", "privado"]));
+        rules.set_hidden(&names(&["Privado"]));
+        assert_eq!(rules.hidden_with_env(""), names(&["privado"]));
+        assert_eq!(rules.hidden_with_env("otro"), names(&["privado", "otro"]));
+        let visibles = rules.discover();
+        assert!(!visibles.contains(&"privado".to_string()));
+        assert_eq!(rules.discover_all().len(), 3);
+        assert!(rules.validate("privado").is_err());
+        assert!(rules.validate("claudia").is_ok());
+        // Un oculto propuesto (ajustes aún sin aplicar) también se rechaza.
+        assert!(rules
+            .validate_with_extra_hidden("claudia", &names(&["claudia"]))
+            .is_err());
+        // Los clones comparten la lista de ocultos.
+        let otro = rules.clone();
+        otro.set_hidden(&[]);
+        assert!(rules.validate("privado").is_ok());
     }
 
     #[test]
@@ -423,8 +640,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let prompt = "Di \"hola\" 'mundo' sin escapar\nlinea 2: $(whoami)\nlinea 3: `ls -la`";
         let ctx = ctx_for(prompt, dir.path(), 15);
+        let (_home, rules) = fake_home(&[]);
 
-        let agent = HermesAgent::default().with_program(fake_hermes_path());
+        let agent = agent_with("default", &rules);
         assert_eq!(agent.kind(), AgentKind::Hermes);
 
         let out = agent
@@ -462,7 +680,8 @@ mod tests {
     async fn hermes_nonzero_exit_code_fails_with_clear_error_and_cleans_up() {
         let dir = tempdir().expect("tempdir");
         let ctx = ctx_for("FAKE:fail con detalle", dir.path(), 15);
-        let agent = HermesAgent::default().with_program(fake_hermes_path());
+        let (_home, rules) = fake_home(&[]);
+        let agent = agent_with("default", &rules);
 
         let err = agent
             .run(&ctx)
@@ -495,7 +714,8 @@ mod tests {
     async fn hermes_timeout_expires_and_kills_the_process() {
         let dir = tempdir().expect("tempdir");
         let ctx = ctx_for("FAKE:timeout", dir.path(), 1);
-        let agent = HermesAgent::default().with_program(fake_hermes_path());
+        let (_home, rules) = fake_home(&[]);
+        let agent = agent_with("default", &rules);
 
         let err = agent
             .run(&ctx)
@@ -512,7 +732,8 @@ mod tests {
     async fn hermes_empty_output_returns_warning_and_cleans_up() {
         let dir = tempdir().expect("tempdir");
         let ctx = ctx_for("FAKE:empty", dir.path(), 15);
-        let agent = HermesAgent::default().with_program(fake_hermes_path());
+        let (_home, rules) = fake_home(&[]);
+        let agent = agent_with("default", &rules);
 
         let out = agent
             .run(&ctx)
@@ -562,19 +783,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hermes_rejects_private_profiles_before_running_anything() {
+    async fn hermes_rejects_hidden_and_unknown_profiles_before_running_anything() {
         let dir = tempdir().expect("tempdir");
         let ctx = ctx_for("hola", dir.path(), 15);
+        let (_home, rules) = fake_home(&["privado", "visible"]);
+        rules.set_hidden(&names(&["privado"]));
 
-        for profile in ["intimo", "mama"] {
-            let agent = HermesAgent::new(profile).with_program(fake_hermes_path());
+        for (profile, needle) in [("privado", "oculto"), ("inexistente", "no existe")] {
+            let agent = agent_with(profile, &rules);
             let err = agent
                 .run(&ctx)
                 .await
-                .expect_err("perfil privado fuera de la lista blanca");
+                .expect_err("perfil oculto o inexistente");
             match err {
                 ForjaError::InvalidInput(msg) => {
                     assert!(msg.contains("no permitido"), "mensaje poco claro: {msg}");
+                    assert!(msg.contains(needle), "esperaba {needle:?}: {msg}");
                     assert!(msg.contains(profile), "debe nombrar el perfil: {msg}");
                     // Se rechazó ANTES de ejecutar nada: nada del proceso en el error.
                     assert!(
@@ -585,5 +809,12 @@ mod tests {
                 other => panic!("esperaba InvalidInput para {profile}, obtuve {other:?}"),
             }
         }
+
+        // Un perfil descubierto y visible sí corre.
+        let out = agent_with("visible", &rules)
+            .run(&ctx)
+            .await
+            .expect("perfil visible");
+        assert_eq!(out.text, "hola");
     }
 }

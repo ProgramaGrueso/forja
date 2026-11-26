@@ -77,7 +77,12 @@ fn line<W: Write>(out: &mut W, ok: bool, msg: String) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor<W: Write>(out: &mut W, repo: Option<&Path>, port: u16) -> Result<()> {
+pub fn doctor<W: Write>(
+    out: &mut W,
+    repo: Option<&Path>,
+    port: u16,
+    store_dir: &Path,
+) -> Result<()> {
     let mut problems = 0;
 
     let git = on_path("git");
@@ -152,6 +157,13 @@ pub fn doctor<W: Write>(out: &mut W, repo: Option<&Path>, port: u16) -> Result<(
     } else {
         writeln!(out, "{problems} problema(s) por resolver arriba.")?;
     }
+    if !store_dir.join("settings.json").is_file() {
+        writeln!(
+            out,
+            "Sin configuración ({}): ejecuta `forja init` para elegir agente del orquestador y modelos.",
+            store_dir.join("settings.json").display()
+        )?;
+    }
     Ok(())
 }
 
@@ -161,12 +173,25 @@ mod tests {
 
     #[test]
     fn doctor_reports_sections_and_succeeds() {
+        let store = tempfile::TempDir::new().expect("tempdir");
         let mut buf = Vec::new();
-        doctor(&mut buf, None, 0).expect("doctor");
+        doctor(&mut buf, None, 0, store.path()).expect("doctor");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("git:") || text.contains("git no encontrado"));
         assert!(text.contains("Agentes"));
         assert!(text.contains("puerto 0"));
+        // Sin settings.json sugiere `forja init`.
+        assert!(text.contains("ejecuta `forja init`"), "{text}");
+    }
+
+    #[test]
+    fn doctor_does_not_suggest_init_when_settings_exist() {
+        let store = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(store.path().join("settings.json"), "{}").expect("settings");
+        let mut buf = Vec::new();
+        doctor(&mut buf, None, 0, store.path()).expect("doctor");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(!text.contains("forja init"), "{text}");
     }
 
     #[test]

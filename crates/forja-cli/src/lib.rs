@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod friendly;
+pub mod init;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use forja_agent::Agent;
@@ -75,6 +76,18 @@ pub enum Command {
     Doctor {
         #[arg(long, default_value_t = 7777)]
         port: u16,
+
+        /// Tras el diagnóstico, lanza el asistente de configuración (`forja init`).
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// Asistente de primer arranque: detecta agentes, elige orquestador y modelos y
+    /// escribe `<store_dir>/settings.json` (sin pisar lo que ya tengas).
+    Init {
+        /// No pregunta nada: acepta los valores por defecto.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -206,7 +219,32 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             write_runs_table(&runs, out)?;
             Ok(())
         }
-        Command::Doctor { port } => friendly::doctor(out, cli.repo.as_deref(), port),
+        Command::Doctor { port, fix } => {
+            friendly::doctor(out, cli.repo.as_deref(), port, &cli.store_dir)?;
+            if fix {
+                writeln!(out)?;
+                let stdin = std::io::stdin();
+                init::run_init(
+                    &mut stdin.lock(),
+                    out,
+                    &cli.store_dir,
+                    false,
+                    &init::InitEnv::detect(),
+                )?;
+            }
+            Ok(())
+        }
+        Command::Init { yes } => {
+            let stdin = std::io::stdin();
+            init::run_init(
+                &mut stdin.lock(),
+                out,
+                &cli.store_dir,
+                yes,
+                &init::InitEnv::detect(),
+            )?;
+            Ok(())
+        }
         Command::Serve {
             port,
             auth_token,
@@ -236,6 +274,13 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             let orchestrator_profile = persisted
                 .as_ref()
                 .and_then(|s| s.orchestrator_profile.clone());
+            let orchestrator_agent = persisted
+                .as_ref()
+                .and_then(|s| s.orchestrator_agent.clone());
+            let hidden_profiles = persisted
+                .as_ref()
+                .map(|s| s.hidden_profiles.clone())
+                .unwrap_or_default();
 
             let store = JsonlStore::new(&cli.store_dir)?;
             let mut sched_cfg = SchedulerConfig::new(&cli.worktrees_dir);
@@ -253,6 +298,8 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 hide_mascot,
                 agent_models,
                 orchestrator_profile,
+                orchestrator_agent,
+                hidden_profiles,
             };
 
             let mut state = AppState::new(scheduler)
@@ -396,6 +443,18 @@ mod tests {
         assert!(CliAgent::Mock.build_agent(Some("x"), &settings).is_err());
         assert!(CliAgent::Hermes.build_agent(Some("x"), &settings).is_err());
         assert!(agent.build_agent(Some("--bad"), &settings).is_err());
+    }
+
+    #[test]
+    fn parse_init_and_doctor_fix() {
+        let cli = Cli::try_parse_from(["forja", "init", "--yes"]).expect("init --yes");
+        assert!(matches!(cli.command, Command::Init { yes: true }));
+        let cli = Cli::try_parse_from(["forja", "init"]).expect("init");
+        assert!(matches!(cli.command, Command::Init { yes: false }));
+        let cli = Cli::try_parse_from(["forja", "doctor", "--fix"]).expect("doctor --fix");
+        assert!(matches!(cli.command, Command::Doctor { fix: true, .. }));
+        let cli = Cli::try_parse_from(["forja", "doctor"]).expect("doctor");
+        assert!(matches!(cli.command, Command::Doctor { fix: false, .. }));
     }
 
     #[test]

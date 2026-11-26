@@ -1126,7 +1126,7 @@
             <div class="provider-group-label">Gemini</div>
             <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">agy</div><div class="side-row-sub">gemini-4-neon-medium</div></div><span class="side-counter">0</span></div>
             <div class="provider-group-label">Hermes</div>
-            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">hermes</div><div class="side-row-sub">yuuki</div></div><span class="side-counter">0</span></div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">hermes</div><div class="side-row-sub">default</div></div><span class="side-counter">0</span></div>
             <div class="provider-group-label">Local</div>
             <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">local</div><div class="side-row-sub">moe</div></div><span class="side-counter">0</span></div>
             <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">mock</div><div class="side-row-sub">mock</div></div><span class="side-counter">0</span></div>
@@ -1305,10 +1305,12 @@
         <!-- VISTA: ORQUESTADOR -->
         <section id="view-orquestador" class="view-pane" aria-label="Vista Orquestador">
           <div class="orq-head">
-            <label for="orq-profile">Orquestador (perfil de Hermes):</label>
-            <select id="orq-profile" class="select" aria-label="Perfil del orquestador"></select>
+            <label for="orq-agent">Agente del orquestador:</label>
+            <select id="orq-agent" class="select" aria-label="Agente del orquestador"></select>
+            <label for="orq-profile" id="orq-profile-label">Perfil de Hermes:</label>
+            <select id="orq-profile" class="select" aria-label="Perfil de Hermes del orquestador"></select>
             <span id="orq-profile-source" class="mono"></span>
-            <span>Cambiar el perfil reinicia las sesiones de las conversaciones.</span>
+            <span>Cambiar el agente o el perfil reinicia las sesiones de las conversaciones. Solo se ofrecen los agentes instalados.</span>
             <span id="orq-profile-msg" role="status"></span>
           </div>
           <div class="orq-layout">
@@ -1435,10 +1437,20 @@
                 <input id="set-quota-path" class="input mono" type="text" required>
               </div>
               <div class="form-field">
-                <label for="set-orch-profile">Orquestador (perfil de Hermes)</label>
-                <select id="set-orch-profile" class="select"></select>
+                <label for="set-orch-agent">Agente del orquestador</label>
+                <select id="set-orch-agent" class="select"></select>
                 <div id="set-orch-source" class="card-sub"></div>
-                <div class="card-sub">Cambiar el perfil reinicia las sesiones de las conversaciones del orquestador.</div>
+                <div class="card-sub">Automático = el primer agente instalado (claude, opencode, agy, local, hermes) o la variable FORJA_ORCHESTRATOR_AGENT. Cambiarlo reinicia las sesiones de las conversaciones del orquestador.</div>
+              </div>
+              <div id="set-orch-profile-field" class="form-field">
+                <label for="set-orch-profile">Perfil de Hermes del orquestador</label>
+                <select id="set-orch-profile" class="select"></select>
+                <div class="card-sub">Solo aplica si el agente es hermes. Se listan los perfiles descubiertos en tu instalación de Hermes.</div>
+              </div>
+              <div class="form-field">
+                <label for="set-hidden-profiles">Perfiles de Hermes ocultos</label>
+                <input id="set-hidden-profiles" class="input mono" type="text" placeholder="p. ej. privado, trabajo" autocomplete="off">
+                <div class="card-sub">Separados por comas. Un perfil oculto no aparece en las listas, no se puede elegir y se rechaza en el orquestador, en el agente hermes y en la lista de modelos. También se pueden ocultar con la variable FORJA_HIDDEN_PROFILES.</div>
               </div>
               <fieldset id="set-models-box" style="border:1px solid var(--border-dim);border-radius:6px;padding:10px 12px;margin-bottom:12px;">
                 <legend class="card-label" style="padding:0 6px;">Modelo por agente</legend>
@@ -2300,6 +2312,7 @@
         $("set-port").value = state.settings.port;
         $("set-quota-path").value = state.settings.quota_path;
         $("set-hide-mascot").checked = Boolean(state.settings.hide_mascot);
+        $("set-hidden-profiles").value = (state.settings.hidden_profiles || []).join(", ");
         renderModelRows();
         renderProfile();
         settingsFilledOnce = true;
@@ -2352,9 +2365,10 @@
         });
       }
 
-      /* Perfil del orquestador */
-      const profileInfo = { profile: null, source: null, allowed: [] };
+      /* Agente y perfil del orquestador */
+      const profileInfo = { profile: null, source: null, allowed: [], profiles: [], agent: null, agent_source: null, agents_available: [], agents_supported: [] };
       const SOURCE_LABEL = { settings: "Ajustes", env: "variable FORJA_ORCHESTRATOR_PROFILE", default: "valor por defecto" };
+      const AGENT_SOURCE_LABEL = { settings: "Ajustes", env: "variable FORJA_ORCHESTRATOR_AGENT", auto: "automático (primer agente instalado)" };
       async function loadProfile() {
         try {
           const r = await apiFetch("/api/orchestrator/profile");
@@ -2363,18 +2377,58 @@
           renderProfile();
         } catch (_) {}
       }
-      function renderProfile() {
-        const allowed = profileInfo.allowed || [];
-        const srcTxt = `Activo: ${profileInfo.profile || "?"} · origen: ${SOURCE_LABEL[profileInfo.source] || profileInfo.source || "?"}`;
-        const head = $("orq-profile");
-        head.textContent = "";
-        allowed.forEach((p) => {
+      function fillSelect(sel, values, labelOf) {
+        sel.textContent = "";
+        values.forEach((v) => {
           const o = document.createElement("option");
-          o.value = p; o.textContent = p;
-          head.appendChild(o);
+          o.value = v; o.textContent = labelOf ? labelOf(v) : v;
+          sel.appendChild(o);
         });
+      }
+      /* Agentes ofrecidos: los instalados (más el activo si ya no lo está). */
+      function agentChoices() {
+        const list = (profileInfo.agents_available || []).slice();
+        if (profileInfo.agent && !list.includes(profileInfo.agent)) list.push(profileInfo.agent);
+        return list;
+      }
+      function agentLabel(a) {
+        return (profileInfo.agents_available || []).includes(a) ? a : `${a} (no instalado)`;
+      }
+      function toggleProfileFields() {
+        const headIsHermes = $("orq-agent").value === "hermes";
+        $("orq-profile").style.display = headIsHermes ? "" : "none";
+        $("orq-profile-label").style.display = headIsHermes ? "" : "none";
+        const sv = $("set-orch-agent").value;
+        const setIsHermes = sv === "hermes" || (sv === "" && profileInfo.agent === "hermes");
+        $("set-orch-profile-field").style.display = setIsHermes ? "" : "none";
+      }
+      function renderProfile() {
+        const profiles = profileInfo.profiles && profileInfo.profiles.length ? profileInfo.profiles : (profileInfo.allowed || []);
+        const profTxt = `perfil: ${profileInfo.profile || "?"} (${SOURCE_LABEL[profileInfo.source] || profileInfo.source || "?"})`;
+        const srcTxt = `Activo: ${profileInfo.agent || "?"} · origen: ${AGENT_SOURCE_LABEL[profileInfo.agent_source] || profileInfo.agent_source || "?"}`
+          + (profileInfo.agent === "hermes" ? ` · ${profTxt}` : "");
+
+        const headAgent = $("orq-agent");
+        fillSelect(headAgent, agentChoices(), agentLabel);
+        if (profileInfo.agent) headAgent.value = profileInfo.agent;
+        const head = $("orq-profile");
+        fillSelect(head, profiles);
         if (profileInfo.profile) head.value = profileInfo.profile;
         $("orq-profile-source").textContent = srcTxt;
+
+        const setAgent = $("set-orch-agent");
+        const prevAgent = setAgent.value;
+        setAgent.textContent = "";
+        const autoA = document.createElement("option");
+        autoA.value = ""; autoA.textContent = "Automático (variable de entorno o primer agente instalado)";
+        setAgent.appendChild(autoA);
+        (profileInfo.agents_supported || []).forEach((a) => {
+          const o = document.createElement("option");
+          o.value = a; o.textContent = agentLabel(a);
+          setAgent.appendChild(o);
+        });
+        const configuredAgent = (state.settings && state.settings.orchestrator_agent) || "";
+        setAgent.value = Array.from(setAgent.options).some((o) => o.value === configuredAgent) ? configuredAgent : (prevAgent || "");
 
         const set = $("set-orch-profile");
         const prevSel = set.value;
@@ -2382,7 +2436,7 @@
         const auto = document.createElement("option");
         auto.value = ""; auto.textContent = "Automático (variable de entorno o default)";
         set.appendChild(auto);
-        allowed.forEach((p) => {
+        profiles.forEach((p) => {
           const o = document.createElement("option");
           o.value = p; o.textContent = p;
           set.appendChild(o);
@@ -2390,6 +2444,7 @@
         const configured = (state.settings && state.settings.orchestrator_profile) || "";
         set.value = Array.from(set.options).some((o) => o.value === configured) ? configured : (prevSel || "");
         $("set-orch-source").textContent = srcTxt;
+        toggleProfileFields();
       }
 
       async function saveSettingsPatch(patch) {
@@ -2771,9 +2826,12 @@
           hide_mascot: $("set-hide-mascot").checked,
           agent_models: collectAgentModels(),
           orchestrator_profile: $("set-orch-profile").value || null,
+          orchestrator_agent: $("set-orch-agent").value || null,
+          hidden_profiles: $("set-hidden-profiles").value.split(",").map((x) => x.trim()).filter(Boolean),
         };
         const profileChanged = (state.settings && (state.settings.orchestrator_profile || "")) !== ($("set-orch-profile").value || "");
-        if (profileChanged && !window.confirm("Cambiar el perfil del orquestador reinicia las sesiones de sus conversaciones. ¿Continuar?")) return;
+        const agentChanged = (state.settings && (state.settings.orchestrator_agent || "")) !== ($("set-orch-agent").value || "");
+        if ((profileChanged || agentChanged) && !window.confirm("Cambiar el agente o el perfil del orquestador reinicia las sesiones de sus conversaciones. ¿Continuar?")) return;
         let data;
         try {
           data = await saveSettingsPatch(patch);
@@ -3237,7 +3295,31 @@
           if (t && t.trim()) send(`/rename ${t.trim()}`);
         });
 
-        /* Selector de perfil del orquestador (cabecera) */
+        /* Selector de agente del orquestador (cabecera) */
+        $("orq-agent").addEventListener("change", async () => {
+          const sel = $("orq-agent");
+          const msg = $("orq-profile-msg");
+          const wanted = sel.value;
+          if (!window.confirm(`Cambiar el agente del orquestador a «${wanted}» reinicia las sesiones de las conversaciones. ¿Continuar?`)) {
+            if (profileInfo.agent) sel.value = profileInfo.agent;
+            toggleProfileFields();
+            return;
+          }
+          try {
+            await saveSettingsPatch({ orchestrator_agent: wanted });
+            msg.textContent = `Agente cambiado a ${wanted}.`;
+            await loadProfile();
+            fillSettingsForm(true);
+            await loadList();
+          } catch (e) {
+            msg.textContent = `Error: ${e.message}`;
+            if (profileInfo.agent) sel.value = profileInfo.agent;
+            toggleProfileFields();
+          }
+        });
+        $("set-orch-agent").addEventListener("change", toggleProfileFields);
+
+        /* Selector de perfil de Hermes del orquestador (cabecera) */
         $("orq-profile").addEventListener("change", async () => {
           const sel = $("orq-profile");
           const msg = $("orq-profile-msg");

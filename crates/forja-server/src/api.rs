@@ -275,14 +275,15 @@ pub async fn agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     ))
 }
 
-/// Perfil efectivo del orquestador, su origen y los perfiles elegibles.
+/// Agente y perfil efectivos del orquestador, su origen y lo elegible.
+///
+/// `allowed` se conserva por compatibilidad y es igual a `profiles` (los perfiles
+/// de Hermes descubiertos, sin los ocultos).
 pub async fn orchestrator_profile(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let configured = state
-        .settings
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .orchestrator_profile
-        .clone();
+    let (configured, configured_agent) = {
+        let g = state.settings.read().unwrap_or_else(|e| e.into_inner());
+        (g.orchestrator_profile.clone(), g.orchestrator_agent.clone())
+    };
     let env = std::env::var(crate::orchestrator::PROFILE_ENV).ok();
     let source = if configured.as_deref().is_some_and(|p| !p.trim().is_empty()) {
         "settings"
@@ -291,10 +292,20 @@ pub async fn orchestrator_profile(State(state): State<AppState>) -> Json<serde_j
     } else {
         "default"
     };
+    let orq = state.orchestrator.clone();
+    let profiles = orq.profiles();
+    let profile = orq.profile().unwrap_or_else(|| {
+        crate::orchestrator::resolve_profile(configured.as_deref(), env.as_deref())
+    });
     Json(json!({
-        "profile": state.orchestrator.profile(),
+        "profile": profile,
         "source": source,
-        "allowed": forja_agent::hermes::ALLOWED_PROFILES,
+        "allowed": profiles,
+        "profiles": profiles,
+        "agent": orq.agent(),
+        "agent_source": orq.agent_source(configured_agent.as_deref()),
+        "agents_available": orq.agents_available(),
+        "agents_supported": crate::orchestrator::ORCHESTRATOR_AGENTS,
     }))
 }
 
@@ -307,7 +318,8 @@ pub struct ModelsQuery {
 /// Modelos detectados en la máquina (`?refresh=true` ignora la caché).
 pub async fn get_models(State(state): State<AppState>, Query(q): Query<ModelsQuery>) -> Response {
     let models = state.models.clone();
-    match tokio::task::spawn_blocking(move || models.catalog(q.refresh)).await {
+    let hidden = state.profile_rules.hidden();
+    match tokio::task::spawn_blocking(move || models.catalog(q.refresh, &hidden)).await {
         Ok(catalog) => Json(catalog).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -352,6 +364,9 @@ pub async fn put_settings(
     };
     next.normalize();
     if let Err(msg) = next.validate() {
+        return error_response(StatusCode::BAD_REQUEST, msg);
+    }
+    if let Err(msg) = state.orchestrator.check_settings(&next) {
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
 
@@ -644,7 +659,7 @@ mod tests {
             "opencode-go/deepseek-v4.1-flash"
         );
         assert_eq!(by_name("hermes")["provider"], "Hermes");
-        assert_eq!(by_name("hermes")["model"], "yuuki");
+        assert_eq!(by_name("hermes")["model"], "default");
         assert_eq!(by_name("local")["provider"], "Local");
         assert_eq!(by_name("local")["model"], "moe");
     }
@@ -816,39 +831,103 @@ mod tests {
         assert!(r.get("model").is_none());
     }
 
+    /// Estado con una base de Hermes falsa (claudia, yuuki, privado) y un orquestador
+    /// con `claude` y `hermes` "instalados". Nunca toca el ~/.hermes real.
+    fn state_with_fake_hermes() -> (AppState, TempDir, TempDir, TempDir) {
+        use forja_agent::hermes::ProfileRules;
+
+        use crate::orchestrator::{BackendFactory, Orchestrator};
+
+        let home = TempDir::new().expect("hermes home");
+        for p in ["claudia", "yuuki", "privado"] {
+            std::fs::create_dir_all(home.path().join("profiles").join(p)).expect("perfil");
+        }
+        let rules = ProfileRules::new().with_base(home.path());
+        let factory = BackendFactory::system(rules.clone())
+            .with_probe(|a: &str| a == "claude" || a == "hermes");
+        let (state, s, w) = state();
+        let state = state
+            .with_orchestrator(Orchestrator::from_factory(factory))
+            .with_profile_rules(rules);
+        (state, s, w, home)
+    }
+
     #[tokio::test]
-    async fn api_orchestrator_profile_hot_switch_and_whitelist() {
-        let (state, _s, _w) = state();
+    async fn api_orchestrator_profile_hot_switch_discovery_and_hidden() {
+        let (state, _s, _w, _home) = state_with_fake_hermes();
         let app = build_router(state);
         let (_, current) = get_json(app.clone(), "/api/settings").await;
 
+        // Perfiles descubiertos y agentes disponibles; `allowed` == `profiles`.
+        let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
+        assert_eq!(
+            prof["profiles"],
+            json!(["default", "claudia", "privado", "yuuki"])
+        );
+        assert_eq!(prof["allowed"], prof["profiles"]);
+        assert_eq!(prof["agents_available"], json!(["claude", "hermes"]));
+        assert!(prof["agent"].is_string() && prof["agent_source"].is_string());
+
+        // Cambio en caliente a hermes con perfil (se normaliza a minúsculas).
         let mut next = current.clone();
+        next["orchestrator_agent"] = json!("hermes");
         next["orchestrator_profile"] = json!("Claudia");
         let (st, body) = put_settings_json(app.clone(), next).await;
         assert_eq!(st, StatusCode::OK, "{body}");
         let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
         assert_eq!(prof["profile"], "claudia");
         assert_eq!(prof["source"], "settings");
-        assert!(prof["allowed"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| p != "intimo" && p != "mama"));
+        assert_eq!(prof["agent"], "hermes");
+        assert_eq!(prof["agent_source"], "settings");
 
-        // Perfiles privados o desconocidos: 400 y el perfil no cambia.
-        for bad in ["intimo", "mama", "otro"] {
-            let mut n = current.clone();
+        // Ocultar un perfil: desaparece de la lista y no se puede elegir.
+        let mut hide = current.clone();
+        hide["orchestrator_agent"] = json!("hermes");
+        hide["orchestrator_profile"] = json!("claudia");
+        hide["hidden_profiles"] = json!([" Privado "]);
+        let (st, body) = put_settings_json(app.clone(), hide.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["hidden_profiles"], json!(["privado"]));
+        let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
+        assert_eq!(prof["profiles"], json!(["default", "claudia", "yuuki"]));
+
+        // Oculto, inexistente o inválido: 400 y el perfil no cambia.
+        for bad in ["privado", "otro", "../x"] {
+            let mut n = hide.clone();
             n["orchestrator_profile"] = json!(bad);
             let (st, _) = put_settings_json(app.clone(), n).await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
         }
+        // Elegir y ocultar el mismo perfil a la vez también se rechaza.
+        let mut n = current.clone();
+        n["orchestrator_profile"] = json!("yuuki");
+        n["hidden_profiles"] = json!(["yuuki"]);
+        assert_eq!(
+            put_settings_json(app.clone(), n).await.0,
+            StatusCode::BAD_REQUEST
+        );
         let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
         assert_eq!(prof["profile"], "claudia");
 
-        // Quitar el ajuste vuelve a env/default.
-        let mut n = current.clone();
-        n["orchestrator_profile"] = json!(null);
+        // Agente: otro válido se aplica; uno inválido da 400.
+        let mut n = hide.clone();
+        n["orchestrator_agent"] = json!("claude");
         assert_eq!(put_settings_json(app.clone(), n).await.0, StatusCode::OK);
+        let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
+        assert_eq!(prof["agent"], "claude");
+        let mut n = hide.clone();
+        n["orchestrator_agent"] = json!("mock");
+        assert_eq!(
+            put_settings_json(app.clone(), n).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Quitar el ajuste de perfil vuelve a env/default.
+        let mut n = hide.clone();
+        n["orchestrator_agent"] = json!("hermes");
+        n["orchestrator_profile"] = json!(null);
+        let (st, body) = put_settings_json(app.clone(), n).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
         let (_, prof) = get_json(app, "/api/orchestrator/profile").await;
         let expected = crate::orchestrator::resolve_profile(
             None,
@@ -858,6 +937,56 @@ mod tests {
         );
         assert_eq!(prof["profile"], json!(expected));
         assert_ne!(prof["source"], "settings");
+    }
+
+    #[tokio::test]
+    async fn api_models_hides_configured_hermes_profiles_even_when_cached() {
+        use crate::models::{CommandRunner, ModelService};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct HermesOnly;
+        impl CommandRunner for HermesOnly {
+            fn run(&self, program: &str, _args: &[&str]) -> Result<String, String> {
+                if program == "hermes" {
+                    Ok(" Profile  Model  Gateway\n  default  m1  running\n  privado  m2  running\n  claudia  m3  running\n".to_string())
+                } else {
+                    Err(format!("{program} no está instalado"))
+                }
+            }
+        }
+        let (state, _s, _w, _home) = state_with_fake_hermes();
+        let state = state.with_models(Arc::new(ModelService::new(
+            Arc::new(HermesOnly),
+            Duration::from_secs(600),
+        )));
+        let app = build_router(state);
+        let hermes_ids = |v: &Value| -> Vec<String> {
+            v["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["provider"] == "hermes")
+                .map(|p| {
+                    p["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["id"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (_, v) = get_json(app.clone(), "/api/models").await;
+        assert!(hermes_ids(&v).contains(&"privado".to_string()));
+
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+        let mut n = current.clone();
+        n["hidden_profiles"] = json!(["privado"]);
+        assert_eq!(put_settings_json(app.clone(), n).await.0, StatusCode::OK);
+        // La caché (600 s) no sirve la lista vieja.
+        let (_, v) = get_json(app, "/api/models").await;
+        assert_eq!(hermes_ids(&v), vec!["default", "claudia"]);
     }
 
     #[tokio::test]

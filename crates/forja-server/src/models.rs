@@ -12,9 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-/// Perfiles de Hermes que nunca se muestran (son privados de otras personas).
-pub const HIDDEN_HERMES_PROFILES: [&str; 2] = ["intimo", "mama"];
-
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -180,9 +177,9 @@ pub fn parse_llm_list(text: &str) -> Vec<DetectedModel> {
         .collect()
 }
 
-/// `hermes profile list`: tabla con perfil, modelo y gateway. Oculta los
-/// perfiles privados de [`HIDDEN_HERMES_PROFILES`].
-pub fn parse_hermes_profiles(text: &str) -> Vec<DetectedModel> {
+/// `hermes profile list`: tabla con perfil, modelo y gateway. Omite los perfiles
+/// de `hidden` (ajuste `hidden_profiles` y `FORJA_HIDDEN_PROFILES`).
+pub fn parse_hermes_profiles(text: &str, hidden: &[String]) -> Vec<DetectedModel> {
     let mut out = Vec::new();
     for line in text.lines() {
         let cleaned = line.trim_start_matches(|c: char| c.is_whitespace() || c == '◆');
@@ -194,7 +191,7 @@ pub fn parse_hermes_profiles(text: &str) -> Vec<DetectedModel> {
         if name == "Profile" || name.starts_with('─') || model_id.starts_with('─') {
             continue;
         }
-        if HIDDEN_HERMES_PROFILES.contains(&name) {
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(name)) {
             continue;
         }
         out.push(model(name, model_id));
@@ -269,7 +266,7 @@ fn from_result(
     }
 }
 
-pub fn detect_all(runner: &dyn CommandRunner) -> ModelCatalog {
+pub fn detect_all(runner: &dyn CommandRunner, hidden: &[String]) -> ModelCatalog {
     let mut providers = Vec::new();
 
     providers.push(from_result(
@@ -319,7 +316,7 @@ pub fn detect_all(runner: &dyn CommandRunner) -> ModelCatalog {
         "hermes profile list",
         runner
             .run("hermes", &["profile", "list"])
-            .map(|t| parse_hermes_profiles(&t)),
+            .map(|t| parse_hermes_profiles(&t, hidden)),
     ));
 
     providers.push(from_result(
@@ -342,7 +339,8 @@ pub fn detect_all(runner: &dyn CommandRunner) -> ModelCatalog {
 pub struct ModelService {
     runner: Arc<dyn CommandRunner>,
     ttl: Duration,
-    cache: Mutex<Option<(Instant, ModelCatalog)>>,
+    /// (cuándo, ocultos con los que se calculó, catálogo)
+    cache: Mutex<Option<(Instant, Vec<String>, ModelCatalog)>>,
 }
 
 impl ModelService {
@@ -358,19 +356,21 @@ impl ModelService {
         Self::new(Arc::new(SystemRunner), Duration::from_secs(300))
     }
 
-    /// Devuelve el catálogo; `refresh` ignora la caché.
-    pub fn catalog(&self, refresh: bool) -> ModelCatalog {
+    /// Devuelve el catálogo sin los perfiles de `hidden`; `refresh` ignora la
+    /// caché. Si cambia la lista de ocultos la caché se descarta (nunca se
+    /// sirve un catálogo calculado con otra lista).
+    pub fn catalog(&self, refresh: bool, hidden: &[String]) -> ModelCatalog {
         {
             let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((at, cat)) = guard.as_ref() {
-                if !refresh && at.elapsed() < self.ttl {
+            if let Some((at, cached_hidden, cat)) = guard.as_ref() {
+                if !refresh && at.elapsed() < self.ttl && cached_hidden == hidden {
                     return cat.clone();
                 }
             }
         }
-        let fresh = detect_all(self.runner.as_ref());
+        let fresh = detect_all(self.runner.as_ref(), hidden);
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some((Instant::now(), fresh.clone()));
+        *guard = Some((Instant::now(), hidden.to_vec(), fresh.clone()));
         fresh
     }
 }
@@ -400,8 +400,8 @@ flash\tflashnext-64k\t65536\tQwen3.8 Flash-Next\n";
 ───────────────    ───────────────────────────    ───────────    ───────────    ────────────────────\n  \
 default         claude-sonnet-5-5            running      —            —\n \
 ◆claudia         claude-sonnet-5-5[1m]        running      claudia      —\n  \
-intimo          deepseek-v4.1-flash          running      —            —\n  \
-mama            deepseek-flash               running      mama         —\n  \
+privado         deepseek-v4.1-flash          running      —            —\n  \
+secreto         deepseek-flash               running      secreto      —\n  \
 yuuki           gemini-3.8-flash             running      —            —\n";
 
     const CLAUDE_HELP: &str = "Options:\n  --model <model>                       Model for the current session. Use an\n                                        alias for the latest model (e.g.\n                                        'fable', 'opus', or 'sonnet') or a\n                                        model's full name.\n  --name <name>   Nombre 'ignorado'\n";
@@ -433,12 +433,20 @@ yuuki           gemini-3.8-flash             running      —            —\n";
     }
 
     #[test]
-    fn hermes_parser_hides_private_profiles() {
-        let m = parse_hermes_profiles(HERMES);
+    fn hermes_parser_hides_configured_profiles_only() {
+        let hidden = vec!["privado".to_string(), "secreto".to_string()];
+        let m = parse_hermes_profiles(HERMES, &hidden);
         let names: Vec<&str> = m.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(names, vec!["default", "claudia", "yuuki"]);
         assert_eq!(m[1].label, "claude-sonnet-5-5[1m]");
-        assert!(!names.contains(&"intimo") && !names.contains(&"mama"));
+
+        // Sin ocultos configurados no se esconde nada (no hay nombres fijos en el código).
+        let all = parse_hermes_profiles(HERMES, &[]);
+        let names: Vec<&str> = all.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["default", "claudia", "privado", "secreto", "yuuki"]
+        );
     }
 
     #[test]
@@ -453,7 +461,7 @@ yuuki           gemini-3.8-flash             running      —            —\n";
         assert!(parse_agy_models("").is_empty());
         assert!(parse_opencode_models("???").is_empty());
         assert!(parse_llm_list("sin tabs").is_empty());
-        assert!(parse_hermes_profiles("").is_empty());
+        assert!(parse_hermes_profiles("", &[]).is_empty());
         assert!(parse_claude_aliases("nada").is_empty());
     }
 
@@ -488,7 +496,7 @@ yuuki           gemini-3.8-flash             running      —            —\n";
             ("claude", Ok(CLAUDE_HELP.to_string())),
             ("opencode", Err("opencode no está instalado".to_string())),
         ]);
-        let cat = detect_all(runner.as_ref());
+        let cat = detect_all(runner.as_ref(), &[]);
         let by: HashMap<&str, &ProviderModels> = cat
             .providers
             .iter()
@@ -496,7 +504,7 @@ yuuki           gemini-3.8-flash             running      —            —\n";
             .collect();
         assert_eq!(by["gemini"].status, "ok");
         assert_eq!(by["local"].models.len(), 2);
-        assert_eq!(by["hermes"].models.len(), 3);
+        assert_eq!(by["hermes"].models.len(), 5);
         assert_eq!(by["anthropic"].models.len(), 3);
         assert_eq!(by["opencode"].status, "unavailable");
         assert!(by["opencode"]
@@ -509,7 +517,7 @@ yuuki           gemini-3.8-flash             running      —            —\n";
     #[test]
     fn detect_all_splits_opencode_into_one_group_per_provider() {
         let runner = fake(vec![("opencode", Ok(OPENCODE.to_string()))]);
-        let cat = detect_all(runner.as_ref());
+        let cat = detect_all(runner.as_ref(), &[]);
         let groups: Vec<&str> = cat
             .providers
             .iter()
@@ -531,12 +539,29 @@ yuuki           gemini-3.8-flash             running      —            —\n";
     fn service_caches_until_refresh() {
         let runner = fake(vec![("agy", Ok(AGY.to_string()))]);
         let svc = ModelService::new(runner.clone(), Duration::from_secs(60));
-        svc.catalog(false);
+        svc.catalog(false, &[]);
         let after_first = runner.calls.load(Ordering::SeqCst);
-        svc.catalog(false);
+        svc.catalog(false, &[]);
         assert_eq!(runner.calls.load(Ordering::SeqCst), after_first);
-        svc.catalog(true);
+        svc.catalog(true, &[]);
         assert_eq!(runner.calls.load(Ordering::SeqCst), after_first * 2);
+    }
+
+    #[test]
+    fn service_cache_never_serves_a_list_computed_with_other_hidden() {
+        let runner = fake(vec![("hermes", Ok(HERMES.to_string()))]);
+        let svc = ModelService::new(runner, Duration::from_secs(60));
+        let names = |hidden: &[String]| -> Vec<String> {
+            svc.catalog(false, hidden)
+                .providers
+                .into_iter()
+                .find(|p| p.provider == "hermes")
+                .map(|p| p.models.into_iter().map(|m| m.id).collect())
+                .unwrap_or_default()
+        };
+        assert!(names(&[]).contains(&"privado".to_string()));
+        assert!(!names(&["privado".to_string()]).contains(&"privado".to_string()));
+        assert!(names(&[]).contains(&"privado".to_string()));
     }
 
     #[test]

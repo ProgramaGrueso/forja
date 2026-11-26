@@ -13,12 +13,26 @@ alguien que acaba de clonar el repo.
   (tabla agente→modelo con «Restablecer»), tiene el campo opcional «Modelo» en Nueva tarea
   (deshabilitado para mock/hermes) y lo muestra en Agentes y en el detalle de la ejecución.
 - ~~**Selector del orquestador en Ajustes.**~~ **Hecho** (backend + panel).
-  `Settings.orchestrator_profile` (lista blanca: default, claudia, yuuki) >
-  `FORJA_ORCHESTRATOR_PROFILE` > `default`; se aplica en caliente al guardar ajustes
-  (resetea la sesión). El panel ofrece el selector en Ajustes y en la cabecera de
-  Orquestador, con el origen del valor y el aviso de reinicio de sesiones.
-- **Wizard de `forja doctor`** que detecte agentes instalados y proponga una
-  configuración mínima que funcione (modelo por agente, perfil del orquestador).
+  `Settings.orchestrator_profile` > `FORJA_ORCHESTRATOR_PROFILE` > `default`; se aplica
+  en caliente al guardar ajustes (resetea la sesión). Ya no hay lista blanca fija: los
+  perfiles de Hermes se descubren (`default` + `<HERMES_HOME o ~/.hermes>/profiles/*`).
+- ~~**Ocultos configurables.**~~ **Hecho**: `Settings.hidden_profiles` ∪ `FORJA_HIDDEN_PROFILES`
+  (vacío por defecto, sin nombres personales en el código). Un perfil oculto no se lista,
+  no se puede elegir y se rechaza en el orquestador, en el agente `hermes` y en `/api/models`.
+- ~~**Orquestador independiente de Hermes.**~~ **Hecho**: `Settings.orchestrator_agent`
+  (`hermes` | `claude` | `opencode` | `agy` | `local`) > `FORJA_ORCHESTRATOR_AGENT` > primero
+  instalado (claude, opencode, agy, local, hermes). Los no-Hermes usan una llamada one-shot
+  al CLI con el modelo de `agent_models` y reciben los últimos 20 intercambios en cada
+  mensaje. Cambio en caliente; `GET /api/orchestrator/profile` devuelve también `agent`,
+  `agents_available` y `profiles`; el panel tiene selector de agente (+ perfil si es hermes)
+  y el campo de perfiles ocultos en Ajustes.
+- ~~**Wizard de primer arranque.**~~ **Hecho**: `forja init [--yes]` detecta agentes, pregunta
+  agente del orquestador, modelo por agente y perfiles de Hermes a ocultar, y fusiona
+  `<store_dir>/settings.json` sin pisar campos. `forja doctor` sugiere `forja init` si falta
+  el archivo y `forja doctor --fix` lanza el asistente.
+- **Pendiente:** el orquestador con `claude` corre con el modo de permisos por defecto del
+  adaptador (`acceptEdits`), que no autoriza ejecutar `curl`; para que delegue sin ayuda
+  hace falta decidir una política de permisos específica del orquestador.
 
 ## Conversaciones
 

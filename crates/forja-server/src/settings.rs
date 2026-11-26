@@ -19,6 +19,14 @@ pub struct Settings {
     /// Perfil de Hermes del orquestador. None => env FORJA_ORCHESTRATOR_PROFILE o `default`.
     #[serde(default)]
     pub orchestrator_profile: Option<String>,
+    /// Agente que hace de orquestador: hermes | claude | opencode | agy | local.
+    /// None => env FORJA_ORCHESTRATOR_AGENT o el primero disponible.
+    #[serde(default)]
+    pub orchestrator_agent: Option<String>,
+    /// Perfiles de Hermes que nunca se listan ni se pueden elegir (se suman a
+    /// `FORJA_HIDDEN_PROFILES`). Vacío por defecto.
+    #[serde(default)]
+    pub hidden_profiles: Vec<String>,
 }
 
 pub const MAX_CONCURRENCY_LIMIT: usize = 16;
@@ -50,6 +58,24 @@ fn validate_safe_path(field: &str, raw: &str) -> Result<(), String> {
 }
 
 impl Settings {
+    /// Ajustes por defecto para un store dado (los que usa `forja init` cuando
+    /// todavía no existe `settings.json`).
+    pub fn with_defaults(store_dir: &str) -> Self {
+        Self {
+            max_concurrency: 2,
+            store_dir: store_dir.to_string(),
+            port: 7777,
+            quota_path: crate::quota::default_manual_path()
+                .to_string_lossy()
+                .into_owned(),
+            hide_mascot: false,
+            agent_models: BTreeMap::new(),
+            orchestrator_profile: None,
+            orchestrator_agent: None,
+            hidden_profiles: Vec::new(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.max_concurrency == 0 || self.max_concurrency > MAX_CONCURRENCY_LIMIT {
             return Err(format!(
@@ -72,9 +98,28 @@ impl Settings {
                 .ok_or_else(|| format!("agent_models: el agente \"{agent}\" no admite modelo"))?;
             forja_agent::validate_model(model).map_err(|e| format!("agent_models[{kind}]: {e}"))?;
         }
+        // Aquí solo se valida el formato (función pura); que el perfil exista y no
+        // esté oculto lo comprueba el orquestador con las reglas de perfiles.
         if let Some(profile) = &self.orchestrator_profile {
-            forja_agent::hermes::validate_profile(profile)
+            let normalized = forja_agent::hermes::validate_profile_format(profile)
                 .map_err(|e| format!("orchestrator_profile: {e}"))?;
+            if self.hidden_profiles.iter().any(|h| h == &normalized) {
+                return Err(format!(
+                    "orchestrator_profile: \"{normalized}\" está en hidden_profiles"
+                ));
+            }
+        }
+        if let Some(agent) = &self.orchestrator_agent {
+            if !crate::orchestrator::ORCHESTRATOR_AGENTS.contains(&agent.as_str()) {
+                return Err(format!(
+                    "orchestrator_agent: \"{agent}\" no es válido (usa {})",
+                    crate::orchestrator::ORCHESTRATOR_AGENTS.join(", ")
+                ));
+            }
+        }
+        for hidden in &self.hidden_profiles {
+            forja_agent::hermes::validate_profile_format(hidden)
+                .map_err(|e| format!("hidden_profiles: {e}"))?;
         }
         Ok(())
     }
@@ -92,6 +137,19 @@ impl Settings {
             .take()
             .map(|p| p.trim().to_lowercase())
             .filter(|p| !p.is_empty());
+        self.orchestrator_agent = self
+            .orchestrator_agent
+            .take()
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty());
+        let mut hidden: Vec<String> = Vec::new();
+        for h in std::mem::take(&mut self.hidden_profiles) {
+            let h = h.trim().to_lowercase();
+            if !h.is_empty() && !hidden.contains(&h) {
+                hidden.push(h);
+            }
+        }
+        self.hidden_profiles = hidden;
     }
 
     /// Campos cuyo cambio exige reiniciar `forja serve` para tener efecto.
@@ -131,6 +189,119 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), String> {
         .map_err(|err| format!("no se pudo escribir {}: {err}", path.display()))
 }
 
+/// Cambios que `forja init` aplica sobre `settings.json` sin tocar el resto.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsPatch {
+    pub orchestrator_agent: Option<String>,
+    pub orchestrator_profile: Option<String>,
+    /// Se fusiona clave a clave con `agent_models` existente.
+    pub agent_models: BTreeMap<String, String>,
+    /// Se UNE con `hidden_profiles` existente (nunca se quita protección).
+    pub hidden_profiles: Vec<String>,
+}
+
+/// Aplica `patch` sobre el archivo de ajustes y lo guarda. Conserva todos los
+/// campos existentes (también los desconocidos); si el archivo no existe parte
+/// de `defaults`. Devuelve los ajustes resultantes, ya validados.
+pub fn apply_patch(
+    path: &Path,
+    patch: &SettingsPatch,
+    defaults: &Settings,
+) -> Result<Settings, String> {
+    let defaults_value = serde_json::to_value(defaults)
+        .map_err(|err| format!("no se pudo serializar ajustes: {err}"))?;
+    let mut root = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|err| format!("no se pudo leer {}: {err}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|err| format!("ajustes inválidos en {}: {err}", path.display()))?
+    } else {
+        defaults_value.clone()
+    };
+    let obj = root.as_object_mut().ok_or_else(|| {
+        format!(
+            "ajustes inválidos en {}: se esperaba un objeto",
+            path.display()
+        )
+    })?;
+    // Campos obligatorios ausentes en un archivo viejo o parcial.
+    if let Some(d) = defaults_value.as_object() {
+        for key in ["max_concurrency", "store_dir", "port", "quota_path"] {
+            if !obj.contains_key(key) {
+                if let Some(v) = d.get(key) {
+                    obj.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
+    let set_opt = |obj: &mut serde_json::Map<String, serde_json::Value>,
+                   key: &str,
+                   value: &Option<String>| {
+        if let Some(v) = value {
+            obj.insert(key.to_string(), serde_json::Value::String(v.clone()));
+        }
+    };
+    set_opt(obj, "orchestrator_agent", &patch.orchestrator_agent);
+    set_opt(obj, "orchestrator_profile", &patch.orchestrator_profile);
+
+    if !patch.agent_models.is_empty() {
+        let entry = obj
+            .entry("agent_models".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !entry.is_object() {
+            *entry = serde_json::json!({});
+        }
+        if let Some(models) = entry.as_object_mut() {
+            for (agent, model) in &patch.agent_models {
+                models.insert(agent.clone(), serde_json::Value::String(model.clone()));
+            }
+        }
+    }
+
+    if !patch.hidden_profiles.is_empty() {
+        let mut hidden: Vec<String> = obj
+            .get("hidden_profiles")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for h in &patch.hidden_profiles {
+            if !hidden.contains(h) {
+                hidden.push(h.clone());
+            }
+        }
+        obj.insert("hidden_profiles".to_string(), serde_json::json!(hidden));
+    }
+
+    let mut settings: Settings = serde_json::from_value(root.clone())
+        .map_err(|err| format!("ajustes inválidos en {}: {err}", path.display()))?;
+    settings.normalize();
+    settings.validate()?;
+
+    // Se escribe el JSON fusionado (conserva campos desconocidos), pero con los
+    // valores normalizados de los campos que Forja entiende.
+    if let (Some(obj), Ok(norm)) = (root.as_object_mut(), serde_json::to_value(&settings)) {
+        if let Some(norm) = norm.as_object() {
+            for (k, v) in norm {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("no se pudo crear {}: {err}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&root)
+        .map_err(|err| format!("no se pudo serializar ajustes: {err}"))?;
+    std::fs::write(path, json)
+        .map_err(|err| format!("no se pudo escribir {}: {err}", path.display()))?;
+    Ok(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -146,6 +317,8 @@ mod tests {
             hide_mascot: false,
             agent_models: BTreeMap::new(),
             orchestrator_profile: None,
+            orchestrator_agent: None,
+            hidden_profiles: Vec::new(),
         }
     }
 
@@ -208,11 +381,32 @@ mod tests {
         s.agent_models.insert("nope".into(), "x".into());
         assert!(s.validate().is_err());
 
-        // El perfil privado jamás puede elegirse.
-        for bad in ["intimo", "mama", "../default", "root", ""] {
+        // Formato inválido o perfil oculto: nunca puede elegirse.
+        for bad in ["../default", "root x", "", "-x"] {
             let mut s = valid();
             s.orchestrator_profile = Some(bad.to_string());
             assert!(s.validate().is_err(), "perfil {bad:?} debía rechazarse");
+        }
+        let mut s = valid();
+        s.orchestrator_profile = Some("privado".into());
+        s.hidden_profiles = vec!["privado".into()];
+        assert!(s.validate().is_err());
+        s.hidden_profiles = vec!["../x".into()];
+        s.orchestrator_profile = None;
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn settings_validate_orchestrator_agent() {
+        for ok in ["hermes", "claude", "opencode", "agy", "local"] {
+            let mut s = valid();
+            s.orchestrator_agent = Some(ok.into());
+            assert!(s.validate().is_ok(), "{ok}");
+        }
+        for bad in ["mock", "gpt", "", "Claude"] {
+            let mut s = valid();
+            s.orchestrator_agent = Some(bad.into());
+            assert!(s.validate().is_err(), "{bad}");
         }
     }
 
@@ -226,10 +420,17 @@ mod tests {
         assert_eq!(s.agent_models.len(), 1);
         assert_eq!(s.agent_models["claude"], "opus");
         assert_eq!(s.orchestrator_profile, None);
-        s.orchestrator_profile = Some(" Yuuki ".into());
+        s.orchestrator_profile = Some(" Otro ".into());
+        s.orchestrator_agent = Some(" Claude ".into());
+        s.hidden_profiles = vec![" Priv ".into(), "priv".into(), "  ".into(), "b".into()];
         s.normalize();
-        assert_eq!(s.orchestrator_profile.as_deref(), Some("yuuki"));
+        assert_eq!(s.orchestrator_profile.as_deref(), Some("otro"));
+        assert_eq!(s.orchestrator_agent.as_deref(), Some("claude"));
+        assert_eq!(s.hidden_profiles, vec!["priv", "b"]);
         assert!(s.validate().is_ok());
+        s.orchestrator_agent = Some("  ".into());
+        s.normalize();
+        assert_eq!(s.orchestrator_agent, None);
     }
 
     #[test]
@@ -239,6 +440,83 @@ mod tests {
         let s: Settings = serde_json::from_str(old).expect("compat");
         assert!(s.agent_models.is_empty());
         assert_eq!(s.orchestrator_profile, None);
+        assert_eq!(s.orchestrator_agent, None);
+        assert!(s.hidden_profiles.is_empty());
+    }
+
+    #[test]
+    fn patch_creates_file_from_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("store/settings.json");
+        let defaults = Settings::with_defaults("/tmp/s");
+        let patch = SettingsPatch {
+            orchestrator_agent: Some("claude".into()),
+            agent_models: [("claude".to_string(), "opus".to_string())].into(),
+            hidden_profiles: vec!["priv".into()],
+            ..Default::default()
+        };
+        let out = apply_patch(&path, &patch, &defaults).expect("crear");
+        assert_eq!(out.orchestrator_agent.as_deref(), Some("claude"));
+        assert_eq!(out.port, 7777);
+        let back = load_settings(&path).expect("leer").expect("existe");
+        assert_eq!(back, out);
+        assert_eq!(back.hidden_profiles, vec!["priv"]);
+    }
+
+    #[test]
+    fn patch_merges_without_clobbering_existing_fields() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"max_concurrency":4,"store_dir":"/tmp/x","port":9000,"quota_path":"/tmp/q.json",
+                "hide_mascot":true,"agent_models":{"agy":"g-1","claude":"haiku"},
+                "hidden_profiles":["a"],"campo_futuro":{"x":1}}"#,
+        )
+        .expect("escribir");
+        let patch = SettingsPatch {
+            orchestrator_agent: Some("opencode".into()),
+            orchestrator_profile: None,
+            agent_models: [("claude".to_string(), "opus".to_string())].into(),
+            hidden_profiles: vec!["b".into(), "a".into()],
+        };
+        let out = apply_patch(&path, &patch, &Settings::with_defaults("/otro")).expect("merge");
+        assert_eq!(out.max_concurrency, 4);
+        assert_eq!(out.port, 9000);
+        assert_eq!(out.store_dir, "/tmp/x");
+        assert!(out.hide_mascot);
+        assert_eq!(out.agent_models["agy"], "g-1", "no pisa otros agentes");
+        assert_eq!(out.agent_models["claude"], "opus");
+        assert_eq!(out.hidden_profiles, vec!["a", "b"], "une, no reemplaza");
+        assert_eq!(out.orchestrator_agent.as_deref(), Some("opencode"));
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("leer")).expect("json");
+        assert_eq!(raw["campo_futuro"]["x"], 1, "conserva campos desconocidos");
+
+        // Un parche vacío no cambia nada.
+        let again = apply_patch(
+            &path,
+            &SettingsPatch::default(),
+            &Settings::with_defaults("/o"),
+        )
+        .expect("vacío");
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn patch_rejects_invalid_result_and_broken_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let defaults = Settings::with_defaults("/tmp/s");
+        let bad = SettingsPatch {
+            orchestrator_agent: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(apply_patch(&path, &bad, &defaults).is_err());
+        assert!(!path.exists(), "no escribe si es inválido");
+        std::fs::write(&path, "{roto").expect("escribir");
+        assert!(apply_patch(&path, &SettingsPatch::default(), &defaults).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("leer"), "{roto");
     }
 
     #[test]

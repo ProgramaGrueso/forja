@@ -20,6 +20,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use forja_agent::hermes::ProfileRules;
 use forja_agent::{
     Agent, AgyAgent, ClaudeAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent,
 };
@@ -47,6 +48,8 @@ pub struct AppState {
     pub settings_path: Option<PathBuf>,
     pub auth_token: Option<String>,
     pub orchestrator: orchestrator::Orchestrator,
+    /// Reglas de perfiles de Hermes (descubrimiento y ocultos) del agente y de /api/models.
+    pub profile_rules: ProfileRules,
 }
 
 impl AppState {
@@ -56,7 +59,11 @@ impl AppState {
         agents.insert(AgentKind::Agy, Arc::new(AgyAgent::default()));
         agents.insert(AgentKind::Claude, Arc::new(ClaudeAgent::default()));
         agents.insert(AgentKind::Opencode, Arc::new(OpencodeAgent::default()));
-        agents.insert(AgentKind::Hermes, Arc::new(HermesAgent::default()));
+        let profile_rules = ProfileRules::new();
+        agents.insert(
+            AgentKind::Hermes,
+            Arc::new(HermesAgent::default().with_rules(profile_rules.clone())),
+        );
         agents.insert(AgentKind::Local, Arc::new(LocalAgent::default()));
 
         let metas = vec![
@@ -77,6 +84,8 @@ impl AppState {
             hide_mascot: false,
             agent_models: Default::default(),
             orchestrator_profile: None,
+            orchestrator_agent: None,
+            hidden_profiles: Vec::new(),
         };
 
         Self {
@@ -90,7 +99,20 @@ impl AppState {
             settings_path: None,
             auth_token: None,
             orchestrator: orchestrator::Orchestrator::from_env(),
+            profile_rules,
         }
+    }
+
+    /// Reglas de perfiles propias (tests con una base de Hermes falsa): las usan el
+    /// agente hermes, el orquestador y /api/models.
+    pub fn with_profile_rules(mut self, rules: ProfileRules) -> Self {
+        Arc::make_mut(&mut self.agents).insert(
+            AgentKind::Hermes,
+            Arc::new(HermesAgent::default().with_rules(rules.clone())),
+        );
+        self.orchestrator = self.orchestrator.clone().with_rules(rules.clone());
+        self.profile_rules = rules;
+        self
     }
 
     pub fn with_orchestrator(mut self, orchestrator: orchestrator::Orchestrator) -> Self {
@@ -146,9 +168,8 @@ impl AppState {
     pub fn with_settings(self, settings: Settings) -> Self {
         self.quota
             .set_manual_path(PathBuf::from(&settings.quota_path));
-        let _ = self
-            .orchestrator
-            .apply_profile(settings.orchestrator_profile.as_deref());
+        self.profile_rules.set_hidden(&settings.hidden_profiles);
+        let _ = self.orchestrator.apply_settings(&settings);
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
         self
     }
@@ -161,9 +182,8 @@ impl AppState {
     pub(crate) fn on_settings_changed(&self, next: &Settings) {
         self.quota.set_manual_path(PathBuf::from(&next.quota_path));
         let _ = self.scheduler.set_max_concurrency(next.max_concurrency);
-        let _ = self
-            .orchestrator
-            .apply_profile(next.orchestrator_profile.as_deref());
+        self.profile_rules.set_hidden(&next.hidden_profiles);
+        let _ = self.orchestrator.apply_settings(next);
     }
 
     /// Agente listo para una tarea: modelo por tarea > ajustes > el que ya traía
@@ -1013,8 +1033,15 @@ mod tests {
             "orq-conv-list",
             "orq-new",
             "orq-suggest",
+            "orq-agent",
+            "Agente del orquestador",
             "orq-profile",
+            "set-orch-agent",
             "set-orch-profile",
+            "set-hidden-profiles",
+            "hidden_profiles",
+            "orchestrator_agent",
+            "FORJA_HIDDEN_PROFILES",
             "set-models-rows",
             "nt-model",
             "nt-open-term",
