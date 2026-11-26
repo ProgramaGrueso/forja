@@ -251,4 +251,37 @@
 | 00:23 | T15 | noche/forja-T15 | gemini-4-neon-low | aceptado (6/6 tests forja-cli + forja list exit 0 + check.sh en verde) |
 
 ## Siguiente paso exacto
-Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.
+Sesión nocturna cerrada; ver sección "Sesión UI".
+
+---
+
+# Sesión UI (dashboard de escritorio)
+
+## Estado
+- Rama: noche/forja-ui (desde noche/forja @ 6b488fb)
+- Inicio: 2026-11-26T05:22:31-05:00
+- Límite: 2026-11-26T08:22:31-05:00
+- Plan: PLAN_UI.md
+
+## Registro
+### U01 — Preparación
+- `forja serve` en 7777 (PID 736061, lanzado en la sesión anterior por mí) apagado con `kill`; `ps` posterior: "7777 apagado".
+- Rama `noche/forja-ui` creada; worktrees `../forja-wt-U02` y `../forja-wt-U03` para subagentes.
+- Fixture real: `hermes usage --provider anthropic --json` -> `crates/forja-server/tests/fixtures/hermes_usage_anthropic.json`.
+- Sondeo real (solo lectura) de `hermes usage` para copilot, deepseek, nous y gemini: los cuatro salen con código 1 ("No account usage available for provider ..."). Por tanto esos chips mostrarán "sin dato" salvo que Juan rellene `~/.config/forja/quota.json`.
+- Herramientas presentes: `/usr/bin/nvidia-smi` (RTX 4070 Ti SUPER, 16376 MiB), `/usr/bin/chromium` (para capturas headless).
+
+## Decisiones (Sesión UI)
+- Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.
+- Fechas como texto ISO-8601 tal como llegan (no hay `chrono`); la antigüedad ("hace 3 h") se calcula en el navegador.
+- "Completadas hoy" se calcula como últimas 24 h (el servidor no tiene zona horaria sin dependencias extra); la UI lo rotula así.
+- Duración de una ejecución = `updated_at_ms - created_at_ms` (incluye espera en cola).
+
+## Bloqueos (Sesión UI)
+- (ninguno)
+
+## Subagentes (Sesión UI)
+| Hora | Tarea | Rama | Modelo | Resultado |
+|------|-------|------|--------|-----------|
+| 05:24 | U02 | noche/forja-ui-U02 | gemini-4-neon-medium | en curso |
+| 05:24 | U03 | noche/forja-ui-U03 | gemini-4-neon-medium | en curso |
