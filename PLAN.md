@@ -52,7 +52,7 @@ Estructura final:
       agy -p "<prompt>" --model <modelo> --mode <modo> --output-format json --print-timeout <seg> --add-dir <worktree>
       Sin ejecutar nada. Prompts con comillas y saltos de línea van como argumento, nunca por shell.
       Hecho cuando: `cargo test -p forja-agent agy_args` pasa (>=5 casos, incluido prompt con comillas).
-- [ ] T08 forja-agent: Runner con agy falso (45 min)
+- [x] T08 forja-agent: Runner con agy falso (45 min)
       Runner ejecuta el comando con tokio::process, con timeout y captura de stdout/stderr. Test con
       tests/fake_agy.sh (script que imprime JSON y sale 0/1 según variable de entorno).
       Hecho cuando: `cargo test -p forja-agent runner` pasa; cubre éxito, código distinto de 0 y timeout.
@@ -61,7 +61,7 @@ Estructura final:
       Hecho cuando: `cargo test -p forja-agent parse` pasa con JSON válido, JSON roto y salida vacía.
 
 ## Fase 2 — Persistencia y planificador
-- [ ] T10 forja-store (40 min)
+- [x] T10 forja-store (40 min)
       JSONL append-only en un directorio configurable: append_run, list_runs, get_run. Tolera línea corrupta.
       Hecho cuando: `cargo test -p forja-store` pasa, incluido un test con una línea corrupta en medio.
 - [ ] T11 forja-sched: cola y concurrencia (50 min)
