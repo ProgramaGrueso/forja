@@ -209,6 +209,37 @@ impl IntoResponse for ApiError {
     }
 }
 
+const MASCOT_FILES: [(&str, &[u8]); 5] = [
+    ("idle.webp", include_bytes!("../assets/mascot/idle.webp")),
+    ("blink.webp", include_bytes!("../assets/mascot/blink.webp")),
+    (
+        "working.webp",
+        include_bytes!("../assets/mascot/working.webp"),
+    ),
+    (
+        "celebrate.webp",
+        include_bytes!("../assets/mascot/celebrate.webp"),
+    ),
+    (
+        "worried.webp",
+        include_bytes!("../assets/mascot/worried.webp"),
+    ),
+];
+
+async fn mascot_handler(Path(name): Path<String>) -> Response {
+    match MASCOT_FILES.iter().find(|(n, _)| *n == name) {
+        Some((_, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 const PANEL_HTML: &str = include_str!("panel.html");
 
 pub fn build_router(state: AppState) -> Router {
@@ -238,6 +269,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(panel_handler))
         .route("/api/health", get(api::health))
+        .route("/mascot/{name}", get(mascot_handler))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -776,8 +808,30 @@ mod tests {
 
         // Mascota SVG inline y soporte prefers-reduced-motion
         assert!(html.contains("id=\"forja-mascot\""));
-        assert!(html.contains("<svg id=\"forja-mascot\""));
+        assert!(html.contains("/mascot/idle.webp"));
         assert!(html.contains("prefers-reduced-motion"));
+    }
+
+    #[tokio::test]
+    async fn mascot_images_are_served_without_auth_and_unknown_is_404() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state.with_auth_token("tk"));
+        for (name, expected) in [
+            ("idle.webp", StatusCode::OK),
+            ("nada.webp", StatusCode::NOT_FOUND),
+        ] {
+            let req = Request::builder()
+                .uri(format!("/mascot/{name}"))
+                .body(Body::empty())
+                .expect("GET mascot");
+            let resp = app.clone().oneshot(req).await.expect("respuesta");
+            assert_eq!(resp.status(), expected, "{name}");
+            if expected == StatusCode::OK {
+                assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/webp");
+                let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("leer");
+                assert_eq!(&bytes[..4], b"RIFF");
+            }
+        }
     }
 
     #[tokio::test]
