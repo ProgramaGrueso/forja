@@ -255,6 +255,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/models", get(api::get_models))
         .route("/api/orchestrator/chat", post(orchestrator::chat))
         .route("/api/orchestrator/reset", post(orchestrator::reset))
+        .route(
+            "/api/orchestrator/conversations",
+            get(orchestrator::list_conversations).post(orchestrator::create_conversation),
+        )
+        .route(
+            "/api/orchestrator/conversations/{id}",
+            get(orchestrator::get_conversation).delete(orchestrator::delete_conversation),
+        )
         .route("/api/policy", get(api::policy))
         .route("/api/quota", get(api::get_quota).put(api::put_quota))
         .route(
