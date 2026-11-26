@@ -1,14 +1,23 @@
-use std::collections::HashMap;
+pub mod output;
+
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use forja_agent::{Agent, RunContext};
+use forja_agent::{with_output_sink, Agent, OutputSink, OutputStream, RunContext};
 use forja_core::{ForjaError, Result, RunRecord, RunStatus, Task};
 use forja_store::JsonlStore;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+pub use output::{is_valid_run_id, OutputChunk, OutputPage, OutputSubscription};
+use output::{RunOutput, MAX_BYTES, MAX_CHUNKS};
+
+/// Máximo de buffers de salida de runs terminados que se conservan en memoria.
+const MAX_RETAINED_OUTPUTS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -103,6 +112,15 @@ struct SchedulerInner {
     store_lock: Mutex<()>,
     git_lock: Mutex<()>,
     events: broadcast::Sender<RunRecord>,
+    outputs: std::sync::Mutex<OutputBuffers>,
+    out_max_chunks: AtomicUsize,
+    out_max_bytes: AtomicUsize,
+}
+
+#[derive(Default)]
+struct OutputBuffers {
+    map: HashMap<String, Arc<RunOutput>>,
+    order: VecDeque<String>,
 }
 
 #[derive(Clone)]
@@ -137,6 +155,9 @@ impl Scheduler {
                 store_lock: Mutex::new(()),
                 git_lock: Mutex::new(()),
                 events,
+                outputs: std::sync::Mutex::new(OutputBuffers::default()),
+                out_max_chunks: AtomicUsize::new(MAX_CHUNKS),
+                out_max_bytes: AtomicUsize::new(MAX_BYTES),
             }),
         })
     }
@@ -157,6 +178,57 @@ impl Scheduler {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RunRecord> {
         self.inner.events.subscribe()
+    }
+
+    /// Ajusta el tope del buffer de salida de los runs que se encolen a partir de ahora.
+    pub fn set_output_limits(&self, max_chunks: usize, max_bytes: usize) {
+        self.inner
+            .out_max_chunks
+            .store(max_chunks.max(1), Ordering::Relaxed);
+        self.inner
+            .out_max_bytes
+            .store(max_bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// Salida acumulada desde `since` (seq). `NotFound` si el id no es válido o no existe.
+    pub async fn output_since(&self, run_id: &str, since: u64) -> Result<OutputPage> {
+        let out = self.output_for(run_id).await?;
+        Ok(out.page(since))
+    }
+
+    /// Suscripción en vivo a la salida de un run (empieza en `since`).
+    pub async fn subscribe_output(&self, run_id: &str, since: u64) -> Result<OutputSubscription> {
+        let out = self.output_for(run_id).await?;
+        let rx = out.watch();
+        Ok(OutputSubscription {
+            out,
+            rx,
+            next_seq: since,
+            done: false,
+        })
+    }
+
+    async fn output_for(&self, run_id: &str) -> Result<Arc<RunOutput>> {
+        if !is_valid_run_id(run_id) {
+            return Err(ForjaError::NotFound(run_id.to_string()));
+        }
+        if let Some(out) = self.inner.output_buffer(run_id) {
+            return Ok(out);
+        }
+        // Sin buffer en memoria (p. ej. tras reiniciar): reconstruir desde la salida guardada.
+        let record = self
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| ForjaError::NotFound(run_id.to_string()))?;
+        let out = RunOutput::new(MAX_CHUNKS, MAX_BYTES);
+        if let Some(text) = record.output.as_deref() {
+            push_lines(&out, "stdout", text);
+        }
+        if let Some(err) = record.error.as_deref() {
+            push_lines(&out, "stderr", err);
+        }
+        out.finish();
+        Ok(self.inner.register_output(run_id, out))
     }
 
     pub async fn submit(&self, task: Task, agent: Arc<dyn Agent>) -> Result<RunRecord> {
@@ -184,6 +256,13 @@ impl Scheduler {
             self.inner.store.append_run(&record)?;
             let mut runs = self.inner.runs.write().await;
             runs.insert(run_id.clone(), record.clone());
+            self.inner.register_output(
+                &run_id,
+                RunOutput::new(
+                    self.inner.out_max_chunks.load(Ordering::Relaxed),
+                    self.inner.out_max_bytes.load(Ordering::Relaxed),
+                ),
+            );
             let _ = self.inner.events.send(record.clone());
         }
 
@@ -275,10 +354,47 @@ impl Scheduler {
         if let Some(record) = updated {
             self.inner.store.append_run(&record)?;
             let _ = self.inner.events.send(record.clone());
+            if let Some(out) = self.inner.output_buffer(run_id) {
+                out.finish();
+            }
             Ok(record)
         } else {
             Err(ForjaError::NotFound(run_id.to_string()))
         }
+    }
+}
+
+impl SchedulerInner {
+    fn output_buffer(&self, run_id: &str) -> Option<Arc<RunOutput>> {
+        let bufs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
+        bufs.map.get(run_id).cloned()
+    }
+
+    /// Registra un buffer y descarta los más antiguos ya terminados si hay demasiados.
+    fn register_output(&self, run_id: &str, out: Arc<RunOutput>) -> Arc<RunOutput> {
+        let mut bufs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = bufs.map.get(run_id) {
+            return Arc::clone(existing);
+        }
+        bufs.map.insert(run_id.to_string(), Arc::clone(&out));
+        bufs.order.push_back(run_id.to_string());
+        let mut idx = 0;
+        while bufs.map.len() > MAX_RETAINED_OUTPUTS && idx < bufs.order.len() {
+            let id = bufs.order[idx].clone();
+            if bufs.map.get(&id).is_some_and(|o| o.is_finished()) && id != run_id {
+                bufs.map.remove(&id);
+                bufs.order.remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+        out
+    }
+}
+
+fn push_lines(out: &RunOutput, stream: &str, text: &str) {
+    for line in text.split_inclusive('\n') {
+        out.push(stream, line);
     }
 }
 
@@ -345,6 +461,10 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
         let _ = inner.events.send(updated);
     }
 
+    if let Some(out) = inner.output_buffer(&run_id) {
+        out.finish();
+    }
+
     let mut handles = inner.handles.lock().await;
     handles.remove(&run_id);
 }
@@ -391,9 +511,38 @@ async fn execute_with_retries(
         timeout_secs: inner.config.timeout_secs,
     };
 
+    let out = inner.output_buffer(run_id);
+    let sink: Option<OutputSink> = out.as_ref().map(|out| {
+        let out = Arc::clone(out);
+        Arc::new(move |stream: OutputStream, text: String| out.push(stream.as_str(), &text))
+            as OutputSink
+    });
+
     let mut attempt: u32 = 1;
     let agent_output = loop {
-        match agent.run(&ctx).await {
+        let seen_before = out.as_ref().map_or(0, |o| o.page(0).next_seq);
+        let result = match &sink {
+            Some(sink) => with_output_sink(Arc::clone(sink), agent.run(&ctx)).await,
+            None => agent.run(&ctx).await,
+        };
+        // Agentes sin streaming: emitir la salida completa al terminar el intento.
+        if let Some(out) = &out {
+            if out.page(0).next_seq == seen_before {
+                match &result {
+                    Ok(o) => {
+                        let stdout = if o.raw_stdout.is_empty() {
+                            &o.text
+                        } else {
+                            &o.raw_stdout
+                        };
+                        push_lines(out, "stdout", stdout);
+                        push_lines(out, "stderr", &o.raw_stderr);
+                    }
+                    Err(e) => push_lines(out, "stderr", &format!("{e}\n")),
+                }
+            }
+        }
+        match result {
             Ok(output) => break output,
             Err(err) => {
                 if attempt <= inner.config.max_retries {
@@ -901,5 +1050,270 @@ mod tests {
             "esperaba concurrencia dinámica entre 2 y 3, observada: {}",
             max_seen.load(Ordering::SeqCst)
         );
+    }
+
+    // ---- salida en vivo ----
+
+    struct ScriptAgent {
+        env: Vec<(String, String)>,
+    }
+
+    impl ScriptAgent {
+        fn arc(env: &[(&str, &str)]) -> Arc<dyn Agent> {
+            Arc::new(Self {
+                env: env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            })
+        }
+    }
+
+    impl Agent for ScriptAgent {
+        fn kind(&self) -> AgentKind {
+            AgentKind::Mock
+        }
+
+        fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
+            Box::pin(async move {
+                let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../forja-agent/tests/fake_stream.sh");
+                let argv = vec![script.to_string_lossy().into_owned()];
+                let env: Vec<(&str, &str)> = self
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let res = forja_agent::Runner::run_argv_with_env(
+                    &argv,
+                    &ctx.worktree,
+                    ctx.timeout_secs,
+                    &env,
+                )
+                .await?;
+                Ok(AgentOutput {
+                    text: res.stdout.trim().to_string(),
+                    raw_stdout: res.stdout,
+                    raw_stderr: res.stderr,
+                    exit_code: res.exit_code,
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn new_scheduler(max_concurrency: usize) -> (Scheduler, TempDir, TempDir) {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let wt_dir = TempDir::new().expect("wt tempdir");
+        let store = JsonlStore::new(store_dir.path()).expect("store");
+        let mut config = SchedulerConfig::new(wt_dir.path());
+        config.max_concurrency = max_concurrency;
+        (
+            Scheduler::new(store, config).expect("scheduler"),
+            store_dir,
+            wt_dir,
+        )
+    }
+
+    fn open_task(name: &str) -> Task {
+        Task::new(name, "prompt", Privacy::Open)
+    }
+
+    #[tokio::test]
+    async fn output_streams_live_before_run_finishes() {
+        let (sched, _a, _b) = new_scheduler(2);
+        let agent = ScriptAgent::arc(&[("FAKE_STREAM_LINES", "4"), ("FAKE_STREAM_SLEEP", "0.15")]);
+        let run = sched
+            .submit(open_task("live"), agent)
+            .await
+            .expect("submit");
+
+        let mut sub = sched.subscribe_output(&run.id, 0).await.expect("subscribe");
+        let first = tokio::time::timeout(Duration::from_secs(5), sub.next_batch())
+            .await
+            .expect("sin timeout")
+            .expect("primer lote");
+        assert_eq!(first[0].text, "linea 1\n");
+        assert_eq!(first[0].stream, "stdout");
+        assert_eq!(first[0].seq, 0);
+        let status = sched.get_run(&run.id).await.expect("run").status;
+        assert_eq!(status, RunStatus::Running, "debe seguir corriendo");
+
+        let mut texts: Vec<String> = first.into_iter().map(|c| c.text).collect();
+        while let Some(batch) = sub.next_batch().await {
+            texts.extend(batch.into_iter().map(|c| c.text));
+        }
+        assert_eq!(texts, ["linea 1\n", "linea 2\n", "linea 3\n", "linea 4\n"]);
+        let done = sched.wait_run(&run.id).await.expect("wait");
+        assert_eq!(done.status, RunStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn output_buffer_is_capped_and_since_reconnects() {
+        let (sched, _a, _b) = new_scheduler(2);
+        sched.set_output_limits(5, 1024 * 1024);
+        let agent = ScriptAgent::arc(&[("FAKE_STREAM_LINES", "20"), ("FAKE_STREAM_SLEEP", "0")]);
+        let run = sched.submit(open_task("cap"), agent).await.expect("submit");
+        sched.wait_run(&run.id).await.expect("wait");
+
+        let page = sched.output_since(&run.id, 0).await.expect("page");
+        assert_eq!(page.chunks.len(), 5);
+        assert_eq!(page.chunks[0].seq, 15);
+        assert_eq!(page.chunks[0].text, "linea 16\n");
+        assert_eq!(page.next_seq, 20);
+        assert!(page.truncated);
+        assert!(page.finished);
+
+        let page = sched.output_since(&run.id, 18).await.expect("page");
+        assert_eq!(
+            page.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [18, 19]
+        );
+        assert!(!page.truncated);
+        let page = sched.output_since(&run.id, 20).await.expect("page");
+        assert!(page.chunks.is_empty());
+        assert_eq!(page.next_seq, 20);
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_drops_oldest() {
+        let (sched, _a, _b) = new_scheduler(1);
+        sched.set_output_limits(2000, 40);
+        let agent = ScriptAgent::arc(&[("FAKE_STREAM_LINES", "30"), ("FAKE_STREAM_SLEEP", "0")]);
+        let run = sched
+            .submit(open_task("bytes"), agent)
+            .await
+            .expect("submit");
+        sched.wait_run(&run.id).await.expect("wait");
+        let page = sched.output_since(&run.id, 0).await.expect("page");
+        let bytes: usize = page.chunks.iter().map(|c| c.text.len()).sum();
+        assert!(bytes <= 40, "bytes retenidos: {bytes}");
+        assert_eq!(page.chunks.last().expect("último").text, "linea 30\n");
+        assert!(page.truncated);
+    }
+
+    #[tokio::test]
+    async fn two_runs_stream_in_parallel_without_mixing() {
+        let (sched, _a, _b) = new_scheduler(2);
+        let mk = |tag: &str| {
+            ScriptAgent::arc(&[
+                ("FAKE_STREAM_LINES", "5"),
+                ("FAKE_STREAM_SLEEP", "0.2"),
+                ("FAKE_STREAM_TAG", tag),
+            ])
+        };
+        let a = sched.submit(open_task("A"), mk("alfa")).await.expect("a");
+        let b = sched.submit(open_task("B"), mk("beta")).await.expect("b");
+
+        // Ambos emiten algo mientras ninguno ha terminado.
+        let mut overlapped = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let pa = sched.output_since(&a.id, 0).await.expect("pa");
+            let pb = sched.output_since(&b.id, 0).await.expect("pb");
+            if !pa.chunks.is_empty() && !pb.chunks.is_empty() && !pa.finished && !pb.finished {
+                overlapped = true;
+                break;
+            }
+        }
+        assert!(overlapped, "los dos runs debieron transmitir a la vez");
+
+        sched.wait_all().await;
+        for (id, tag) in [(&a.id, "alfa"), (&b.id, "beta")] {
+            let page = sched.output_since(id, 0).await.expect("page");
+            let texts: Vec<String> = page.chunks.iter().map(|c| c.text.clone()).collect();
+            let expected: Vec<String> = (1..=5).map(|i| format!("{tag} {i}\n")).collect();
+            assert_eq!(texts, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_still_applies_to_streaming_runs() {
+        let (sched, _a, _b) = new_scheduler(1);
+        let mk = |tag: &str| {
+            ScriptAgent::arc(&[
+                ("FAKE_STREAM_LINES", "3"),
+                ("FAKE_STREAM_SLEEP", "0.15"),
+                ("FAKE_STREAM_TAG", tag),
+            ])
+        };
+        let a = sched.submit(open_task("A"), mk("uno")).await.expect("a");
+        let b = sched.submit(open_task("B"), mk("dos")).await.expect("b");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pb = sched.output_since(&b.id, 0).await.expect("pb");
+        assert!(pb.chunks.is_empty(), "B no debe arrancar con límite 1");
+        assert!(!sched
+            .output_since(&a.id, 0)
+            .await
+            .expect("pa")
+            .chunks
+            .is_empty());
+        sched.wait_all().await;
+    }
+
+    #[tokio::test]
+    async fn finished_run_replays_buffer_and_closes() {
+        let (sched, _a, _b) = new_scheduler(2);
+        let run = sched
+            .submit(
+                open_task("fin"),
+                ScriptAgent::arc(&[("FAKE_STREAM_LINES", "2"), ("FAKE_STREAM_SLEEP", "0")]),
+            )
+            .await
+            .expect("submit");
+        sched.wait_run(&run.id).await.expect("wait");
+
+        let mut sub = sched.subscribe_output(&run.id, 0).await.expect("sub");
+        let batch = sub.next_batch().await.expect("backlog");
+        assert_eq!(batch.len(), 2);
+        assert!(sub.next_batch().await.is_none(), "debe cerrar");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_agent_emits_output_at_end() {
+        let (sched, _a, _b) = new_scheduler(2);
+        let run = sched
+            .submit(
+                open_task("mock"),
+                Arc::new(MockAgent::success("hola\nmundo")),
+            )
+            .await
+            .expect("submit");
+        sched.wait_run(&run.id).await.expect("wait");
+        let page = sched.output_since(&run.id, 0).await.expect("page");
+        let all: String = page.chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(all.contains("hola\nmundo"), "salida: {all:?}");
+        assert!(page.finished);
+    }
+
+    #[tokio::test]
+    async fn output_is_redacted_before_emission() {
+        let (sched, _a, _b) = new_scheduler(2);
+        let run = sched
+            .submit(
+                open_task("secret"),
+                ScriptAgent::arc(&[
+                    ("FAKE_STREAM_LINES", "1"),
+                    ("FAKE_STREAM_SLEEP", "0"),
+                    ("FAKE_STREAM_SECRET", "sk-live1234567890abcdef"),
+                ]),
+            )
+            .await
+            .expect("submit");
+        sched.wait_run(&run.id).await.expect("wait");
+        let page = sched.output_since(&run.id, 0).await.expect("page");
+        let all: String = page.chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(all.contains("clave ***"), "salida: {all:?}");
+        assert!(!all.contains("sk-live"));
+    }
+
+    #[tokio::test]
+    async fn output_unknown_or_invalid_id_is_not_found() {
+        let (sched, _a, _b) = new_scheduler(1);
+        for id in ["no-existe", "../etc/passwd", "", "a b"] {
+            let err = sched.output_since(id, 0).await.expect_err("debe fallar");
+            assert!(matches!(err, ForjaError::NotFound(_)), "{id}: {err:?}");
+            assert!(sched.subscribe_output(id, 0).await.is_err());
+        }
     }
 }

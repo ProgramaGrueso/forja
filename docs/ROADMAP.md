@@ -34,6 +34,14 @@ alguien que acaba de clonar el repo.
 
 ## Terminales en paralelo (estilo Orca)
 
+- **[Backend hecho] Salida en vivo por ejecución.** `Runner::run_argv_streaming`
+  (y `with_output_sink`, que adapta sin cambios a los agentes basados en `Runner`)
+  emite líneas stdout/stderr mientras el proceso corre; los agentes sin streaming
+  (mock) emiten la salida completa al terminar. El scheduler guarda un buffer por
+  run (2000 líneas / 512 KiB), redactado con `forja_core::redact_secrets`, y el
+  server expone `GET /runs/{id}/output?since=SEQ` (JSON: `chunks`, `next_seq`,
+  `truncated`, `finished`) y SSE `GET /runs/{id}/stream?since=SEQ` (eventos
+  `output` y `status` final; si el run terminó reproduce y cierra). Falta la UI:
 - **Varios terminales vivos en el panel.** Ver en vivo, y no solo al terminar,
   la salida de cada ejecución; varios a la vez, con selector de foco y scroll
   independiente, como los workspaces de Orca. Hoy la salida se consulta con

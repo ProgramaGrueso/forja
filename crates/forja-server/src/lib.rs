@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use api::AgentMeta;
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -295,6 +295,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/runs/{id}/output", get(run_output))
+        .route("/runs/{id}/stream", get(run_stream))
         .route("/api/telemetry", get(api::get_telemetry))
         .route("/api/agents", get(api::agents))
         .route("/api/stats", get(api::stats))
@@ -423,6 +425,93 @@ async fn get_run(
         .await
         .ok_or(ApiError(ForjaError::NotFound(id)))?;
     Ok(Json(record))
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputQuery {
+    #[serde(default)]
+    since: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct OutputChunkDto {
+    seq: u64,
+    stream: String,
+    text: String,
+}
+
+impl From<forja_sched::OutputChunk> for OutputChunkDto {
+    fn from(c: forja_sched::OutputChunk) -> Self {
+        Self {
+            seq: c.seq,
+            stream: c.stream,
+            text: c.text,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OutputResponse {
+    chunks: Vec<OutputChunkDto>,
+    next_seq: u64,
+    truncated: bool,
+    finished: bool,
+}
+
+/// GET /runs/{id}/output?since=N: salida acumulada (ya redactada) para reconectar.
+async fn run_output(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<OutputQuery>,
+) -> std::result::Result<Json<OutputResponse>, ApiError> {
+    let page = state.scheduler.output_since(&id, q.since).await?;
+    Ok(Json(OutputResponse {
+        chunks: page.chunks.into_iter().map(Into::into).collect(),
+        next_seq: page.next_seq,
+        truncated: page.truncated,
+        finished: page.finished,
+    }))
+}
+
+/// GET /runs/{id}/stream?since=N: SSE con eventos `output` en vivo y un `status`
+/// final con el RunRecord; si el run ya terminó reproduce el buffer y cierra.
+async fn run_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<OutputQuery>,
+) -> std::result::Result<
+    Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>>,
+    ApiError,
+> {
+    let mut sub = state.scheduler.subscribe_output(&id, q.since).await?;
+    let scheduler = state.scheduler.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+
+    tokio::spawn(async move {
+        while let Some(batch) = sub.next_batch().await {
+            for chunk in batch {
+                let seq = chunk.seq;
+                let Ok(ev) = Event::default()
+                    .event("output")
+                    .id(seq.to_string())
+                    .json_data(OutputChunkDto::from(chunk))
+                else {
+                    continue;
+                };
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if let Some(record) = scheduler.get_run(&id).await {
+            if let Ok(ev) = Event::default().event("status").json_data(record) {
+                let _ = tx.send(ev).await;
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 async fn cancel_run(
@@ -1019,5 +1108,189 @@ mod tests {
             "esperaba id {} en: {text}",
             submitted.id
         );
+    }
+
+    struct ScriptAgent(Vec<(String, String)>);
+
+    impl Agent for ScriptAgent {
+        fn kind(&self) -> AgentKind {
+            AgentKind::Mock
+        }
+
+        fn run<'a>(&'a self, ctx: &'a forja_agent::RunContext) -> forja_agent::AgentFuture<'a> {
+            Box::pin(async move {
+                let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../forja-agent/tests/fake_stream.sh");
+                let argv = vec![script.to_string_lossy().into_owned()];
+                let env: Vec<(&str, &str)> = self
+                    .0
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let res = forja_agent::Runner::run_argv_with_env(
+                    &argv,
+                    &ctx.worktree,
+                    ctx.timeout_secs,
+                    &env,
+                )
+                .await?;
+                Ok(forja_agent::AgentOutput {
+                    text: res.stdout.trim().to_string(),
+                    raw_stdout: res.stdout,
+                    raw_stderr: res.stderr,
+                    exit_code: res.exit_code,
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn script_agent(lines: &str, sleep: &str) -> Arc<dyn Agent> {
+        Arc::new(ScriptAgent(vec![
+            ("FAKE_STREAM_LINES".into(), lines.into()),
+            ("FAKE_STREAM_SLEEP".into(), sleep.into()),
+        ]))
+    }
+
+    async fn get(app: &axum::Router, uri: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("respuesta")
+    }
+
+    #[tokio::test]
+    async fn run_output_endpoint_supports_since() {
+        let (state, _s, _w) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+        let run = scheduler
+            .submit(
+                forja_core::Task::new("out", "p", Privacy::Open),
+                script_agent("4", "0"),
+            )
+            .await
+            .expect("submit");
+        scheduler.wait_run(&run.id).await.expect("wait");
+
+        let res = get(&app, &format!("/runs/{}/output", run.id)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: Value = read_json(res.into_body()).await;
+        assert_eq!(v["chunks"].as_array().unwrap().len(), 4);
+        assert_eq!(v["next_seq"], 4);
+        assert_eq!(v["finished"], true);
+        assert_eq!(v["chunks"][0]["stream"], "stdout");
+        assert_eq!(v["chunks"][0]["text"], "linea 1\n");
+
+        let res = get(&app, &format!("/runs/{}/output?since=3", run.id)).await;
+        let v: Value = read_json(res.into_body()).await;
+        assert_eq!(v["chunks"].as_array().unwrap().len(), 1);
+        assert_eq!(v["chunks"][0]["seq"], 3);
+        assert_eq!(v["next_seq"], 4);
+    }
+
+    #[tokio::test]
+    async fn run_output_and_stream_unknown_id_404() {
+        let (state, _s, _w) = test_state();
+        let app = build_router(state);
+        for uri in [
+            "/runs/no-existe/output",
+            "/runs/no-existe/stream",
+            "/runs/..%2Fetc/output",
+            "/runs/..%2Fetc/stream",
+        ] {
+            let res = get(&app, uri).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_stream_sse_live_then_status_and_close() {
+        use tokio_stream::StreamExt;
+
+        let (state, _s, _w) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+        let run = scheduler
+            .submit(
+                forja_core::Task::new("sse", "p", Privacy::Open),
+                script_agent("3", "0.15"),
+            )
+            .await
+            .expect("submit");
+
+        let res = get(&app, &format!("/runs/{}/stream", run.id)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/event-stream"));
+
+        let mut body = res.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("sin timeout")
+            .expect("chunk")
+            .expect("ok");
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert!(first.contains("event: output"), "{first}");
+        assert!(first.contains("linea 1"), "{first}");
+        assert_eq!(
+            scheduler.get_run(&run.id).await.unwrap().status,
+            RunStatus::Running,
+            "el primer evento llega con el run aún en curso"
+        );
+
+        let mut rest = first;
+        while let Some(Ok(b)) = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("sin timeout")
+        {
+            rest.push_str(&String::from_utf8_lossy(&b));
+        }
+        assert!(rest.contains("linea 3"));
+        assert!(rest.contains("event: status"));
+        assert!(
+            rest.contains("\"status\":\"done\"") || rest.contains("\"status\":\"Done\""),
+            "{rest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_stream_finished_run_replays_and_closes() {
+        use tokio_stream::StreamExt;
+
+        let (state, _s, _w) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+        let run = scheduler
+            .submit(
+                forja_core::Task::new("sse2", "p", Privacy::Open),
+                script_agent("2", "0"),
+            )
+            .await
+            .expect("submit");
+        scheduler.wait_run(&run.id).await.expect("wait");
+
+        let res = get(&app, &format!("/runs/{}/stream?since=1", run.id)).await;
+        let mut body = res.into_body().into_data_stream();
+        let mut all = String::new();
+        while let Some(Ok(b)) = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("el stream debe cerrar")
+        {
+            all.push_str(&String::from_utf8_lossy(&b));
+        }
+        let outputs: Vec<&str> = all.matches("event: output").collect();
+        assert_eq!(outputs.len(), 1, "since=1 salta el primero: {all}");
+        assert!(all.contains("linea 2"));
+        assert!(all.contains("event: status"));
     }
 }
