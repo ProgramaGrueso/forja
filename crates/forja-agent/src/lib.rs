@@ -9,7 +9,7 @@ use std::pin::Pin;
 use forja_core::{AgentKind, Result, Task};
 use serde::{Deserialize, Serialize};
 
-pub use agy::{build_command, AgyCommandOptions};
+pub use agy::{build_command, parse_agy_output, AgyAgent, AgyCommandOptions};
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
 pub use runner::{CommandResult, Runner};
 
