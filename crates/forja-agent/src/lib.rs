@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub use agy::{build_command, parse_agy_output, AgyAgent, AgyCommandOptions};
 pub use claude::ClaudeAgent;
 pub use hermes::HermesAgent;
-pub use local::LocalAgent;
+pub use local::{build_command as build_local_command, LocalAgent, LocalCommandOptions};
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
 pub use opencode::OpencodeAgent;
 pub use runner::{CommandResult, Runner};
