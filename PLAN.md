@@ -40,14 +40,14 @@ Estructura final:
       fn create_worktree(repo, base_branch, nueva_rama, destino)->Result<PathBuf>, usando std::process::Command
       con `git`. Tests con tempfile creando un repo real.
       Hecho cuando: `cargo test -p forja-git create` pasa y el test verifica que la rama y la carpeta existen.
-- [ ] T05 forja-git: estado y commit (30 min)
+- [x] T05 forja-git: estado y commit (30 min)
       fn status_clean, fn commit_all(msg), fn current_branch. Nunca ejecuta push (no debe existir ninguna función con push).
       Hecho cuando: `cargo test -p forja-git` pasa y `grep -rn "push" crates/forja-git/src` no devuelve nada.
 - [x] T06 forja-agent: trait Agent y MockAgent (30 min)
       trait Agent { fn kind(&self)->AgentKind; async fn run(&self, ctx:&RunContext)->Result<AgentOutput>; }
       MockAgent configurable: éxito, fallo, tardanza, y escribe un archivo en el worktree.
       Hecho cuando: `cargo test -p forja-agent mock` pasa con casos de éxito, fallo y timeout.
-- [ ] T07 forja-agent: AgyAgent, construcción del comando (40 min)
+- [x] T07 forja-agent: AgyAgent, construcción del comando (40 min)
       Función pura build_command(opts)->Vec<String> que arma:
       agy -p "<prompt>" --model <modelo> --mode <modo> --output-format json --print-timeout <seg> --add-dir <worktree>
       Sin ejecutar nada. Prompts con comillas y saltos de línea van como argumento, nunca por shell.

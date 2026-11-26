@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T04 (forja-git) y T06 (forja-agent)
-- Tarea en curso: T05 (forja-git: estado y commit) y T07 (forja-agent: AgyAgent build_command) en paralelo
+- Última tarea cerrada: T05 (forja-git) y T07 (forja-agent)
+- Tarea en curso: T08 (forja-agent: Runner con agy falso) y T10 (forja-store: JSONL) en paralelo
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -61,22 +61,42 @@
 - Notas para retomar: `Agent`, `RunContext`, `AgentOutput`, `MockAgent` listos; `Pin<Box<dyn Future>>` permite `Arc<dyn Agent>` sin dependencias extra.
 
 ### T05 — forja-git: estado y commit
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:04:00-05:00 / 2026-11-26T00:06:14-05:00
+- Quién la hizo: subagente noche/forja-T05 (verificado e integrado por agente principal)
+- Commits: dec6e8e T05: status_clean, commit_all y current_branch en forja-git
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-git && ! grep -rn "push" crates/forja-git/src && ./scripts/check.sh` -> exit 0; `forja-git`: `test result: ok. 5 passed; 0 failed`; 0 coincidencias de `push`; workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: `forja-git` completo.
+
+### T10 — forja-store: JSONL append-only
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:04:00-05:00 /
-- Quién la hizo: subagente noche/forja-T05
+- Hora de inicio / fin: 2026-11-26T00:06:30-05:00 /
+- Quién la hizo: subagente noche/forja-T10
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T05.
+- Notas para retomar: worktree ../forja-wt-T10.
 
 ### T07 — forja-agent: AgyAgent, construcción del comando
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:04:00-05:00 / 2026-11-26T00:05:48-05:00
+- Quién la hizo: subagente noche/forja-T07 (verificado e integrado por agente principal)
+- Commits: da4701d T07: construcción del comando de agy en forja-agent
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-agent agy_args && ./scripts/check.sh` -> exit 0; `agy_args`: `test result: ok. 5 passed; 0 failed; 0 ignored`; workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: `build_command` y `AgyCommandOptions` listos en `forja-agent::agy`.
+
+### T08 — forja-agent: Runner con agy falso
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:04:00-05:00 /
-- Quién la hizo: subagente noche/forja-T07
+- Hora de inicio / fin: 2026-11-26T00:05:55-05:00 /
+- Quién la hizo: subagente noche/forja-T08
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T07.
+- Notas para retomar: worktree ../forja-wt-T08.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
@@ -97,6 +117,8 @@
 |------|-------|------|--------|--------------------------------------------|
 | 00:01 | T04 | noche/forja-T04 | gemini-4-neon-low | aceptado (código limpio; verificado y commiteado tras bloqueo de bash headless) |
 | 00:01 | T06 | noche/forja-T06 | gemini-4-neon-low | aceptado (1 import sin usar corregido tras bloqueo de bash headless; 4/4 tests ok) |
+| 00:04 | T07 | noche/forja-T07 | gemini-4-neon-low | aceptado (5/5 tests agy_args + check.sh en verde a la primera) |
+| 00:04 | T05 | noche/forja-T05 | gemini-4-neon-low | aceptado (5/5 tests forja-git, 0 grep push + check.sh en verde a la primera) |
 
 ## Siguiente paso exacto
 Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.
