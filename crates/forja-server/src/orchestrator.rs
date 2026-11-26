@@ -173,6 +173,32 @@ impl Orchestrator {
     }
 }
 
+/// Comandos de barra que el panel resuelve sin llamar a Hermes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    New,
+    Help,
+    Unknown(String),
+}
+
+/// Devuelve `None` si el mensaje no es un comando (va normal al orquestador).
+pub fn parse_command(message: &str) -> Option<Command> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let word = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    Some(match word.as_str() {
+        "/new" | "/reset" | "/nueva" => Command::New,
+        "/help" | "/ayuda" | "/comandos" => Command::Help,
+        _ => Command::Unknown(word),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -195,6 +221,29 @@ pub async fn chat(
         );
     }
     let port = state.settings.read().map(|s| s.port).unwrap_or(7777);
+    if let Some(cmd) = parse_command(message) {
+        return match cmd {
+            Command::New => {
+                state.orchestrator.reset();
+                (
+                    StatusCode::OK,
+                    Json(json!({ "reply": "Sesión nueva. ¿Qué hacemos?" })),
+                )
+            }
+            Command::Help => (
+                StatusCode::OK,
+                Json(json!({
+                    "reply": "Comandos: /new para empezar una sesión nueva, /help para ver esto."
+                })),
+            ),
+            Command::Unknown(cmd) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("comando desconocido: {cmd}. Usa /new o /help.")
+                })),
+            ),
+        };
+    }
     match state
         .orchestrator
         .say(message, port, state.auth_token.as_deref())
@@ -235,6 +284,19 @@ mod tests {
             Some("abc-1")
         );
         assert_eq!(parse_session_id("nada"), None);
+    }
+
+    #[test]
+    fn parses_slash_commands_locally() {
+        assert_eq!(parse_command("/new"), Some(Command::New));
+        assert_eq!(parse_command("  /NEW  "), Some(Command::New));
+        assert_eq!(parse_command("/reset"), Some(Command::New));
+        assert_eq!(parse_command("/help"), Some(Command::Help));
+        assert_eq!(
+            parse_command("/modelo"),
+            Some(Command::Unknown("/modelo".into()))
+        );
+        assert_eq!(parse_command("hola /new"), None);
     }
 
     #[test]
