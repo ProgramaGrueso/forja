@@ -36,6 +36,13 @@ En el panel, pestaña **Orquestador**: conversas por texto o pulsas **Llamar** p
 - Usa Hermes como cerebro: `export FORJA_ORCHESTRATOR_PROFILE=tu-perfil` (por defecto `default`; solo perfiles de la lista blanca).
 - La voz usa el navegador (Web Speech API): funciona en Chrome, Edge y Chromium, necesita internet y permiso de micrófono.
 
+### Orquestador, modelos y terminales en el panel
+
+- **Conversaciones**: en **Orquestador** hay una lista lateral (máx. 20) con un historial independiente por conversación; varias pueden estar «pensando» a la vez. `+ Nueva` crea otra; ✕ la borra (con confirmación). La seleccionada se recuerda.
+- **Comandos `/`**: al escribir `/` aparece el autocompletado. `/new` (conversación nueva), `/help`, `/rename <título>`, `/agents`, `/stop`; `/model` y `/agent` están reservados («disponible pronto»).
+- **Elegir orquestador y modelos** (pestaña **Ajustes**, el selector de perfil también está en la cabecera de Orquestador): perfil de Hermes del orquestador (cambiarlo reinicia sus sesiones) y modelo por agente (`claude`, `agy`, `opencode`, `local`; vacío = default). En **Nueva tarea** el campo opcional «Modelo» lo sobrescribe para esa ejecución (no aplica a `mock` ni `hermes`).
+- **Terminales**: vista con 1–4 paneles que muestran en vivo la salida de varias ejecuciones a la vez (stderr en rojo, autoscroll que se pausa si subes, cancelar/limpiar/cerrar). Las tareas nuevas se abren solas en un panel libre.
+
 ### Si algo falla
 
 - `cargo: command not found`: instala Rust desde https://rustup.rs.
