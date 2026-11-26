@@ -30,9 +30,22 @@ alguien que acaba de clonar el repo.
   agente del orquestador, modelo por agente y perfiles de Hermes a ocultar, y fusiona
   `<store_dir>/settings.json` sin pisar campos. `forja doctor` sugiere `forja init` si falta
   el archivo y `forja doctor --fix` lanza el asistente.
-- **Pendiente:** el orquestador con `claude` corre con el modo de permisos por defecto del
-  adaptador (`acceptEdits`), que no autoriza ejecutar `curl`; para que delegue sin ayuda
-  hace falta decidir una política de permisos específica del orquestador.
+- ~~**Orquestador que delega con cualquier agente.**~~ **Hecho**: sin dar permisos de shell,
+  los orquestadores no-Hermes terminan su respuesta con bloques `[[forja:delegar {...}]]` /
+  `[[forja:estado ID]]` que el servidor valida (mismas reglas que `POST /tasks`, máx. 5
+  delegaciones por turno), encola y reinyecta en el siguiente turno («Tareas delegadas»);
+  los bloques se ocultan al usuario y solo se leen en la salida del orquestador. Hermes
+  conserva el camino `curl`. Límite: el resultado se entrega en el turno siguiente (el
+  orquestador no espera a que acaben las tareas).
+- ~~**Esfuerzo de razonamiento por familia.**~~ **Hecho**: `Settings.agent_effort`
+  (claude, agy, opencode, hermes), `esfuerzo` en `POST /tasks`, `forja run --effort` y
+  `forja init`; tarea > ajustes > ninguno (sin configurar no se pasa flag). claude/agy
+  `--effort`, hermes `--reasoning` (+ `-m`), opencode `#variante` del modelo; `local` no lo
+  soporta. Queda en `RunRecord.effort`; `GET /api/agents` expone `effort`, `effort_levels`
+  y `model_editable`.
+- ~~**Modelo y esfuerzo por conversación del orquestador.**~~ **Hecho**: desplegables
+  `[Modelo] [Esfuerzo]` y micrófono en el composer, `/model` y `/effort`, campos `modelo` y
+  `esfuerzo` en la conversación y en `/api/orchestrator/chat`; no reinician la conversación.
 
 ## Conversaciones
 

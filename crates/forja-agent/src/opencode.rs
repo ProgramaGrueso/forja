@@ -19,6 +19,9 @@ pub struct OpencodeCommandOptions {
     pub prompt: String,
     pub model: String,
     pub title: String,
+    /// Variante de razonamiento: se añade como `#variante` al modelo (reemplaza la
+    /// que ya traiga). None = el modelo va tal cual.
+    pub effort: Option<String>,
 }
 
 impl OpencodeCommandOptions {
@@ -27,6 +30,7 @@ impl OpencodeCommandOptions {
             prompt: prompt.into(),
             model: DEFAULT_MODEL.to_string(),
             title: DEFAULT_TITLE.to_string(),
+            effort: None,
         }
     }
 }
@@ -40,7 +44,7 @@ pub fn build_command(opts: &OpencodeCommandOptions) -> Vec<String> {
         DEFAULT_PROGRAM.to_string(),
         "run".to_string(),
         "--model".to_string(),
-        opts.model.clone(),
+        crate::models::opencode_model_with_effort(&opts.model, opts.effort.as_deref()),
         "--auto".to_string(),
         "--title".to_string(),
         opts.title.clone(),
@@ -118,6 +122,8 @@ pub struct OpencodeAgent {
     pub program: String,
     pub model: String,
     pub title: String,
+    /// Variante de razonamiento (`#variante` del modelo); None = no se añade.
+    pub effort: Option<String>,
 }
 
 impl Default for OpencodeAgent {
@@ -132,7 +138,13 @@ impl OpencodeAgent {
             program: DEFAULT_PROGRAM.to_string(),
             model: model.into(),
             title: DEFAULT_TITLE.to_string(),
+            effort: None,
         }
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
     }
 
     /// Cambia el binario a ejecutar (los tests apuntan a un script falso).
@@ -162,12 +174,23 @@ impl Agent for OpencodeAgent {
         Some(Arc::new(copy))
     }
 
+    fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+
+    fn with_effort(&self, effort: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.effort = Some(effort.to_string());
+        Some(Arc::new(copy))
+    }
+
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
         Box::pin(async move {
             let opts = OpencodeCommandOptions {
                 prompt: ctx.task.prompt.clone(),
                 model: self.model.clone(),
                 title: self.title.clone(),
+                effort: self.effort.clone(),
             };
             let mut argv = build_command(&opts);
             argv[0] = self.program.clone();
@@ -188,6 +211,23 @@ impl Agent for OpencodeAgent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opencode_effort_is_a_model_variant_and_replaces_existing() {
+        let mut opts = OpencodeCommandOptions::new("p");
+        opts.model = "prov/mod".into();
+        assert_eq!(build_command(&opts)[3], "prov/mod");
+        opts.effort = Some("high".into());
+        let args = build_command(&opts);
+        assert_eq!(args[3], "prov/mod#high");
+        assert!(!args.contains(&"--effort".to_string()));
+        opts.model = "prov/mod#low".into();
+        assert_eq!(build_command(&opts)[3], "prov/mod#high");
+        opts.effort = None;
+        assert_eq!(build_command(&opts)[3], "prov/mod#low");
+        let agent = Agent::with_effort(&OpencodeAgent::default(), "max").unwrap();
+        assert_eq!(agent.effort().as_deref(), Some("max"));
+    }
+
     use std::path::PathBuf;
 
     use forja_core::{AgentKind, ForjaError, Privacy, Task};

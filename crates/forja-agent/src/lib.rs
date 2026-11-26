@@ -20,7 +20,10 @@ pub use claude::ClaudeAgent;
 pub use hermes::HermesAgent;
 pub use local::{build_command as build_local_command, LocalAgent, LocalCommandOptions};
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
-pub use models::{build_agent, default_model, resolve_model, validate_model, MODEL_AGENTS};
+pub use models::{
+    build_agent, default_model, effort_levels, opencode_model_with_effort, resolve_effort,
+    resolve_model, validate_effort, validate_model, EFFORT_AGENTS, MODEL_AGENTS,
+};
 pub use opencode::{
     build_command as build_opencode_command, parse_opencode_output, OpencodeAgent,
     OpencodeCommandOptions,
@@ -56,6 +59,16 @@ pub trait Agent: Send + Sync {
     /// Copia del agente con otro modelo, conservando el resto de su configuración.
     /// None si el agente no admite elegir modelo.
     fn with_model(&self, _model: &str) -> Option<Arc<dyn Agent>> {
+        None
+    }
+
+    /// Esfuerzo de razonamiento configurado (None si no se fijó o no aplica).
+    fn effort(&self) -> Option<String> {
+        None
+    }
+
+    /// Copia del agente con otro esfuerzo de razonamiento. None si el agente no lo admite.
+    fn with_effort(&self, _effort: &str) -> Option<Arc<dyn Agent>> {
         None
     }
 

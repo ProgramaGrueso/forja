@@ -147,6 +147,10 @@ pub fn run_init<R: BufRead, W: Write>(
         .as_ref()
         .map(|s| s.agent_models.clone())
         .unwrap_or_default();
+    let saved_efforts = existing
+        .as_ref()
+        .map(|s| s.agent_effort.clone())
+        .unwrap_or_default();
     for kind in forja_agent::MODEL_AGENTS {
         let name = kind.to_string();
         if !env.installed.contains(&name) {
@@ -158,24 +162,58 @@ pub fn run_init<R: BufRead, W: Write>(
             .map(String::as_str)
             .unwrap_or(code_default)
             .to_string();
+        let label = if code_default.is_empty() {
+            "vacío = el del perfil".to_string()
+        } else {
+            format!("default del código: {code_default}")
+        };
         let answer = ask(
             input,
             out,
             yes,
-            &format!("Modelo para {name} (default del código: {code_default})"),
+            &format!("Modelo para {name} ({label})"),
             &default,
         )?;
-        let model = match forja_agent::validate_model(&answer) {
-            Ok(m) => m,
-            Err(e) => {
-                writeln!(out, "  modelo no válido ({e}): se conserva {default}.")
-                    .map_err(io_err)?;
-                default.clone()
+        if answer.trim().is_empty() && code_default.is_empty() {
+            // Sin modelo configurado (hermes): se usa el del perfil.
+        } else {
+            let model = match forja_agent::validate_model(&answer) {
+                Ok(m) => m,
+                Err(e) => {
+                    writeln!(out, "  modelo no válido ({e}): se conserva {default}.")
+                        .map_err(io_err)?;
+                    default.clone()
+                }
+            };
+            // Solo se guarda si difiere del default del código o ya había una entrada.
+            if !model.is_empty() && (model != code_default || saved_models.contains_key(&name)) {
+                patch.agent_models.insert(name.clone(), model);
             }
-        };
-        // Solo se guarda si difiere del default del código o ya había una entrada.
-        if model != code_default || saved_models.contains_key(&name) {
-            patch.agent_models.insert(name, model);
+        }
+
+        // Esfuerzo de razonamiento (Enter = sin configurar: no se pasa ningún flag).
+        if forja_agent::EFFORT_AGENTS.contains(&kind) {
+            let saved_effort = saved_efforts.get(&name).cloned().unwrap_or_default();
+            let answer = ask(
+                input,
+                out,
+                yes,
+                &format!(
+                    "Esfuerzo de razonamiento para {name} ({}; vacío = sin configurar)",
+                    forja_agent::effort_levels(kind).join("/")
+                ),
+                &saved_effort,
+            )?;
+            if !answer.trim().is_empty() {
+                match forja_agent::validate_effort(kind, &answer) {
+                    Ok(e) => {
+                        patch.agent_effort.insert(name, e);
+                    }
+                    Err(e) => {
+                        writeln!(out, "  esfuerzo no válido ({e}): se ignora.").map_err(io_err)?
+                    }
+                }
+            }
         }
     }
 
@@ -273,6 +311,9 @@ pub fn run_init<R: BufRead, W: Write>(
     for (agent, model) in &settings.agent_models {
         writeln!(out, "  modelo de {agent}: {model}").map_err(io_err)?;
     }
+    for (agent, effort) in &settings.agent_effort {
+        writeln!(out, "  esfuerzo de {agent}: {effort}").map_err(io_err)?;
+    }
     if !settings.hidden_profiles.is_empty() {
         writeln!(
             out,
@@ -343,8 +384,14 @@ mod tests {
             &["claude", "agy", "hermes"],
             &["default", "claudia", "privado"],
         );
-        // agente, modelo claude, modelo agy (Enter), ocultos, perfil de hermes (no aplica)
-        let (res, out) = run("hermes\nopus\n\nprivado\nclaudia\n", dir.path(), false, &e);
+        // agente; claude: modelo, esfuerzo; agy: modelo (Enter), esfuerzo; hermes: modelo
+        // (Enter), esfuerzo; ocultos; perfil de hermes
+        let (res, out) = run(
+            "hermes\nopus\nhigh\n\n\n\nultra\nprivado\nclaudia\n",
+            dir.path(),
+            false,
+            &e,
+        );
         let s = res.expect("init");
         assert_eq!(s.orchestrator_agent.as_deref(), Some("hermes"));
         assert_eq!(
@@ -354,6 +401,22 @@ mod tests {
         assert!(
             !s.agent_models.contains_key("agy"),
             "Enter = default del código"
+        );
+        assert_eq!(
+            s.agent_effort.get("claude").map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            s.agent_effort.get("hermes").map(String::as_str),
+            Some("ultra")
+        );
+        assert!(
+            !s.agent_effort.contains_key("agy"),
+            "Enter = sin configurar"
+        );
+        assert!(
+            out.contains("Esfuerzo de razonamiento para claude (low/medium/high/xhigh/max"),
+            "{out}"
         );
         assert_eq!(s.hidden_profiles, vec!["privado"]);
         assert_eq!(s.orchestrator_profile.as_deref(), Some("claudia"));
@@ -374,12 +437,15 @@ mod tests {
     fn invalid_answers_fall_back_to_defaults_without_looping() {
         let dir = tmp();
         let e = env(&["claude", "opencode"], &[]);
-        let (res, out) = run("gpt\n--malo\n", dir.path(), false, &e);
+        // agente; claude: modelo malo, esfuerzo malo (local no lo admite)
+        let (res, out) = run("gpt\n--malo\nextremo\n", dir.path(), false, &e);
         let s = res.expect("init");
         assert_eq!(s.orchestrator_agent.as_deref(), Some("claude"));
         assert!(out.contains("no está instalado"), "{out}");
         assert!(out.contains("modelo no válido"), "{out}");
+        assert!(out.contains("esfuerzo no válido"), "{out}");
         assert!(s.agent_models.is_empty());
+        assert!(s.agent_effort.is_empty());
     }
 
     #[test]
@@ -409,12 +475,12 @@ mod tests {
             dir.path().join("settings.json"),
             r#"{"max_concurrency":5,"store_dir":"/tmp/x","port":8123,"quota_path":"/tmp/q.json",
                 "hide_mascot":true,"agent_models":{"claude":"haiku","agy":"g-9"},
-                "orchestrator_agent":"agy","hidden_profiles":["viejo"]}"#,
+                "agent_effort":{"claude":"high"},"orchestrator_agent":"agy","hidden_profiles":["viejo"]}"#,
         )
         .expect("escribir");
         let e = env(&["claude", "agy", "hermes"], &["default", "viejo", "nuevo"]);
         // Todo Enter: los valores existentes son los defaults. Se añade "nuevo" a ocultos.
-        let (res, _) = run("\n\n\nviejo, nuevo\n", dir.path(), false, &e);
+        let (res, _) = run("\n\n\n\n\n\n\nviejo, nuevo\n", dir.path(), false, &e);
         let s = res.expect("init");
         assert_eq!(s.max_concurrency, 5);
         assert_eq!(s.port, 8123);
@@ -422,6 +488,10 @@ mod tests {
         assert_eq!(s.orchestrator_agent.as_deref(), Some("agy"));
         assert_eq!(s.agent_models["claude"], "haiku");
         assert_eq!(s.agent_models["agy"], "g-9");
+        assert_eq!(
+            s.agent_effort["claude"], "high",
+            "el esfuerzo guardado es el default"
+        );
         assert_eq!(s.hidden_profiles, vec!["viejo", "nuevo"]);
     }
 

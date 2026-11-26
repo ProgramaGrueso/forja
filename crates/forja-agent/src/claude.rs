@@ -20,6 +20,8 @@ pub struct ClaudeCommandOptions {
     pub prompt: String,
     pub model: String,
     pub permission_mode: String,
+    /// `--effort <nivel>`; None = no se pasa el flag.
+    pub effort: Option<String>,
 }
 
 impl ClaudeCommandOptions {
@@ -28,6 +30,7 @@ impl ClaudeCommandOptions {
             prompt: prompt.into(),
             model: DEFAULT_MODEL.to_string(),
             permission_mode: DEFAULT_PERMISSION_MODE.to_string(),
+            effort: None,
         }
     }
 }
@@ -36,7 +39,7 @@ impl ClaudeCommandOptions {
 /// --permission-mode <modo>` sin ejecutar nada. El prompt viaja íntegro como
 /// argumento: nunca se interpola en una shell.
 pub fn build_command(opts: &ClaudeCommandOptions) -> Vec<String> {
-    vec![
+    let mut argv = vec![
         DEFAULT_PROGRAM.to_string(),
         "-p".to_string(),
         opts.prompt.clone(),
@@ -46,7 +49,12 @@ pub fn build_command(opts: &ClaudeCommandOptions) -> Vec<String> {
         "json".to_string(),
         "--permission-mode".to_string(),
         opts.permission_mode.clone(),
-    ]
+    ];
+    if let Some(effort) = &opts.effort {
+        argv.push("--effort".to_string());
+        argv.push(effort.clone());
+    }
+    argv
 }
 
 const TEXT_FIELDS: [&str; 4] = ["result", "text", "output", "message"];
@@ -164,6 +172,8 @@ pub struct ClaudeAgent {
     pub program: String,
     pub model: String,
     pub permission_mode: String,
+    /// Esfuerzo de razonamiento (`--effort`); None = no se pasa.
+    pub effort: Option<String>,
 }
 
 impl Default for ClaudeAgent {
@@ -178,7 +188,13 @@ impl ClaudeAgent {
             program: DEFAULT_PROGRAM.to_string(),
             model: DEFAULT_MODEL.to_string(),
             permission_mode: DEFAULT_PERMISSION_MODE.to_string(),
+            effort: None,
         }
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
     }
 
     pub fn with_program(mut self, program: impl Into<String>) -> Self {
@@ -212,6 +228,16 @@ impl Agent for ClaudeAgent {
         Some(Arc::new(copy))
     }
 
+    fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+
+    fn with_effort(&self, effort: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.effort = Some(effort.to_string());
+        Some(Arc::new(copy))
+    }
+
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
         Box::pin(async move {
             if !program_available(&self.program) {
@@ -225,6 +251,7 @@ impl Agent for ClaudeAgent {
                 prompt: ctx.task.prompt.clone(),
                 model: self.model.clone(),
                 permission_mode: self.permission_mode.clone(),
+                effort: self.effort.clone(),
             };
             let mut argv = build_command(&opts);
             argv[0] = self.program.clone();
@@ -237,6 +264,19 @@ impl Agent for ClaudeAgent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_effort_flag_only_when_configured() {
+        let mut opts = ClaudeCommandOptions::new("p");
+        assert!(!build_command(&opts).contains(&"--effort".to_string()));
+        opts.effort = Some("xhigh".into());
+        let args = build_command(&opts);
+        let i = args.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(args[i + 1], "xhigh");
+        let agent = Agent::with_effort(&ClaudeAgent::default(), "max").unwrap();
+        assert_eq!(agent.effort().as_deref(), Some("max"));
+        assert_eq!(ClaudeAgent::default().effort(), None);
+    }
+
     use std::fs;
     use std::path::PathBuf;
 

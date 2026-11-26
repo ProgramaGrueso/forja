@@ -1,4 +1,5 @@
 pub mod api;
+pub mod delegation;
 pub mod models;
 pub mod orchestrator;
 pub mod quota;
@@ -83,6 +84,7 @@ impl AppState {
             quota_path: default_quota.to_string_lossy().into_owned(),
             hide_mascot: false,
             agent_models: Default::default(),
+            agent_effort: Default::default(),
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
@@ -186,9 +188,72 @@ impl AppState {
         let _ = self.orchestrator.apply_settings(next);
     }
 
-    /// Agente listo para una tarea: modelo por tarea > ajustes > el que ya traía
-    /// el agente registrado (default en código).
+    /// Agente listo para una tarea: modelo y esfuerzo por tarea > ajustes > el que ya
+    /// traía el agente registrado (default en código / sin esfuerzo).
     pub(crate) fn agent_for_task(
+        &self,
+        kind: AgentKind,
+        task_model: Option<&str>,
+        task_effort: Option<&str>,
+    ) -> Result<Arc<dyn Agent>> {
+        let agent = self.agent_with_model(kind, task_model)?;
+        self.apply_effort(kind, agent, task_effort)
+    }
+
+    fn apply_effort(
+        &self,
+        kind: AgentKind,
+        agent: Arc<dyn Agent>,
+        task_effort: Option<&str>,
+    ) -> Result<Arc<dyn Agent>> {
+        let task_effort = match task_effort.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(e) => Some(forja_agent::validate_effort(kind, e)?),
+            None => None,
+        };
+        let from_settings = self
+            .settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .agent_effort
+            .get(&kind.to_string())
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty());
+        let explicit_task = task_effort.is_some();
+        match task_effort.or(from_settings) {
+            None => Ok(agent),
+            Some(effort) => match agent.with_effort(&effort) {
+                Some(a) => Ok(a),
+                None if explicit_task => Err(ForjaError::InvalidInput(format!(
+                    "el agente {kind} no admite esfuerzo de razonamiento"
+                ))),
+                None => Ok(agent),
+            },
+        }
+    }
+
+    /// Validación y alta de una tarea (misma ruta para `POST /tasks` y para las
+    /// delegaciones del orquestador): título/prompt, agente, modelo, esfuerzo y
+    /// política de privacidad (la comprueba el planificador).
+    pub async fn submit_task(&self, req: &CreateTaskRequest) -> Result<RunRecord> {
+        let titulo = req.titulo.trim();
+        let prompt = req.prompt.trim();
+        if titulo.is_empty() {
+            return Err(ForjaError::InvalidInput(
+                "el título no puede estar vacío".to_string(),
+            ));
+        }
+        if prompt.is_empty() {
+            return Err(ForjaError::InvalidInput(
+                "el prompt no puede estar vacío".to_string(),
+            ));
+        }
+        let agent =
+            self.agent_for_task(req.agent, req.modelo.as_deref(), req.esfuerzo.as_deref())?;
+        let task = Task::new(titulo, prompt, req.privacidad);
+        self.scheduler.submit(task, agent).await
+    }
+
+    fn agent_with_model(
         &self,
         kind: AgentKind,
         task_model: Option<&str>,
@@ -234,7 +299,7 @@ fn default_agent() -> AgentKind {
     AgentKind::Mock
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct CreateTaskRequest {
     pub titulo: String,
     pub prompt: String,
@@ -245,6 +310,9 @@ pub struct CreateTaskRequest {
     /// Override de modelo solo para esta tarea (prioridad sobre los ajustes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modelo: Option<String>,
+    /// Override de esfuerzo de razonamiento solo para esta tarea.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esfuerzo: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -411,23 +479,7 @@ async fn create_task(
     State(state): State<AppState>,
     Json(req): Json<CreateTaskRequest>,
 ) -> std::result::Result<(StatusCode, Json<RunRecord>), ApiError> {
-    let titulo = req.titulo.trim();
-    let prompt = req.prompt.trim();
-    if titulo.is_empty() {
-        return Err(ApiError(ForjaError::InvalidInput(
-            "el título no puede estar vacío".to_string(),
-        )));
-    }
-    if prompt.is_empty() {
-        return Err(ApiError(ForjaError::InvalidInput(
-            "el prompt no puede estar vacío".to_string(),
-        )));
-    }
-
-    let agent = state.agent_for_task(req.agent, req.modelo.as_deref())?;
-
-    let task = Task::new(titulo, prompt, req.privacidad);
-    let record = state.scheduler.submit(task, agent).await?;
+    let record = state.submit_task(&req).await?;
     Ok((StatusCode::CREATED, Json(record)))
 }
 
@@ -1044,6 +1096,12 @@ mod tests {
             "FORJA_HIDDEN_PROFILES",
             "set-models-rows",
             "nt-model",
+            "nt-effort",
+            "orq-model",
+            "orq-effort",
+            "agent_effort",
+            "/effort",
+            "esfuerzo",
             "nt-open-term",
             "drawer-term-btn",
             "/api/orchestrator/conversations",

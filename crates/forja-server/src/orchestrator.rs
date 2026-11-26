@@ -12,6 +12,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::delegation::{self, Delegator, Pending};
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -45,11 +46,29 @@ pub struct ChatReply {
     pub session_id: Option<String>,
 }
 
+/// Opciones por conversación que sobrescriben los ajustes solo para el orquestador.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatOpts {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<ChatReply, String>> + Send + 'a>>;
 
 /// Motor de conversación; se sustituye por un doble en las pruebas.
 pub trait ChatBackend: Send + Sync {
     fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_>;
+
+    /// Igual que [`Self::chat`] con modelo y esfuerzo de la conversación. Por defecto
+    /// los ignora (dobles de prueba).
+    fn chat_with(
+        &self,
+        prompt: String,
+        resume: Option<String>,
+        _opts: &ChatOpts,
+    ) -> ChatFuture<'_> {
+        self.chat(prompt, resume)
+    }
 
     /// Perfil activo (None si el backend no tiene perfiles).
     fn profile(&self) -> Option<String> {
@@ -72,6 +91,9 @@ pub trait ChatBackend: Send + Sync {
 
     /// Modelos por agente de los ajustes (no-op si el backend no usa modelos).
     fn set_models(&self, _models: &BTreeMap<String, String>) {}
+
+    /// Esfuerzos por agente de los ajustes (no-op si el backend no los usa).
+    fn set_efforts(&self, _efforts: &BTreeMap<String, String>) {}
 }
 
 /// Backend real: `hermes -p <perfil> chat --query-file <f> -Q --oneshot [--resume <id>]`.
@@ -79,6 +101,8 @@ pub struct HermesBackend {
     profile: RwLock<String>,
     rules: ProfileRules,
     program: String,
+    models: RwLock<BTreeMap<String, String>>,
+    efforts: RwLock<BTreeMap<String, String>>,
 }
 
 impl HermesBackend {
@@ -91,6 +115,8 @@ impl HermesBackend {
             profile: RwLock::new(resolve_profile(None, env_profile().as_deref())),
             rules,
             program: "hermes".to_string(),
+            models: RwLock::new(BTreeMap::new()),
+            efforts: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -117,6 +143,17 @@ fn env_profile() -> Option<String> {
 }
 
 pub fn build_argv(profile: &str, query_file: &Path, resume: Option<&str>) -> Vec<String> {
+    build_argv_with(profile, query_file, resume, None, None)
+}
+
+/// Como [`build_argv`] con `-m <modelo>` y `--reasoning <nivel>` opcionales.
+pub fn build_argv_with(
+    profile: &str,
+    query_file: &Path,
+    resume: Option<&str>,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "hermes".to_string(),
         "-p".to_string(),
@@ -130,6 +167,14 @@ pub fn build_argv(profile: &str, query_file: &Path, resume: Option<&str>) -> Vec
     if let Some(id) = resume {
         argv.push("--resume".to_string());
         argv.push(id.to_string());
+    }
+    if let Some(m) = model {
+        argv.push("-m".to_string());
+        argv.push(m.to_string());
+    }
+    if let Some(r) = reasoning {
+        argv.push("--reasoning".to_string());
+        argv.push(r.to_string());
     }
     argv
 }
@@ -158,8 +203,48 @@ impl ChatBackend for HermesBackend {
         "hermes".to_string()
     }
 
+    fn set_models(&self, models: &BTreeMap<String, String>) {
+        if let Ok(mut m) = self.models.write() {
+            *m = models.clone();
+        }
+    }
+
+    fn set_efforts(&self, efforts: &BTreeMap<String, String>) {
+        if let Ok(mut m) = self.efforts.write() {
+            *m = efforts.clone();
+        }
+    }
+
     fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
+        self.chat_with(prompt, resume, &ChatOpts::default())
+    }
+
+    fn chat_with(&self, prompt: String, resume: Option<String>, opts: &ChatOpts) -> ChatFuture<'_> {
+        let opts = opts.clone();
         Box::pin(async move {
+            let (model, effort) = {
+                let models = self.models.read().map(|m| m.clone()).unwrap_or_default();
+                let efforts = self.efforts.read().map(|m| m.clone()).unwrap_or_default();
+                (
+                    forja_agent::resolve_model(AgentKind::Hermes, opts.model.as_deref(), &models),
+                    forja_agent::resolve_effort(
+                        AgentKind::Hermes,
+                        opts.effort.as_deref(),
+                        &efforts,
+                    ),
+                )
+            };
+            let model = match model {
+                Some(m) => Some(forja_agent::validate_model(&m).map_err(|e| e.to_string())?),
+                None => None,
+            };
+            let effort = match effort {
+                Some(e) => Some(
+                    forja_agent::validate_effort(AgentKind::Hermes, &e)
+                        .map_err(|e| e.to_string())?,
+                ),
+                None => None,
+            };
             let wanted = self.profile().unwrap_or_default();
             let profile = self.rules.validate(&wanted).map_err(|e| e.to_string())?;
             let dir = std::env::temp_dir();
@@ -170,7 +255,13 @@ impl ChatBackend for HermesBackend {
             let file = dir.join(format!("forja-orq-{}-{nanos}.txt", std::process::id()));
             std::fs::write(&file, &prompt)
                 .map_err(|e| format!("no se pudo escribir la consulta: {e}"))?;
-            let mut argv = build_argv(&profile, &file, resume.as_deref());
+            let mut argv = build_argv_with(
+                &profile,
+                &file,
+                resume.as_deref(),
+                model.as_deref(),
+                effort.as_deref(),
+            );
             argv[0] = self.program.clone();
             let result = Runner::run_argv(&argv, &dir, TIMEOUT_SECS).await;
             let _ = std::fs::remove_file(&file);
@@ -197,6 +288,7 @@ impl ChatBackend for HermesBackend {
 pub struct CliBackend {
     kind: String,
     models: RwLock<BTreeMap<String, String>>,
+    efforts: RwLock<BTreeMap<String, String>>,
     /// Programa alternativo (tests con scripts falsos).
     program: Option<String>,
 }
@@ -206,6 +298,7 @@ impl CliBackend {
         Self {
             kind: kind.to_string(),
             models: RwLock::new(models),
+            efforts: RwLock::new(BTreeMap::new()),
             program: None,
         }
     }
@@ -217,15 +310,34 @@ impl CliBackend {
 
     /// Agente de `forja-agent` con el modelo efectivo (ajustes > default en código).
     pub fn make_agent(&self) -> Result<Arc<dyn Agent>, String> {
+        self.make_agent_with(&ChatOpts::default())
+    }
+
+    /// Modelo: conversación > ajustes > default. Esfuerzo: conversación > ajustes > ninguno.
+    pub fn make_agent_with(&self, opts: &ChatOpts) -> Result<Arc<dyn Agent>, String> {
         let kind: AgentKind = self
             .kind
             .parse()
             .map_err(|_| format!("agente de orquestador desconocido: {}", self.kind))?;
         let models = self.models.read().map(|m| m.clone()).unwrap_or_default();
-        let model = forja_agent::resolve_model(kind, None, &models)
+        let efforts = self.efforts.read().map(|m| m.clone()).unwrap_or_default();
+        let model_override = match opts.model.as_deref() {
+            Some(m) => Some(forja_agent::validate_model(m).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let effort = match forja_agent::resolve_effort(kind, opts.effort.as_deref(), &efforts) {
+            Some(e) => Some(forja_agent::validate_effort(kind, &e).map_err(|e| e.to_string())?),
+            None if opts.effort.is_some() => {
+                return Err(format!(
+                    "el agente {kind} no admite esfuerzo de razonamiento"
+                ))
+            }
+            None => None,
+        };
+        let model = forja_agent::resolve_model(kind, model_override.as_deref(), &models)
             .ok_or_else(|| format!("el agente {kind} no puede ser orquestador"))?;
         let program = self.program.clone();
-        Ok(match kind {
+        let agent: Arc<dyn Agent> = match kind {
             AgentKind::Claude => {
                 let a = ClaudeAgent::default().with_model(model);
                 Arc::new(match program {
@@ -259,7 +371,13 @@ impl CliBackend {
                     "el agente {kind} no puede ser orquestador one-shot"
                 ))
             }
-        })
+        };
+        match effort {
+            Some(e) => agent
+                .with_effort(&e)
+                .ok_or_else(|| format!("el agente {kind} no admite esfuerzo de razonamiento")),
+            None => Ok(agent),
+        }
     }
 }
 
@@ -278,9 +396,25 @@ impl ChatBackend for CliBackend {
         }
     }
 
-    fn chat(&self, prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+    fn set_efforts(&self, efforts: &BTreeMap<String, String>) {
+        if let Ok(mut m) = self.efforts.write() {
+            *m = efforts.clone();
+        }
+    }
+
+    fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
+        self.chat_with(prompt, resume, &ChatOpts::default())
+    }
+
+    fn chat_with(
+        &self,
+        prompt: String,
+        _resume: Option<String>,
+        opts: &ChatOpts,
+    ) -> ChatFuture<'_> {
+        let opts = opts.clone();
         Box::pin(async move {
-            let agent = self.make_agent()?;
+            let agent = self.make_agent_with(&opts)?;
             // Directorio propio: el agente trabaja ahí, no en el repo ni en /tmp suelto.
             let dir = std::env::temp_dir().join("forja-orquestador");
             std::fs::create_dir_all(&dir)
@@ -507,6 +641,10 @@ pub struct ConversationSummary {
     pub actualizado: u64,
     /// Hay una llamada a Hermes en curso.
     pub ocupada: bool,
+    /// Modelo elegido para esta conversación (None = el de los ajustes).
+    pub modelo: Option<String>,
+    /// Esfuerzo elegido para esta conversación (None = el de los ajustes).
+    pub esfuerzo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -524,6 +662,8 @@ pub enum ChatError {
     /// Cancelada con `/stop`.
     Cancelled,
     Backend(String),
+    /// Modelo o esfuerzo no válido para el agente del orquestador.
+    Invalid(String),
 }
 
 impl std::fmt::Display for ChatError {
@@ -532,7 +672,7 @@ impl std::fmt::Display for ChatError {
             ChatError::NotFound => write!(f, "conversación no encontrada"),
             ChatError::Busy => write!(f, "la conversación ya tiene una llamada en curso"),
             ChatError::Cancelled => write!(f, "llamada cancelada"),
-            ChatError::Backend(e) => write!(f, "{e}"),
+            ChatError::Backend(e) | ChatError::Invalid(e) => write!(f, "{e}"),
         }
     }
 }
@@ -555,6 +695,11 @@ struct Conversation {
     created: u64,
     updated: u64,
     in_flight: Option<InFlight>,
+    /// Modelo y esfuerzo propios de la conversación (sobrescriben los ajustes).
+    model: Option<String>,
+    effort: Option<String>,
+    /// Acciones delegadas del último turno, a reinyectar en el siguiente.
+    pending: Vec<Pending>,
 }
 
 impl Conversation {
@@ -567,6 +712,9 @@ impl Conversation {
             created: now,
             updated: now,
             in_flight: None,
+            model: None,
+            effort: None,
+            pending: Vec::new(),
         }
     }
 
@@ -592,6 +740,8 @@ impl Conversation {
             creado: self.created,
             actualizado: self.updated,
             ocupada: self.in_flight.is_some(),
+            modelo: self.model.clone(),
+            esfuerzo: self.effort.clone(),
         }
     }
 }
@@ -750,13 +900,23 @@ impl Orchestrator {
                 let fresh = f.build(&choice.agent, &s.agent_models);
                 *self.backend.write().unwrap_or_else(|e| e.into_inner()) = fresh;
                 self.reset_all_sessions();
+                // Modelo y esfuerzo por conversación pertenecen a la familia anterior.
+                self.clear_conversation_options();
             }
         }
         self.backend().set_models(&s.agent_models);
+        self.backend().set_efforts(&s.agent_effort);
         if self.backend().profile().is_some() {
             self.apply_profile(s.orchestrator_profile.as_deref())?;
         }
         Ok(())
+    }
+
+    fn clear_conversation_options(&self) {
+        for c in lock(&self.inner).map.values_mut() {
+            c.model = None;
+            c.effort = None;
+        }
     }
 
     /// Sesión de Hermes de la conversación principal.
@@ -874,6 +1034,7 @@ impl Orchestrator {
                     f.cancel.notify_one();
                 }
                 c.session_id = None;
+                c.pending.clear();
                 c.messages.clear();
                 c.updated = now_ms();
                 true
@@ -911,6 +1072,63 @@ impl Orchestrator {
         }
     }
 
+    /// Modelo y esfuerzo propios de la conversación (None = los de los ajustes).
+    pub fn options_of(&self, id: &str) -> Option<(Option<String>, Option<String>)> {
+        lock(&self.inner)
+            .map
+            .get(id)
+            .map(|c| (c.model.clone(), c.effort.clone()))
+    }
+
+    /// Cambia modelo y/o esfuerzo de la conversación sin reiniciarla. Para cada campo:
+    /// `None` = sin cambios, `Some("")` = vuelve a los ajustes, `Some(v)` = lo valida
+    /// contra la familia del agente orquestador y lo guarda.
+    pub fn update_options(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<(), ChatError> {
+        let kind: Option<AgentKind> = self.agent().parse().ok();
+        let model = match model.map(str::trim) {
+            None => None,
+            Some("") => Some(None),
+            Some(m) => {
+                if !kind.is_some_and(|k| forja_agent::MODEL_AGENTS.contains(&k)) {
+                    return Err(ChatError::Invalid(
+                        "este agente no admite elegir modelo".to_string(),
+                    ));
+                }
+                Some(Some(
+                    forja_agent::validate_model(m)
+                        .map_err(|e| ChatError::Invalid(e.to_string()))?,
+                ))
+            }
+        };
+        let effort = match effort.map(str::trim) {
+            None => None,
+            Some("") => Some(None),
+            Some(e) => {
+                let kind = kind.ok_or_else(|| {
+                    ChatError::Invalid("agente de orquestador desconocido".to_string())
+                })?;
+                Some(Some(
+                    forja_agent::validate_effort(kind, e)
+                        .map_err(|e| ChatError::Invalid(e.to_string()))?,
+                ))
+            }
+        };
+        let mut g = lock(&self.inner);
+        let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
+        if let Some(m) = model {
+            conv.model = m;
+        }
+        if let Some(e) = effort {
+            conv.effort = e;
+        }
+        Ok(())
+    }
+
     /// Habla en la conversación principal.
     pub async fn say(
         &self,
@@ -932,9 +1150,24 @@ impl Orchestrator {
         port: u16,
         token: Option<&str>,
     ) -> Result<String, ChatError> {
+        self.say_in_with(id, message, port, token, None).await
+    }
+
+    /// Como [`Self::say_in`]; con `delegator`, los orquestadores sin sesión (todos menos
+    /// Hermes) delegan con bloques `[[forja:...]]` que ejecuta el servidor (ver
+    /// [`crate::delegation`]). El camino de Hermes (curl) no cambia.
+    pub async fn say_in_with(
+        &self,
+        id: &str,
+        message: &str,
+        port: u16,
+        token: Option<&str>,
+        delegator: Option<&dyn Delegator>,
+    ) -> Result<String, ChatError> {
         let backend = self.backend();
         let stateless = backend.stateless();
-        let (resume, cancel, seq, history) = {
+        let delegating = stateless && delegator.is_some();
+        let (resume, cancel, seq, history, opts, pending) = {
             let mut g = lock(&self.inner);
             g.seq += 1;
             let seq = g.seq;
@@ -962,14 +1195,32 @@ impl Orchestrator {
             } else {
                 conv.session_id.clone()
             };
-            (resume, cancel, seq, history)
+            let pending = if delegating {
+                std::mem::take(&mut conv.pending)
+            } else {
+                Vec::new()
+            };
+            let opts = ChatOpts {
+                model: conv.model.clone(),
+                effort: conv.effort.clone(),
+            };
+            (resume, cancel, seq, history, opts, pending)
+        };
+        let pending_block = match delegator {
+            Some(d) if delegating => delegation::render_pending(&pending, d).await,
+            _ => String::new(),
         };
         let _guard = InFlightGuard {
             inner: self.inner.clone(),
             id: id.to_string(),
             seq,
         };
-        let prompt = if stateless {
+        let prompt = if delegating {
+            format!(
+                "{}{history}{pending_block}Mensaje del usuario:\n{message}",
+                delegation::system_prompt_actions()
+            )
+        } else if stateless {
             format!(
                 "{}{history}Mensaje del usuario:\n{message}",
                 system_prompt(port, token)
@@ -980,8 +1231,23 @@ impl Orchestrator {
             format!("{}{message}", system_prompt(port, token))
         };
         let outcome = tokio::select! {
-            r = backend.chat(prompt, resume) => Some(r),
+            r = backend.chat_with(prompt, resume, &opts) => Some(r),
             _ = cancel.notified() => None,
+        };
+        // Acciones del orquestador: las ejecuta el servidor ANTES de tomar el mutex.
+        let (outcome, new_pending) = match (outcome, delegator) {
+            (Some(Ok(mut reply)), Some(d)) if delegating => {
+                let (clean, actions) = delegation::parse_actions(&reply.text);
+                let had_actions = !actions.is_empty();
+                let new_pending = delegation::execute_actions(actions, d).await;
+                reply.text = if clean.is_empty() && had_actions {
+                    "Hecho, ya estoy con ello.".to_string()
+                } else {
+                    clean
+                };
+                (Some(Ok(reply)), new_pending)
+            }
+            (outcome, _) => (outcome, Vec::new()),
         };
         let mut g = lock(&self.inner);
         let Some(conv) = g.map.get_mut(id) else {
@@ -998,10 +1264,29 @@ impl Orchestrator {
                     conv.session_id = Some(sid);
                 }
                 conv.push("orquestador", &reply.text);
+                let delegated: Vec<String> = new_pending
+                    .iter()
+                    .filter_map(|p| match p {
+                        Pending::Task { id, titulo } => Some(format!("{titulo} ({id})")),
+                        _ => None,
+                    })
+                    .collect();
+                if !delegated.is_empty() {
+                    conv.push(
+                        "sistema",
+                        &format!("Tareas delegadas: {}", delegated.join(", ")),
+                    );
+                }
+                conv.pending = new_pending;
                 Ok(reply.text)
             }
-            Some(Err(e)) => Err(ChatError::Backend(e)),
+            Some(Err(e)) => {
+                // Lo pendiente no se pierde si la llamada falla.
+                conv.pending = pending;
+                Err(ChatError::Backend(e))
+            }
             None => {
+                conv.pending = pending;
                 conv.push("sistema", "Llamada cancelada con /stop.");
                 Err(ChatError::Cancelled)
             }
@@ -1017,8 +1302,10 @@ pub enum Command {
     Rename(String),
     Agents,
     Stop,
-    /// Reservado: lo implementa otro stream.
+    /// `/model [m|reset]`: modelo del orquestador en esta conversación.
     Model(String),
+    /// `/effort [nivel|reset]`: esfuerzo de razonamiento en esta conversación.
+    Effort(String),
     /// Reservado: lo implementa otro stream.
     Agent(String),
     Unknown(String),
@@ -1031,7 +1318,14 @@ pub const COMMAND_HELP: &[(&str, &str)] = &[
     ("/rename <título>", "cambia el título de la conversación"),
     ("/agents", "lista los agentes de Forja y su estado"),
     ("/stop", "cancela la llamada en curso de la conversación"),
-    ("/model", "disponible pronto"),
+    (
+        "/model <modelo>",
+        "cambia el modelo del orquestador en esta conversación (sin argumento: muestra el actual; reset: vuelve a Ajustes)",
+    ),
+    (
+        "/effort <nivel>",
+        "cambia el esfuerzo de razonamiento del orquestador en esta conversación (sin argumento: muestra el actual; reset: vuelve a Ajustes)",
+    ),
     ("/agent", "disponible pronto"),
 ];
 
@@ -1058,7 +1352,8 @@ pub fn parse_command(message: &str) -> Option<Command> {
         "/rename" | "/renombrar" => Command::Rename(arg),
         "/agents" | "/agentes" => Command::Agents,
         "/stop" | "/parar" => Command::Stop,
-        "/model" => Command::Model(arg),
+        "/model" | "/modelo" => Command::Model(arg),
+        "/effort" | "/esfuerzo" => Command::Effort(arg),
         "/agent" => Command::Agent(arg),
         _ => Command::Unknown(word),
     })
@@ -1069,6 +1364,12 @@ pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Modelo del orquestador para esta conversación (vacío = volver a Ajustes).
+    #[serde(default)]
+    pub modelo: Option<String>,
+    /// Esfuerzo del orquestador para esta conversación (vacío = volver a Ajustes).
+    #[serde(default)]
+    pub esfuerzo: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1119,9 +1420,29 @@ pub async fn chat(
     }
     match state
         .orchestrator
-        .say_in(&id, message, port, state.auth_token.as_deref())
+        .update_options(&id, req.modelo.as_deref(), req.esfuerzo.as_deref())
+    {
+        Ok(()) => {}
+        Err(ChatError::NotFound) => return not_found(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+        }
+    }
+    match state
+        .orchestrator
+        .say_in_with(
+            &id,
+            message,
+            port,
+            state.auth_token.as_deref(),
+            Some(&state),
+        )
         .await
     {
+        Err(ChatError::Invalid(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
         Ok(reply) => (
             StatusCode::OK,
             Json(json!(ChatResponse {
@@ -1209,14 +1530,56 @@ async fn run_command(state: &AppState, id: &str, cmd: Command) -> (StatusCode, J
             };
             ok(json!({ "reply": reply, "conversation_id": id, "stopped": stopped }))
         }
-        Command::Model(_) | Command::Agent(_) => {
-            ok(json!({ "reply": "Disponible pronto.", "conversation_id": id }))
-        }
+        Command::Model(arg) => option_command(state, id, "modelo", &arg),
+        Command::Effort(arg) => option_command(state, id, "esfuerzo", &arg),
+        Command::Agent(_) => ok(json!({ "reply": "Disponible pronto.", "conversation_id": id })),
         Command::Unknown(cmd) => (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!("comando desconocido: {cmd}. Usa /help para ver la lista.")
             })),
+        ),
+    }
+}
+
+/// `/model` y `/effort`: sin argumento muestra el valor; `reset` vuelve a los ajustes.
+fn option_command(state: &AppState, id: &str, which: &str, arg: &str) -> (StatusCode, Json<Value>) {
+    let orq = &state.orchestrator;
+    let ok = |reply: String| {
+        (
+            StatusCode::OK,
+            Json(json!({ "reply": reply, "conversation_id": id })),
+        )
+    };
+    let Some((model, effort)) = orq.options_of(id) else {
+        return not_found();
+    };
+    let current = if which == "modelo" { model } else { effort };
+    let agent = orq.agent();
+    if arg.is_empty() {
+        let shown = current.unwrap_or_else(|| "los de Ajustes".to_string());
+        return ok(format!("{which} del orquestador ({agent}): {shown}."));
+    }
+    let reset = matches!(
+        arg.to_lowercase().as_str(),
+        "reset" | "default" | "ajustes" | "auto"
+    );
+    let value = if reset { "" } else { arg };
+    let res = if which == "modelo" {
+        orq.update_options(id, Some(value), None)
+    } else {
+        orq.update_options(id, None, Some(value))
+    };
+    match res {
+        Ok(()) if reset => ok(format!("{which} restablecido a Ajustes.")),
+        Ok(()) => ok(format!(
+            "{which} del orquestador ({agent}) cambiado a {}.",
+            arg.trim()
+        )),
+        Err(ChatError::NotFound) => not_found(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
         ),
     }
 }
@@ -1628,7 +1991,15 @@ mod tests {
         assert_eq!(parse_command("/help"), Some(Command::Help));
         assert_eq!(
             parse_command("/modelo"),
-            Some(Command::Unknown("/modelo".into()))
+            Some(Command::Model(String::new()))
+        );
+        assert_eq!(
+            parse_command("/effort high"),
+            Some(Command::Effort("high".into()))
+        );
+        assert_eq!(
+            parse_command("/esfuerzo"),
+            Some(Command::Effort(String::new()))
         );
         assert_eq!(parse_command("hola /new"), None);
     }
@@ -1865,6 +2236,446 @@ mod tests {
         }
     }
 
+    mod delegation_flow {
+        use super::*;
+        use forja_sched::{Scheduler, SchedulerConfig};
+        use forja_store::JsonlStore;
+        use tempfile::TempDir;
+
+        /// Estado con scheduler real (sin repo) y un orquestador `claude` con el script falso.
+        fn setup() -> (AppState, Orchestrator, TempDir, TempDir, TempDir) {
+            let s = TempDir::new().unwrap();
+            let w = TempDir::new().unwrap();
+            let (home, rules) = fake_rules(&[]);
+            let store = JsonlStore::new(s.path()).unwrap();
+            let sched = Scheduler::new(store, SchedulerConfig::new(w.path())).unwrap();
+            let factory = BackendFactory::system(rules)
+                .with_probe(only(&["claude"]))
+                .with_program("claude", fake_script());
+            let orq = Orchestrator::from_factory(factory);
+            orq.apply_settings(&{
+                let mut st = base_settings();
+                st.orchestrator_agent = Some("claude".into());
+                st
+            })
+            .unwrap();
+            let state = AppState::new(sched).with_orchestrator(orq.clone());
+            (state, orq, s, w, home)
+        }
+
+        async fn say(state: &AppState, orq: &Orchestrator, msg: &str) -> String {
+            orq.say_in_with(PRINCIPAL, msg, 7777, None, Some(state))
+                .await
+                .expect("turno")
+        }
+
+        #[tokio::test]
+        async fn valid_block_enqueues_mock_task_hides_block_and_feeds_next_turn() {
+            let (state, orq, _s, _w, _h) = setup();
+            let r1 = say(
+                &state,
+                &orq,
+                "hazlo\nEMIT: [[forja:delegar {\"titulo\":\"Tarea uno\",\"prompt\":\"haz algo\",\"agent\":\"mock\",\"privacidad\":\"open\"}]]",
+            )
+            .await;
+            assert_eq!(r1, "Delegando.", "los bloques se ocultan al usuario");
+            let runs = state.scheduler.list_runs().await;
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].agent, AgentKind::Mock);
+            assert_eq!(runs[0].task.titulo, "Tarea uno");
+            let id = runs[0].id.clone();
+            state.scheduler.wait_run(&id).await.unwrap();
+            // El historial guarda el texto sin bloques.
+            let h = orq.get(PRINCIPAL).unwrap().historial;
+            assert!(h
+                .iter()
+                .all(|m| !m.texto.contains("[[forja:delegar") || m.rol == "usuario"));
+            assert!(h
+                .iter()
+                .any(|m| m.rol == "sistema" && m.texto.contains(&id)));
+
+            let r2 = say(&state, &orq, "¿cómo va?").await;
+            assert!(r2.contains("Tareas delegadas (acciones"), "{r2}");
+            assert!(r2.contains(&format!("ID {id}")), "{r2}");
+            assert!(
+                r2.contains("Tarea uno") && r2.contains("estado: done"),
+                "{r2}"
+            );
+            // Se consume: el turno siguiente ya no lo repite.
+            let r3 = say(&state, &orq, "gracias").await;
+            assert!(!r3.contains(&format!("ID {id}")), "{r3}");
+            assert!(
+                !r3.contains("curl -s") && !r3.contains("http://127.0.0.1"),
+                "sin curl en el prompt de acciones"
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_json_and_rejected_blocks_warn_next_turn_without_enqueueing() {
+            let (state, orq, _s, _w, _h) = setup();
+            let r1 = say(
+                &state,
+                &orq,
+                "x\nEMIT: [[forja:delegar {roto]]\nEMIT: [[forja:delegar {\"titulo\":\"S\",\"prompt\":\"p\",\"agent\":\"mock\",\"privacidad\":\"sensitive\"}]]\nEMIT: [[forja:delegar {\"titulo\":\"S\",\"prompt\":\"p\",\"agent\":\"mock\",\"esfuerzo\":\"high\"}]]\nEMIT: [[forja:borrar]]",
+            )
+            .await;
+            assert_eq!(r1, "Delegando.");
+            assert!(state.scheduler.list_runs().await.is_empty());
+            let r2 = say(&state, &orq, "¿y?").await;
+            assert!(r2.contains("Aviso: delegar: JSON inválido"), "{r2}");
+            assert!(
+                r2.contains("rechazada"),
+                "política de privacidad / esfuerzo: {r2}"
+            );
+            assert!(r2.contains("no admite esfuerzo"), "{r2}");
+            assert!(r2.contains("acción desconocida"), "{r2}");
+        }
+
+        #[tokio::test]
+        async fn limit_of_five_delegations_per_turn_is_enforced() {
+            let (state, orq, _s, _w, _h) = setup();
+            let line =
+                "EMIT: [[forja:delegar {\"titulo\":\"T\",\"prompt\":\"p\",\"agent\":\"mock\"}]]";
+            let msg = [line; 7].join("\n");
+            say(&state, &orq, &msg).await;
+            assert_eq!(
+                state.scheduler.list_runs().await.len(),
+                crate::delegation::MAX_DELEGATIONS_PER_TURN
+            );
+            let r2 = say(&state, &orq, "estado").await;
+            assert!(r2.contains("se ignoraron 2 acción"), "{r2}");
+        }
+
+        #[tokio::test]
+        async fn status_block_reports_a_run_and_unknown_ids() {
+            let (state, orq, _s, _w, _h) = setup();
+            let rec = state
+                .submit_task(&crate::CreateTaskRequest {
+                    titulo: "Previa".into(),
+                    prompt: "p".into(),
+                    privacidad: Privacy::Open,
+                    agent: AgentKind::Mock,
+                    modelo: None,
+                    esfuerzo: None,
+                })
+                .await
+                .unwrap();
+            state.scheduler.wait_run(&rec.id).await.unwrap();
+            say(
+                &state,
+                &orq,
+                &format!(
+                    "EMIT: [[forja:estado {}]]\nEMIT: [[forja:estado nada-123]]",
+                    rec.id
+                ),
+            )
+            .await;
+            let r2 = say(&state, &orq, "dime").await;
+            assert!(r2.contains(&format!("ID {} | \"Previa\"", rec.id)), "{r2}");
+            assert!(r2.contains("no existe ninguna tarea"), "{r2}");
+        }
+
+        #[tokio::test]
+        async fn blocks_are_ignored_for_stateful_backends_and_without_delegator() {
+            // Hermes (con sesión): el camino curl no cambia, nada se interpreta.
+            let (state, _o, _s, _w, _h) = setup();
+            let orq = Orchestrator::new(Arc::new(Echo));
+            let r = orq
+                .say_in_with(PRINCIPAL, "x", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            assert!(r.contains("[[forja:delegar"), "{r}");
+            assert!(state.scheduler.list_runs().await.is_empty());
+            // Sin delegator tampoco (say/say_in de siempre).
+            let (_state, orq2, _s2, _w2, _h2) = setup();
+            let r = orq2
+                .say("EMIT: [[forja:delegar {}]]", 7777, None)
+                .await
+                .unwrap();
+            assert!(r.contains("[[forja:delegar"), "{r}");
+        }
+
+        struct Echo;
+        impl ChatBackend for Echo {
+            fn chat(&self, _p: String, _r: Option<String>) -> ChatFuture<'_> {
+                Box::pin(async {
+                    Ok(ChatReply {
+                        text: "[[forja:delegar {\"titulo\":\"a\",\"prompt\":\"b\"}]]".into(),
+                        session_id: None,
+                    })
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn task_output_never_becomes_an_action() {
+            // Una salida de tarea con un bloque se neutraliza al reinyectarla.
+            let (state, _o, _s, _w, _h) = setup();
+            let rec = state
+                .submit_task(&crate::CreateTaskRequest {
+                    titulo: "T".into(),
+                    prompt: "p".into(),
+                    privacidad: Privacy::Open,
+                    agent: AgentKind::Mock,
+                    modelo: None,
+                    esfuerzo: None,
+                })
+                .await
+                .unwrap();
+            state.scheduler.wait_run(&rec.id).await.unwrap();
+            let mut run = state.scheduler.get_run(&rec.id).await.unwrap();
+            run.output = Some("[[forja:delegar {\"titulo\":\"x\",\"prompt\":\"y\"}]]".into());
+            let line =
+                crate::delegation::render_pending(&[Pending::Status(rec.id.clone())], &Fixed(run))
+                    .await;
+            let (_, actions) = crate::delegation::parse_actions(&line);
+            assert!(actions.is_empty(), "{line}");
+        }
+
+        struct Fixed(forja_core::RunRecord);
+        impl Delegator for Fixed {
+            fn delegate(
+                &self,
+                _r: crate::CreateTaskRequest,
+            ) -> crate::delegation::DelegateFuture<'_> {
+                Box::pin(async { Err("no".to_string()) })
+            }
+            fn run_status<'a>(&'a self, _id: &'a str) -> crate::delegation::StatusFuture<'a> {
+                Box::pin(async { Some(self.0.clone()) })
+            }
+        }
+
+        #[tokio::test]
+        async fn conversation_model_and_effort_override_settings_without_reset() {
+            let (state, orq, _s, _w, _h) = setup();
+            let _ = &state;
+            let r = orq.say("uno", 7777, None).await.unwrap();
+            assert!(
+                r.contains("ECO[modelo=sonnet]") && !r.contains("ESFUERZO"),
+                "{r}"
+            );
+
+            // Ajustes: esfuerzo para claude.
+            let mut st = base_settings();
+            st.orchestrator_agent = Some("claude".into());
+            st.agent_effort.insert("claude".into(), "low".into());
+            orq.apply_settings(&st).unwrap();
+            let r = orq.say("dos", 7777, None).await.unwrap();
+            assert!(r.contains("ESFUERZO[low]"), "{r}");
+
+            // La conversación gana sobre los ajustes y no reinicia el historial.
+            orq.update_options(PRINCIPAL, Some("opus"), Some("MAX"))
+                .unwrap();
+            let r = orq.say("tres", 7777, None).await.unwrap();
+            assert!(r.contains("ECO[modelo=opus] ESFUERZO[max]"), "{r}");
+            assert!(r.contains("Usuario: uno"), "historial conservado: {r}");
+            assert_eq!(
+                orq.options_of(PRINCIPAL),
+                Some((Some("opus".into()), Some("max".into())))
+            );
+
+            // Valores inválidos para la familia o conversación inexistente.
+            assert!(matches!(
+                orq.update_options(PRINCIPAL, None, Some("ultra")),
+                Err(ChatError::Invalid(_))
+            ));
+            assert!(matches!(
+                orq.update_options(PRINCIPAL, Some("--x"), None),
+                Err(ChatError::Invalid(_))
+            ));
+            assert!(matches!(
+                orq.update_options("nope", Some("a"), None),
+                Err(ChatError::NotFound)
+            ));
+            // "" vuelve a los ajustes.
+            orq.update_options(PRINCIPAL, Some(""), Some("")).unwrap();
+            let r = orq.say("cuatro", 7777, None).await.unwrap();
+            assert!(r.contains("ECO[modelo=sonnet] ESFUERZO[low]"), "{r}");
+        }
+
+        #[tokio::test]
+        async fn opencode_effort_becomes_model_variant_and_local_rejects_it() {
+            let oc = CliBackend::new("opencode", BTreeMap::new()).with_program(fake_script());
+            let opts = ChatOpts {
+                model: Some("p/m#low".into()),
+                effort: Some("High".into()),
+            };
+            let r = oc.chat_with("hola".into(), None, &opts).await.unwrap();
+            assert!(r.text.contains("ECO[modelo=p/m#high]"), "{}", r.text);
+            let r = oc
+                .chat_with(
+                    "hola".into(),
+                    None,
+                    &ChatOpts {
+                        model: Some("p/m#low".into()),
+                        effort: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(r.text.contains("ECO[modelo=p/m#low]"), "{}", r.text);
+            let local = CliBackend::new("local", BTreeMap::new()).with_program(fake_script());
+            let err = local
+                .chat_with(
+                    "hola".into(),
+                    None,
+                    &ChatOpts {
+                        model: None,
+                        effort: Some("high".into()),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("no admite esfuerzo"), "{err}");
+            // agy usa --effort.
+            let agy = CliBackend::new("agy", BTreeMap::new()).with_program(fake_script());
+            let r = agy
+                .chat_with(
+                    "hola".into(),
+                    None,
+                    &ChatOpts {
+                        model: None,
+                        effort: Some("xhigh".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(r.text.contains("ESFUERZO[xhigh]"), "{}", r.text);
+        }
+
+        #[tokio::test]
+        async fn hermes_orchestrator_passes_model_and_reasoning() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().unwrap();
+            let script = dir.path().join("fake_hermes_args.sh");
+            std::fs::write(&script, "#!/usr/bin/env bash\necho \"ARGS: $*\"\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (_home, rules) = fake_rules(&[]);
+            let b = HermesBackend::new(rules).with_program(script.to_string_lossy());
+            let r = b.chat("hola".into(), None).await.unwrap();
+            assert!(
+                !r.text.contains(" -m ") && !r.text.contains("--reasoning"),
+                "{}",
+                r.text
+            );
+            // Ajustes: modelo y esfuerzo de hermes.
+            b.set_models(&[("hermes".to_string(), "gpt-x".to_string())].into());
+            b.set_efforts(&[("hermes".to_string(), "high".to_string())].into());
+            let r = b.chat("hola".into(), None).await.unwrap();
+            assert!(r.text.contains("-m gpt-x --reasoning high"), "{}", r.text);
+            // La conversación gana.
+            let opts = ChatOpts {
+                model: Some("otro".into()),
+                effort: Some("ULTRA".into()),
+            };
+            let r = b
+                .chat_with("hola".into(), Some("sess".into()), &opts)
+                .await
+                .unwrap();
+            assert!(
+                r.text.contains("--resume sess -m otro --reasoning ultra"),
+                "{}",
+                r.text
+            );
+            let bad = ChatOpts {
+                model: None,
+                effort: Some("extremo".into()),
+            };
+            assert!(b.chat_with("hola".into(), None, &bad).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn chat_body_modelo_and_esfuerzo_are_stored_per_conversation() {
+            use axum::body::{to_bytes, Body};
+            use axum::http::{header, Method, Request};
+            use tower::ServiceExt;
+            let (state, orq, _s, _w, _h) = setup();
+            let app = crate::build_router(state);
+            let chat = |body: Value| {
+                let app = app.clone();
+                async move {
+                    let req = Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/orchestrator/chat")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap();
+                    let resp = app.oneshot(req).await.unwrap();
+                    let st = resp.status();
+                    let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                    (
+                        st,
+                        serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+                    )
+                }
+            };
+            let (st, v) =
+                chat(json!({"message": "hola", "modelo": "haiku", "esfuerzo": "medium"})).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let reply = v["reply"].as_str().unwrap();
+            assert!(
+                reply.contains("ECO[modelo=haiku] ESFUERZO[medium]"),
+                "{reply}"
+            );
+            let d = orq.get(PRINCIPAL).unwrap().resumen;
+            assert_eq!(d.modelo.as_deref(), Some("haiku"));
+            assert_eq!(d.esfuerzo.as_deref(), Some("medium"));
+            // Sin campos en el cuerpo se conservan; inválido -> 400 sin llamar al agente.
+            let (_, v) = chat(json!({"message": "otra"})).await;
+            assert!(v["reply"].as_str().unwrap().contains("ESFUERZO[medium]"));
+            let (st, _) = chat(json!({"message": "x", "esfuerzo": "ultra"})).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+            let (st, _) =
+                chat(json!({"message": "x", "conversation_id": "nope", "modelo": "a"})).await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn slash_model_and_effort_commands_over_http() {
+            use axum::body::{to_bytes, Body};
+            use axum::http::{header, Method, Request};
+            use tower::ServiceExt;
+            let (state, orq, _s, _w, _h) = setup();
+            let app = crate::build_router(state);
+            let call = |msg: &'static str| {
+                let app = app.clone();
+                async move {
+                    let req = Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/orchestrator/chat")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "message": msg }).to_string()))
+                        .unwrap();
+                    let resp = app.oneshot(req).await.unwrap();
+                    let st = resp.status();
+                    let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                    (
+                        st,
+                        serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+                    )
+                }
+            };
+            let (st, v) = call("/model opus").await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(v["reply"].as_str().unwrap().contains("cambiado a opus"));
+            let (st, v) = call("/effort high").await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(
+                orq.options_of(PRINCIPAL),
+                Some((Some("opus".into()), Some("high".into())))
+            );
+            let (_, v) = call("/effort").await;
+            assert!(v["reply"].as_str().unwrap().contains("high"));
+            let (st, _) = call("/effort ultra").await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+            let (st, _) = call("/model reset").await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(orq.options_of(PRINCIPAL).unwrap().0, None);
+            // Los comandos no tocan el historial.
+            assert_eq!(orq.get(PRINCIPAL).unwrap().historial.len(), 0);
+        }
+    }
+
     mod http {
         use super::*;
         use axum::body::{to_bytes, Body};
@@ -2017,6 +2828,7 @@ mod tests {
             let (_, v) = chat("/help", None).await;
             let r = v["reply"].as_str().unwrap();
             assert!(r.contains("/rename") && r.contains("/stop") && r.contains("/agents"));
+            assert!(r.contains("/model") && r.contains("/effort"), "{r}");
 
             let (st, _) = chat("/rename", None).await;
             assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -2035,11 +2847,18 @@ mod tests {
             assert_eq!(v["stopped"], false);
             assert!(v["reply"].as_str().unwrap().contains("nada en curso"));
 
-            for cmd in ["/model x", "/agent claude"] {
+            let (st, v) = chat("/agent claude", None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(v["reply"].as_str().unwrap().contains("pronto"));
+            // /model y /effort sin argumento solo muestran el valor.
+            for cmd in ["/model", "/effort"] {
                 let (st, v) = chat(cmd, None).await;
                 assert_eq!(st, StatusCode::OK);
-                assert!(v["reply"].as_str().unwrap().contains("pronto"));
+                assert!(v["reply"].as_str().unwrap().contains("Ajustes"), "{v}");
             }
+            // El doble de pruebas no es una familia conocida: no admite elegir.
+            let (st, _) = chat("/model x", None).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
             let (st, _) = chat("/loquesea", None).await;
             assert_eq!(st, StatusCode::BAD_REQUEST);
             // los comandos no entran en el historial ni llaman al backend

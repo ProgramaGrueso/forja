@@ -52,6 +52,11 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
 
+        /// Esfuerzo de razonamiento solo para esta ejecución (claude/agy: low..max;
+        /// hermes: none..ultra; opencode: variante libre). Prioridad sobre Ajustes.
+        #[arg(long)]
+        effort: Option<String>,
+
         prompt: String,
     },
 
@@ -114,15 +119,18 @@ impl CliAgent {
     }
 
     /// Modelo: `--model` > ajustes persistidos > default en código.
+    /// Esfuerzo: `--effort` > ajustes persistidos > ninguno (no se pasa flag).
     fn build_agent(
         self,
         model: Option<&str>,
         agent_models: &BTreeMap<String, String>,
+        effort: Option<&str>,
+        agent_effort: &BTreeMap<String, String>,
     ) -> Result<Arc<dyn Agent>> {
         let kind = self.kind();
         let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
             Some(m) => {
-                if forja_agent::default_model(kind).is_none() {
+                if !forja_agent::MODEL_AGENTS.contains(&kind) {
                     return Err(ForjaError::InvalidInput(format!(
                         "el agente {kind} no admite --model"
                     )));
@@ -131,11 +139,21 @@ impl CliAgent {
             }
             None => None,
         };
-        Ok(forja_agent::build_agent(
-            kind,
-            model.as_deref(),
-            agent_models,
-        ))
+        let effort = match effort.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(e) => Some(forja_agent::validate_effort(kind, e)?),
+            None => None,
+        };
+        let built = forja_agent::build_agent(kind, model.as_deref(), agent_models);
+        match forja_agent::resolve_effort(kind, effort.as_deref(), agent_effort) {
+            // Un valor inválido guardado en ajustes también se rechaza (no se pasa a un CLI).
+            Some(e) => {
+                let e = forja_agent::validate_effort(kind, &e)?;
+                built.with_effort(&e).ok_or_else(|| {
+                    ForjaError::InvalidInput(format!("el agente {kind} no admite --effort"))
+                })
+            }
+            None => Ok(built),
+        }
     }
 }
 
@@ -178,10 +196,16 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             privacy,
             title,
             model,
+            effort,
             prompt,
         } => {
-            let agent_models = load_agent_models(&cli.store_dir);
-            let built = agent.build_agent(model.as_deref(), &agent_models)?;
+            let (agent_models, agent_effort) = load_agent_settings(&cli.store_dir);
+            let built = agent.build_agent(
+                model.as_deref(),
+                &agent_models,
+                effort.as_deref(),
+                &agent_effort,
+            )?;
             let scheduler =
                 build_scheduler(&cli.store_dir, &cli.worktrees_dir, cli.repo, base_branch)?;
             let titulo = title.unwrap_or_else(|| derive_title(&prompt));
@@ -267,6 +291,10 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 });
 
             let hide_mascot = persisted.as_ref().is_some_and(|s| s.hide_mascot);
+            let agent_effort = persisted
+                .as_ref()
+                .map(|s| s.agent_effort.clone())
+                .unwrap_or_default();
             let agent_models = persisted
                 .as_ref()
                 .map(|s| s.agent_models.clone())
@@ -297,6 +325,7 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 quota_path,
                 hide_mascot,
                 agent_models,
+                agent_effort,
                 orchestrator_profile,
                 orchestrator_agent,
                 hidden_profiles,
@@ -327,12 +356,14 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
     }
 }
 
-/// Modelos por agente de `settings.json` (vacío si no existe o es inválido).
-fn load_agent_models(store_dir: &std::path::Path) -> BTreeMap<String, String> {
+/// Modelos y esfuerzos por agente de `settings.json` (vacíos si no existe o es inválido).
+fn load_agent_settings(
+    store_dir: &std::path::Path,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     forja_server::settings::load_settings(&store_dir.join("settings.json"))
         .ok()
         .flatten()
-        .map(|s| s.agent_models)
+        .map(|s| (s.agent_models, s.agent_effort))
         .unwrap_or_default()
 }
 
@@ -414,10 +445,11 @@ mod tests {
 
         let settings: BTreeMap<String, String> =
             [("claude".to_string(), "haiku".to_string())].into();
+        let none: BTreeMap<String, String> = BTreeMap::new();
         // --model > ajustes > default
         assert_eq!(
             agent
-                .build_agent(Some("opus"), &settings)
+                .build_agent(Some("opus"), &settings, None, &none)
                 .unwrap()
                 .model()
                 .as_deref(),
@@ -425,7 +457,7 @@ mod tests {
         );
         assert_eq!(
             agent
-                .build_agent(None, &settings)
+                .build_agent(None, &settings, None, &none)
                 .unwrap()
                 .model()
                 .as_deref(),
@@ -433,16 +465,66 @@ mod tests {
         );
         assert_eq!(
             CliAgent::Local
-                .build_agent(None, &settings)
+                .build_agent(None, &settings, None, &none)
                 .unwrap()
                 .model()
                 .as_deref(),
             Some("moe")
         );
-        // Mock/hermes no admiten --model; modelos inválidos se rechazan.
-        assert!(CliAgent::Mock.build_agent(Some("x"), &settings).is_err());
-        assert!(CliAgent::Hermes.build_agent(Some("x"), &settings).is_err());
-        assert!(agent.build_agent(Some("--bad"), &settings).is_err());
+        // Mock no admite --model; hermes sí (opcional); modelos inválidos se rechazan.
+        assert!(CliAgent::Mock
+            .build_agent(Some("x"), &settings, None, &none)
+            .is_err());
+        assert!(CliAgent::Hermes
+            .build_agent(Some("x"), &settings, None, &none)
+            .is_ok());
+        assert!(agent
+            .build_agent(Some("--bad"), &settings, None, &none)
+            .is_err());
+    }
+
+    #[test]
+    fn run_effort_flag_resolves_with_priority_and_validates_per_family() {
+        use std::collections::BTreeMap;
+        let cli = Cli::try_parse_from([
+            "forja",
+            "run",
+            "--agent",
+            "claude",
+            "--privacy",
+            "open",
+            "--effort",
+            "max",
+            "hola",
+        ])
+        .expect("parsear --effort");
+        let Command::Run { effort, .. } = cli.command else {
+            panic!("esperaba run");
+        };
+        assert_eq!(effort.as_deref(), Some("max"));
+
+        let none: BTreeMap<String, String> = BTreeMap::new();
+        let eff: BTreeMap<String, String> = [
+            ("claude".to_string(), "low".to_string()),
+            ("hermes".to_string(), "ultra".to_string()),
+        ]
+        .into();
+        let e =
+            |a: CliAgent, o: Option<&str>| a.build_agent(None, &none, o, &eff).map(|b| b.effort());
+        // --effort > ajustes > ninguno
+        assert_eq!(
+            e(CliAgent::Claude, Some("max")).unwrap().as_deref(),
+            Some("max")
+        );
+        assert_eq!(e(CliAgent::Claude, None).unwrap().as_deref(), Some("low"));
+        assert_eq!(e(CliAgent::Hermes, None).unwrap().as_deref(), Some("ultra"));
+        assert_eq!(e(CliAgent::Agy, None).unwrap(), None);
+        // Cada familia con su conjunto; local/mock lo rechazan con mensaje claro.
+        assert!(e(CliAgent::Claude, Some("ultra")).is_err());
+        assert!(e(CliAgent::Hermes, Some("ultra")).is_ok());
+        let err = e(CliAgent::Local, Some("high")).err().unwrap().to_string();
+        assert!(err.contains("local no admite esfuerzo"), "{err}");
+        assert!(e(CliAgent::Mock, Some("high")).is_err());
     }
 
     #[test]

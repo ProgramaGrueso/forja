@@ -134,6 +134,9 @@ pub struct RunRecord {
     /// Modelo efectivo con el que se ejecutó (None si el agente no tiene modelo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Esfuerzo de razonamiento efectivo (None si no se configuró o el agente no lo admite).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

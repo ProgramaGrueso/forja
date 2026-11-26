@@ -98,6 +98,7 @@ mod tests {
             worktree: Some(format!("/tmp/wt/{id}")),
             attempts: 1,
             model: None,
+            effort: None,
             output: None,
             error: None,
             created_at_ms: 1000,

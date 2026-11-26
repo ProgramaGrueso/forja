@@ -9,13 +9,107 @@ use crate::{Agent, AgyAgent, ClaudeAgent, HermesAgent, LocalAgent, MockAgent, Op
 
 pub const MAX_MODEL_LEN: usize = 100;
 
-/// Agentes cuyo modelo es configurable (mock y hermes no lo tienen).
-pub const MODEL_AGENTS: [AgentKind; 4] = [
+/// Agentes cuyo modelo es configurable (mock no lo tiene). En hermes el modelo es
+/// opcional: sin él se usa el del perfil.
+pub const MODEL_AGENTS: [AgentKind; 5] = [
     AgentKind::Claude,
     AgentKind::Agy,
     AgentKind::Opencode,
+    AgentKind::Hermes,
     AgentKind::Local,
 ];
+
+/// Agentes con esfuerzo de razonamiento configurable (local y mock no lo tienen).
+pub const EFFORT_AGENTS: [AgentKind; 4] = [
+    AgentKind::Claude,
+    AgentKind::Agy,
+    AgentKind::Opencode,
+    AgentKind::Hermes,
+];
+
+const LEVELS_CLAUDE_AGY: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const LEVELS_HERMES: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+/// opencode no tiene flag aparte: la variante del proveedor es texto libre; esta
+/// lista es solo la sugerencia habitual para la interfaz.
+const LEVELS_OPENCODE_HINT: [&str; 4] = ["low", "medium", "high", "max"];
+pub const MAX_OPENCODE_VARIANT_LEN: usize = 20;
+
+/// Niveles de esfuerzo de la familia (lista vacía = no soporta esfuerzo). Para
+/// opencode son solo sugerencias: acepta cualquier `[a-z0-9_-]{1,20}`.
+pub fn effort_levels(kind: AgentKind) -> &'static [&'static str] {
+    match kind {
+        AgentKind::Claude | AgentKind::Agy => &LEVELS_CLAUDE_AGY,
+        AgentKind::Hermes => &LEVELS_HERMES,
+        AgentKind::Opencode => &LEVELS_OPENCODE_HINT,
+        AgentKind::Local | AgentKind::Mock => &[],
+    }
+}
+
+/// Valida y normaliza (trim + minúsculas) un esfuerzo para la familia `kind`, con
+/// su propio conjunto de valores.
+pub fn validate_effort(kind: AgentKind, raw: &str) -> Result<String> {
+    if !EFFORT_AGENTS.contains(&kind) {
+        return Err(ForjaError::InvalidInput(format!(
+            "el agente {kind} no admite esfuerzo de razonamiento"
+        )));
+    }
+    let effort = raw.trim().to_lowercase();
+    if effort.is_empty() {
+        return Err(ForjaError::InvalidInput(
+            "el esfuerzo no puede estar vacío".to_string(),
+        ));
+    }
+    if kind == AgentKind::Opencode {
+        let ok = effort.chars().count() <= MAX_OPENCODE_VARIANT_LEN
+            && effort
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !ok {
+            return Err(ForjaError::InvalidInput(format!(
+                "esfuerzo \"{effort}\" no válido para opencode (usa [a-z0-9_-], máx. {MAX_OPENCODE_VARIANT_LEN})"
+            )));
+        }
+    } else if !effort_levels(kind).contains(&effort.as_str()) {
+        return Err(ForjaError::InvalidInput(format!(
+            "esfuerzo \"{effort}\" no válido para {kind} (usa {})",
+            effort_levels(kind).join(", ")
+        )));
+    }
+    Ok(effort)
+}
+
+/// Prioridad: tarea > ajustes > ninguno (si no se configura no se pasa ningún flag).
+/// No valida: eso lo hace [`validate_effort`] en cada punto de entrada.
+pub fn resolve_effort(
+    kind: AgentKind,
+    task_override: Option<&str>,
+    settings: &BTreeMap<String, String>,
+) -> Option<String> {
+    if !EFFORT_AGENTS.contains(&kind) {
+        return None;
+    }
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_lowercase());
+    task_override.and_then(nonblank).or_else(|| {
+        settings
+            .get(&kind.to_string())
+            .map(String::as_str)
+            .and_then(nonblank)
+    })
+}
+
+/// Modelo de opencode con la variante de razonamiento: `provider/model#variante`.
+/// Un esfuerzo explícito reemplaza la variante que ya traiga el modelo.
+pub fn opencode_model_with_effort(model: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(e) if !e.is_empty() => {
+            let base = model.split('#').next().unwrap_or(model);
+            format!("{base}#{e}")
+        }
+        _ => model.to_string(),
+    }
+}
 
 /// Modelo por defecto fijado en código (None si el agente no admite modelo).
 pub fn default_model(kind: AgentKind) -> Option<&'static str> {
@@ -62,7 +156,9 @@ pub fn resolve_model(
     task_override: Option<&str>,
     settings: &BTreeMap<String, String>,
 ) -> Option<String> {
-    default_model(kind)?;
+    if !MODEL_AGENTS.contains(&kind) {
+        return None;
+    }
     let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
     task_override
         .and_then(nonblank)
@@ -87,7 +183,10 @@ pub fn build_agent(
         (AgentKind::Agy, Some(m)) => Arc::new(AgyAgent::new(m, crate::agy::DEFAULT_MODE)),
         (AgentKind::Opencode, Some(m)) => Arc::new(OpencodeAgent::new(m)),
         (AgentKind::Local, Some(m)) => Arc::new(LocalAgent::new(m)),
-        (AgentKind::Hermes, _) => Arc::new(HermesAgent::default()),
+        (AgentKind::Hermes, m) => Arc::new(HermesAgent {
+            model: m,
+            ..HermesAgent::default()
+        }),
         _ => Arc::new(MockAgent::default()),
     }
 }
@@ -155,6 +254,74 @@ mod tests {
         );
         assert_eq!(model(AgentKind::Mock, None), None);
         assert_eq!(model(AgentKind::Hermes, None), None);
+        let h = map(&[("hermes", "gpt-x")]);
+        assert_eq!(
+            build_agent(AgentKind::Hermes, None, &h).model().as_deref(),
+            Some("gpt-x")
+        );
+    }
+
+    #[test]
+    fn effort_validation_per_family() {
+        for ok in ["low", " HIGH ", "max", "xhigh", "medium"] {
+            assert!(validate_effort(AgentKind::Claude, ok).is_ok(), "{ok}");
+            assert!(validate_effort(AgentKind::Agy, ok).is_ok(), "{ok}");
+        }
+        assert_eq!(
+            validate_effort(AgentKind::Claude, " HIGH ").unwrap(),
+            "high"
+        );
+        assert!(validate_effort(AgentKind::Claude, "ultra").is_err());
+        assert!(validate_effort(AgentKind::Agy, "none").is_err());
+        for ok in ["none", "minimal", "ultra", "max"] {
+            assert!(validate_effort(AgentKind::Hermes, ok).is_ok(), "{ok}");
+        }
+        assert!(validate_effort(AgentKind::Hermes, "extreme").is_err());
+        assert!(validate_effort(AgentKind::Opencode, "high").is_ok());
+        assert!(validate_effort(AgentKind::Opencode, "my_variant-2").is_ok());
+        assert!(validate_effort(AgentKind::Opencode, "a#b").is_err());
+        assert!(validate_effort(AgentKind::Opencode, "--x y").is_err());
+        assert!(validate_effort(AgentKind::Opencode, &"a".repeat(21)).is_err());
+        assert!(validate_effort(AgentKind::Opencode, &"a".repeat(20)).is_ok());
+        assert!(validate_effort(AgentKind::Claude, "").is_err());
+        let e = validate_effort(AgentKind::Local, "high")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("local no admite esfuerzo"), "{e}");
+        assert!(validate_effort(AgentKind::Mock, "high").is_err());
+        assert!(effort_levels(AgentKind::Local).is_empty());
+        assert!(effort_levels(AgentKind::Mock).is_empty());
+        assert_eq!(effort_levels(AgentKind::Hermes).len(), 8);
+    }
+
+    #[test]
+    fn effort_priority_task_over_settings_over_none() {
+        let s = map(&[("claude", "low"), ("local", "high")]);
+        assert_eq!(
+            resolve_effort(AgentKind::Claude, Some("MAX"), &s).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            resolve_effort(AgentKind::Claude, None, &s).as_deref(),
+            Some("low")
+        );
+        assert_eq!(resolve_effort(AgentKind::Agy, None, &s), None);
+        assert_eq!(
+            resolve_effort(AgentKind::Claude, Some(" "), &map(&[])),
+            None
+        );
+        assert_eq!(resolve_effort(AgentKind::Local, Some("high"), &s), None);
+    }
+
+    #[test]
+    fn opencode_variant_is_appended_and_replaced() {
+        assert_eq!(opencode_model_with_effort("p/m", None), "p/m");
+        assert_eq!(opencode_model_with_effort("p/m", Some("high")), "p/m#high");
+        assert_eq!(
+            opencode_model_with_effort("p/m#low", Some("high")),
+            "p/m#high"
+        );
+        assert_eq!(opencode_model_with_effort("p/m#low", None), "p/m#low");
     }
 
     #[test]
@@ -164,6 +331,7 @@ mod tests {
         assert_eq!(swapped.kind(), AgentKind::Claude);
         assert_eq!(swapped.model().as_deref(), Some("haiku"));
         assert!(MockAgent::default().with_model("x").is_none());
-        assert!(HermesAgent::default().with_model("x").is_none());
+        let hermes = Agent::with_model(&HermesAgent::default(), "x").expect("hermes admite -m");
+        assert_eq!(hermes.model().as_deref(), Some("x"));
     }
 }

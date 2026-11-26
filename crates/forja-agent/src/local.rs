@@ -198,6 +198,12 @@ impl Agent for LocalAgent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_does_not_support_effort() {
+        assert!(Agent::with_effort(&LocalAgent::default(), "high").is_none());
+        assert_eq!(LocalAgent::default().effort(), None);
+    }
+
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
 

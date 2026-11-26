@@ -102,6 +102,7 @@ mod tests {
             worktree: Some("/tmp/wt".to_string()),
             attempts: 1,
             model: None,
+            effort: None,
             output: Some("ok".to_string()),
             error: None,
             created_at_ms: 1000,

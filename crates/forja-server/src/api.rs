@@ -25,6 +25,8 @@ pub struct AgentMeta {
     pub kind: AgentKind,
     pub provider: String,
     pub model: String,
+    /// Esfuerzo de razonamiento efectivo (ajustes); None = no configurado.
+    pub effort: Option<String>,
     pub available: bool,
 }
 
@@ -42,6 +44,7 @@ impl AgentMeta {
             kind,
             provider: provider.to_string(),
             model: model.to_string(),
+            effort: None,
             available,
         }
     }
@@ -53,6 +56,13 @@ pub struct AgentView {
     pub name: String,
     pub provider: String,
     pub model: String,
+    /// Esfuerzo de razonamiento efectivo (None = no configurado: no se pasa flag).
+    pub effort: Option<String>,
+    /// Niveles de esfuerzo de la familia (vacía = no soporta). En opencode son solo
+    /// sugerencias: acepta una variante libre `[a-z0-9_-]{1,20}`.
+    pub effort_levels: Vec<String>,
+    /// El modelo se puede elegir (ajustes / tarea) en este agente.
+    pub model_editable: bool,
     pub available: bool,
     /// `idle` | `busy` | `error` | `unconfigured`
     pub state: String,
@@ -121,6 +131,12 @@ pub fn build_agent_views(metas: &[AgentMeta], runs: &[RunRecord]) -> Vec<AgentVi
                 name: meta.kind.to_string(),
                 provider: meta.provider.clone(),
                 model: meta.model.clone(),
+                effort: meta.effort.clone(),
+                effort_levels: forja_agent::effort_levels(meta.kind)
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect(),
+                model_editable: forja_agent::MODEL_AGENTS.contains(&meta.kind),
                 available: meta.available,
                 state: state.to_string(),
                 active,
@@ -238,10 +254,11 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
-/// Metadatos con el modelo efectivo (ajustes > default en código) de cada agente.
+/// Metadatos con el modelo y esfuerzo efectivos (ajustes > default) de cada agente.
 pub fn effective_metas(
     metas: &[AgentMeta],
     agent_models: &std::collections::BTreeMap<String, String>,
+    agent_effort: &std::collections::BTreeMap<String, String>,
 ) -> Vec<AgentMeta> {
     metas
         .iter()
@@ -256,6 +273,7 @@ pub fn effective_metas(
                     meta.model = m.to_string();
                 }
             }
+            meta.effort = forja_agent::resolve_effort(meta.kind, None, agent_effort);
             meta
         })
         .collect()
@@ -263,14 +281,12 @@ pub fn effective_metas(
 
 pub async fn agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     let runs = state.scheduler.list_runs().await;
-    let models = state
-        .settings
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .agent_models
-        .clone();
+    let (models, efforts) = {
+        let g = state.settings.read().unwrap_or_else(|e| e.into_inner());
+        (g.agent_models.clone(), g.agent_effort.clone())
+    };
     Json(build_agent_views(
-        &effective_metas(&state.metas, &models),
+        &effective_metas(&state.metas, &models, &efforts),
         &runs,
     ))
 }
@@ -280,9 +296,14 @@ pub async fn agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
 /// `allowed` se conserva por compatibilidad y es igual a `profiles` (los perfiles
 /// de Hermes descubiertos, sin los ocultos).
 pub async fn orchestrator_profile(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (configured, configured_agent) = {
+    let (configured, configured_agent, agent_models, agent_effort) = {
         let g = state.settings.read().unwrap_or_else(|e| e.into_inner());
-        (g.orchestrator_profile.clone(), g.orchestrator_agent.clone())
+        (
+            g.orchestrator_profile.clone(),
+            g.orchestrator_agent.clone(),
+            g.agent_models.clone(),
+            g.agent_effort.clone(),
+        )
     };
     let env = std::env::var(crate::orchestrator::PROFILE_ENV).ok();
     let source = if configured.as_deref().is_some_and(|p| !p.trim().is_empty()) {
@@ -297,7 +318,25 @@ pub async fn orchestrator_profile(State(state): State<AppState>) -> Json<serde_j
     let profile = orq.profile().unwrap_or_else(|| {
         crate::orchestrator::resolve_profile(configured.as_deref(), env.as_deref())
     });
+    // Modelo y esfuerzo que usa el orquestador sin override de conversación, y qué
+    // se puede elegir en el composer del chat.
+    let orq_agent = orq.agent();
+    let orq_kind = orq_agent.parse::<forja_core::AgentKind>().ok();
+    let model_options: &[&str] = match orq_kind {
+        Some(forja_core::AgentKind::Claude) => &["sonnet", "opus", "haiku"],
+        _ => &[],
+    };
+    let model = orq_kind.and_then(|k| forja_agent::resolve_model(k, None, &agent_models));
+    let effort = orq_kind.and_then(|k| forja_agent::resolve_effort(k, None, &agent_effort));
+    let effort_levels: Vec<&str> = orq_kind
+        .map(|k| forja_agent::effort_levels(k).to_vec())
+        .unwrap_or_default();
     Json(json!({
+        "model": model,
+        "effort": effort,
+        "effort_levels": effort_levels,
+        "model_options": model_options,
+        "model_editable": orq_kind.is_some_and(|k| forja_agent::MODEL_AGENTS.contains(&k)),
         "profile": profile,
         "source": source,
         "allowed": profiles,
@@ -523,6 +562,7 @@ mod tests {
             worktree: None,
             attempts: 1,
             model: None,
+            effort: None,
             output: None,
             error: (status == RunStatus::Failed).then(|| "fallo".to_string()),
             created_at_ms: created,
@@ -829,6 +869,116 @@ mod tests {
         let (st, r) = post_task(app, task("mock", None)).await;
         assert_eq!(st, StatusCode::CREATED);
         assert!(r.get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_effort_settings_agents_view_and_task_priority() {
+        use std::sync::Arc;
+
+        use forja_agent::{ClaudeAgent, HermesAgent, OpencodeAgent};
+        let (state, _s, _w) = state();
+        // Programas inexistentes: ningún agente real se ejecuta.
+        let state = state
+            .with_agent(Arc::new(
+                ClaudeAgent::default().with_program("/nonexistent/claude"),
+            ))
+            .with_agent(Arc::new(
+                OpencodeAgent::default().with_program("/nonexistent/opencode"),
+            ))
+            .with_agent(Arc::new(
+                HermesAgent::default().with_program("/nonexistent/hermes"),
+            ));
+        let app = build_router(state);
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+        assert_eq!(current["agent_effort"], json!({}));
+
+        let mut next = current.clone();
+        next["agent_effort"] = json!({"claude": " LOW ", "hermes": "ultra", "opencode": "high"});
+        next["agent_models"] = json!({"hermes": "gpt-x"});
+        let (st, body) = put_settings_json(app.clone(), next.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["agent_effort"]["claude"], "low");
+
+        // /api/agents: esfuerzo efectivo, niveles por familia y model_editable.
+        let (_, agents) = get_json(app.clone(), "/api/agents").await;
+        let agent = |n: &str| {
+            agents
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(agent("claude")["effort"], "low");
+        assert_eq!(
+            agent("claude")["effort_levels"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(agent("hermes")["effort"], "ultra");
+        assert_eq!(
+            agent("hermes")["effort_levels"].as_array().unwrap().len(),
+            8
+        );
+        assert_eq!(agent("hermes")["model"], "gpt-x");
+        assert!(agent("agy")["effort"].is_null());
+        assert_eq!(agent("local")["effort_levels"], json!([]));
+        assert_eq!(agent("mock")["effort_levels"], json!([]));
+        assert_eq!(agent("local")["model_editable"], true);
+        assert_eq!(agent("mock")["model_editable"], false);
+
+        // Validación por familia en ajustes.
+        for bad in [
+            json!({"claude": "ultra"}),
+            json!({"local": "high"}),
+            json!({"hermes": "extreme"}),
+            json!({"opencode": "a b"}),
+        ] {
+            let mut n = current.clone();
+            n["agent_effort"] = bad;
+            assert_eq!(
+                put_settings_json(app.clone(), n).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        // POST /tasks: tarea > ajustes > ninguno; queda en RunRecord.
+        let task = |agent: &str, esfuerzo: Option<&str>| {
+            let mut t = json!({"titulo": "t", "prompt": "p", "agent": agent});
+            if let Some(e) = esfuerzo {
+                t["esfuerzo"] = json!(e);
+            }
+            t
+        };
+        let (st, r) = post_task(app.clone(), task("claude", Some("max"))).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        assert_eq!(r["effort"], "max");
+        let (_, r) = post_task(app.clone(), task("claude", None)).await;
+        assert_eq!(r["effort"], "low");
+        let (_, r) = post_task(app.clone(), task("opencode", None)).await;
+        assert_eq!(r["effort"], "high");
+        let (_, r) = post_task(app.clone(), task("hermes", None)).await;
+        assert_eq!(r["effort"], "ultra");
+        assert_eq!(r["model"], "gpt-x");
+        // Sin configurar no hay esfuerzo (y se omite del JSON).
+        let (_, r) = post_task(app.clone(), task("agy", None)).await;
+        assert!(r.get("effort").is_none(), "{r}");
+        // Inválidos: valor de otra familia, local/mock, vacío ignorado.
+        let (st, _) = post_task(app.clone(), task("claude", Some("ultra"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, r) = post_task(app.clone(), task("local", Some("high"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .contains("local no admite esfuerzo"),
+            "{r}"
+        );
+        let (st, _) = post_task(app.clone(), task("mock", Some("high"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = post_task(app, task("claude", Some("  "))).await;
+        assert_eq!(st, StatusCode::CREATED);
     }
 
     /// Estado con una base de Hermes falsa (claudia, yuuki, privado) y un orquestador

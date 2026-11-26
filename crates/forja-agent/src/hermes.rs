@@ -35,6 +35,10 @@ pub struct HermesCommandOptions {
     pub profile: String,
     /// Ruta del archivo con el prompt; el CLI lo lee tal cual.
     pub query_file: PathBuf,
+    /// `-m <modelo>`; None = el modelo del perfil.
+    pub model: Option<String>,
+    /// `--reasoning <nivel>`; None = no se pasa el flag.
+    pub reasoning: Option<String>,
 }
 
 impl HermesCommandOptions {
@@ -42,6 +46,8 @@ impl HermesCommandOptions {
         Self {
             profile: profile.into(),
             query_file: query_file.into(),
+            model: None,
+            reasoning: None,
         }
     }
 }
@@ -56,7 +62,7 @@ impl HermesCommandOptions {
 /// archivo `query_file`, seguro para comillas, saltos de línea y cualquier
 /// metacarácter de shell.
 pub fn build_command(opts: &HermesCommandOptions) -> Vec<String> {
-    vec![
+    let mut argv = vec![
         "hermes".to_string(),
         "-p".to_string(),
         opts.profile.clone(),
@@ -65,7 +71,16 @@ pub fn build_command(opts: &HermesCommandOptions) -> Vec<String> {
         opts.query_file.to_string_lossy().into_owned(),
         "-Q".to_string(),
         "--oneshot".to_string(),
-    ]
+    ];
+    if let Some(model) = &opts.model {
+        argv.push("-m".to_string());
+        argv.push(model.clone());
+    }
+    if let Some(reasoning) = &opts.reasoning {
+        argv.push("--reasoning".to_string());
+        argv.push(reasoning.clone());
+    }
+    argv
 }
 
 /// Normaliza y valida el FORMATO del perfil (sin tocar el disco).
@@ -301,6 +316,10 @@ pub struct HermesAgent {
     /// Programa que se ejecuta (por defecto "hermes"); los tests lo apuntan
     /// a un script falso.
     pub program: String,
+    /// Modelo opcional (`-m`); None = el del perfil.
+    pub model: Option<String>,
+    /// Nivel de razonamiento (`--reasoning`); None = no se pasa.
+    pub effort: Option<String>,
 }
 
 impl Default for HermesAgent {
@@ -315,7 +334,19 @@ impl HermesAgent {
             profile: profile.into(),
             program: "hermes".to_string(),
             rules: ProfileRules::new(),
+            model: None,
+            effort: None,
         }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
     }
 
     /// Usa reglas de perfiles propias (ocultos compartidos, base de Hermes).
@@ -340,6 +371,8 @@ impl HermesAgent {
         let opts = HermesCommandOptions {
             profile: profile.to_string(),
             query_file: prompt_path.to_path_buf(),
+            model: self.model.clone(),
+            reasoning: self.effort.clone(),
         };
         let mut argv = build_command(&opts);
         argv[0] = self.program.clone();
@@ -377,6 +410,26 @@ impl Drop for PromptFileGuard {
 impl Agent for HermesAgent {
     fn kind(&self) -> AgentKind {
         AgentKind::Hermes
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model.clone()
+    }
+
+    fn with_model(&self, model: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.model = Some(model.to_string());
+        Some(Arc::new(copy))
+    }
+
+    fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+
+    fn with_effort(&self, effort: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.effort = Some(effort.to_string());
+        Some(Arc::new(copy))
     }
 
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
@@ -421,6 +474,21 @@ impl Agent for HermesAgent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hermes_model_and_reasoning_flags_only_when_configured() {
+        let mut opts = HermesCommandOptions::new("claudia", "/tmp/q.txt");
+        let base = build_command(&opts);
+        assert!(!base.contains(&"-m".to_string()) && !base.contains(&"--reasoning".to_string()));
+        opts.model = Some("gpt-x".into());
+        opts.reasoning = Some("ultra".into());
+        let args = build_command(&opts);
+        assert_eq!(&args[base.len()..], ["-m", "gpt-x", "--reasoning", "ultra"]);
+        let agent = Agent::with_effort(&HermesAgent::default(), "none").unwrap();
+        assert_eq!(agent.effort().as_deref(), Some("none"));
+        let agent = Agent::with_model(&HermesAgent::default(), "m").unwrap();
+        assert_eq!(agent.model().as_deref(), Some("m"));
+    }
+
     use std::path::{Path, PathBuf};
 
     #[test]

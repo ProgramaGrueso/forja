@@ -1025,6 +1025,10 @@
     .orq-suggest button:hover, .orq-suggest button:focus { background: var(--bg-hover); outline: none; }
     .orq-suggest .mono { color: var(--emerald); min-width: 90px; }
     .orq-send-busy { opacity: 0.55; }
+    .orq-pill { width: auto; max-width: 150px; padding: 6px 8px; font-size: 12px; border-radius: 999px; }
+    .orq-pill[hidden] { display: none; }
+    .orq-mic { width: 38px; height: 38px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+    .orq-mic svg { width: 18px; height: 18px; fill: currentColor; }
     @media (max-width: 820px) {
       .orq-layout { grid-template-columns: 1fr; }
       .orq-side { max-height: 150px; }
@@ -1333,8 +1337,10 @@
                 <div id="orq-status" class="orq-status" role="status"></div>
                 <div id="orq-suggest" class="orq-suggest" role="listbox" aria-label="Comandos disponibles"></div>
                 <form id="orq-form" class="orq-bar" autocomplete="off">
-                  <button id="orq-call" class="btn orq-call" type="button" title="Llamada de voz: él escucha y te responde hablando">Llamar</button>
                   <input id="orq-input" type="text" placeholder="Escribe un mensaje o un comando (/help)" aria-label="Mensaje al orquestador">
+                  <select id="orq-model" class="select orq-pill" aria-label="Modelo del orquestador en esta conversación" title="Modelo del orquestador en esta conversación (también /model)"></select>
+                  <select id="orq-effort" class="select orq-pill" aria-label="Esfuerzo de razonamiento en esta conversación" title="Esfuerzo de razonamiento en esta conversación (también /effort)"></select>
+                  <button id="orq-call" class="btn orq-call orq-mic" type="button" aria-label="Iniciar llamada de voz" title="Llamada de voz: él escucha y te responde hablando (clic otra vez para colgar)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></button>
                   <button id="orq-send" class="btn btn-primary" type="submit">Enviar</button>
                   <button id="orq-reset" class="btn" type="button" title="Crear una conversación nueva">Nueva</button>
                 </form>
@@ -1453,9 +1459,9 @@
                 <div class="card-sub">Separados por comas. Un perfil oculto no aparece en las listas, no se puede elegir y se rechaza en el orquestador, en el agente hermes y en la lista de modelos. También se pueden ocultar con la variable FORJA_HIDDEN_PROFILES.</div>
               </div>
               <fieldset id="set-models-box" style="border:1px solid var(--border-dim);border-radius:6px;padding:10px 12px;margin-bottom:12px;">
-                <legend class="card-label" style="padding:0 6px;">Modelo por agente</legend>
-                <div class="card-sub" style="margin-bottom:8px;">Vacío = modelo por defecto del agente. Una tarea puede sobrescribirlo con su campo «Modelo».</div>
-                <div id="set-models-rows" style="display:grid;grid-template-columns:90px 1fr auto;gap:6px 8px;align-items:center;"></div>
+                <legend class="card-label" style="padding:0 6px;">Modelo y esfuerzo por agente</legend>
+                <div class="card-sub" style="margin-bottom:8px;">Vacío = modelo por defecto del agente (en hermes, el del perfil). El esfuerzo de razonamiento vacío = no se pasa ningún flag. Una tarea puede sobrescribir ambos en Nueva tarea; el chat del orquestador, por conversación.</div>
+                <div id="set-models-rows" style="display:grid;grid-template-columns:90px 1fr 170px auto;gap:6px 8px;align-items:center;"></div>
               </fieldset>
               <div class="form-field" style="flex-direction:row;align-items:center;gap:10px;margin-top:6px;">
                 <input id="set-hide-mascot" type="checkbox">
@@ -1558,6 +1564,11 @@
           <div id="nt-model-note" class="card-sub"></div>
         </div>
         <div class="form-field">
+          <label for="nt-effort">Esfuerzo</label>
+          <select id="nt-effort" class="select"></select>
+          <div id="nt-effort-note" class="card-sub"></div>
+        </div>
+        <div class="form-field">
           <label for="nt-prompt">Prompt</label>
           <textarea id="nt-prompt" class="textarea" rows="4" placeholder="Describe la tarea con criterios verificables…" required></textarea>
         </div>
@@ -1595,9 +1606,37 @@
         initializedRuns: false,
         defaultModels: {},
       };
-      const MODEL_AGENTS = ["claude", "agy", "opencode", "local"];
+      const MODEL_AGENTS = ["claude", "agy", "opencode", "hermes", "local"];
+      /* Esfuerzo de razonamiento por familia (el servidor manda los suyos en /api/agents). */
+      const EFFORT_LEVELS = {
+        claude: ["low", "medium", "high", "xhigh", "max"],
+        agy: ["low", "medium", "high", "xhigh", "max"],
+        hermes: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        opencode: ["low", "medium", "high", "max"],
+      };
+      const EFFORT_SHORT = { none: "Ninguno", minimal: "Mínimo", low: "Bajo", medium: "Med", high: "Alto", xhigh: "Muy alto", max: "Máx", ultra: "Ultra" };
+      function effortLevelsOf(agent) {
+        const ag = (state.agents || []).find((a) => a.name === agent);
+        if (ag && Array.isArray(ag.effort_levels)) return ag.effort_levels;
+        return EFFORT_LEVELS[agent] || [];
+      }
+      function fillEffortSelect(sel, levels, blankLabel, current) {
+        sel.textContent = "";
+        const b = document.createElement("option");
+        b.value = ""; b.textContent = blankLabel;
+        sel.appendChild(b);
+        const list = levels.slice();
+        if (current && !list.includes(current)) list.push(current);
+        list.forEach((l) => {
+          const o = document.createElement("option");
+          o.value = l; o.textContent = EFFORT_SHORT[l] || l;
+          sel.appendChild(o);
+        });
+        sel.value = current || "";
+      }
       /* Ganchos que rellena el módulo de terminales */
       const termApi = { onRuns() {}, open() { return false; } };
+      const orqHooks = { refresh() {} };
       const orqApi = { reload() {} };
 
       const VIEW_META = {
@@ -2091,6 +2130,7 @@
           <span class="muted">Estado:</span><span><span class="badge ${esc(r.status)}">${esc(r.status)}</span></span>
           <span class="muted">Agente:</span><span class="mono">${esc(r.agent)}</span>
           <span class="muted">Modelo:</span><span class="mono">${esc(r.model || "sin modelo")}</span>
+          <span class="muted">Esfuerzo:</span><span class="mono">${esc(r.effort || "sin configurar")}</span>
           <span class="muted">Privacidad:</span><span class="mono">${esc(r.task.privacidad)}</span>
           <span class="muted">Duración:</span><span class="mono" ${r.status === "running" ? `data-live-duration="${r.created_at_ms}"` : ""}>${esc(fmtDuration(runDurationMs(r)))}</span>
           <span class="muted">Intentos:</span><span class="mono">${r.attempts}</span>
@@ -2123,6 +2163,7 @@
               </div>
               <div class="kv-grid" style="margin-top:8px;">
                 <span class="muted">Modelo:</span><span class="mono">${esc(ag.model)}${state.settings && state.settings.agent_models && state.settings.agent_models[ag.name] ? " (de Ajustes)" : ""}</span>
+                <span class="muted">Esfuerzo:</span><span class="mono">${esc(ag.effort || ((ag.effort_levels || []).length ? "sin configurar" : "sin soporte"))}${ag.effort ? " (de Ajustes)" : ""}</span>
                 <span class="muted">Estado:</span><span class="mono">${esc(ag.state)}</span>
                 <span class="muted">Ejecuciones:</span><span class="mono">${ag.total} (activas: ${ag.active})</span>
                 <span class="muted">Tasa de éxito:</span><span class="mono">${esc(rate)}</span>
@@ -2161,7 +2202,7 @@
       function loadModels(refresh) {
         return apiFetch(refresh ? "/api/models?refresh=true" : "/api/models")
           .then((r) => r.ok ? r.json() : null)
-          .then((m) => { if (m) { state.models = m; renderModels(); } })
+          .then((m) => { if (m) { state.models = m; renderModels(); orqHooks.refresh(); } })
           .catch(() => {});
       }
 
@@ -2318,10 +2359,11 @@
         settingsFilledOnce = true;
       }
 
-      /* Modelo por agente (Ajustes) */
+      /* Modelo y esfuerzo por agente (Ajustes) */
       function renderModelRows() {
         const box = $("set-models-rows");
         const saved = (state.settings && state.settings.agent_models) || {};
+        const savedEff = (state.settings && state.settings.agent_effort) || {};
         box.textContent = "";
         MODEL_AGENTS.forEach((name) => {
           const lab = document.createElement("label");
@@ -2335,14 +2377,28 @@
           inp.autocomplete = "off";
           inp.dataset.agent = name;
           inp.value = saved[name] || "";
-          inp.placeholder = state.defaultModels[name] || "por defecto del agente";
+          inp.placeholder = name === "hermes" ? "vacío = el del perfil" : (state.defaultModels[name] || "por defecto del agente");
+          const levels = effortLevelsOf(name);
+          let eff;
+          if (levels.length) {
+            eff = document.createElement("select");
+            eff.id = `set-effort-${name}`;
+            eff.className = "select";
+            eff.dataset.effortAgent = name;
+            eff.setAttribute("aria-label", `Esfuerzo de razonamiento de ${name}`);
+            fillEffortSelect(eff, levels, "Esfuerzo: sin configurar", savedEff[name] || "");
+          } else {
+            eff = document.createElement("span");
+            eff.className = "card-sub";
+            eff.textContent = "esfuerzo: sin soporte";
+          }
           const btn = document.createElement("button");
           btn.type = "button";
           btn.className = "btn";
           btn.textContent = "Restablecer";
-          btn.setAttribute("aria-label", `Restablecer modelo de ${name}`);
-          btn.addEventListener("click", () => { inp.value = ""; inp.focus(); });
-          box.append(lab, inp, btn);
+          btn.setAttribute("aria-label", `Restablecer modelo y esfuerzo de ${name}`);
+          btn.addEventListener("click", () => { inp.value = ""; if (eff.tagName === "SELECT") eff.value = ""; inp.focus(); });
+          box.append(lab, inp, eff, btn);
         });
       }
 
@@ -2355,12 +2411,21 @@
         return out;
       }
 
+      function collectAgentEffort() {
+        const out = {};
+        document.querySelectorAll("#set-models-rows select[data-effort-agent]").forEach((sel) => {
+          if (sel.value) out[sel.dataset.effortAgent] = sel.value;
+        });
+        return out;
+      }
+
       function updateDefaultModels() {
         const saved = (state.settings && state.settings.agent_models) || {};
         (state.agents || []).forEach((ag) => {
-          if (MODEL_AGENTS.includes(ag.name) && !saved[ag.name] && ag.model) state.defaultModels[ag.name] = ag.model;
+          if (ag.name !== "hermes" && MODEL_AGENTS.includes(ag.name) && !saved[ag.name] && ag.model) state.defaultModels[ag.name] = ag.model;
         });
         document.querySelectorAll("#set-models-rows input[data-agent]").forEach((inp) => {
+          if (inp.dataset.agent === "hermes") return;
           inp.placeholder = state.defaultModels[inp.dataset.agent] || "por defecto del agente";
         });
       }
@@ -2415,6 +2480,7 @@
         fillSelect(head, profiles);
         if (profileInfo.profile) head.value = profileInfo.profile;
         $("orq-profile-source").textContent = srcTxt;
+        orqHooks.refresh();
 
         const setAgent = $("set-orch-agent");
         const prevAgent = setAgent.value;
@@ -2535,6 +2601,26 @@
         }
       }
 
+      function updateModalEffortField() {
+        const agent = $("nt-agent").value;
+        const sel = $("nt-effort");
+        const note = $("nt-effort-note");
+        const levels = effortLevelsOf(agent);
+        const prev = sel.value;
+        if (!levels.length) {
+          fillEffortSelect(sel, [], "no aplica", "");
+          sel.disabled = true;
+          note.textContent = `El agente ${agent} no admite esfuerzo de razonamiento.`;
+          return;
+        }
+        sel.disabled = false;
+        const ag = (state.agents || []).find((a) => a.name === agent);
+        fillEffortSelect(sel, levels, `Esfuerzo de Ajustes (${(ag && ag.effort) || "sin configurar"})`, levels.includes(prev) ? prev : "");
+        note.textContent = agent === "opencode"
+          ? "Se añade como #variante al modelo (opencode no tiene flag aparte)."
+          : "Vacío = el de Ajustes; si no hay ninguno no se pasa ningún flag.";
+      }
+
       /* Acciones HTTP (soporta token Bearer opcional vía sessionStorage o ?token=) */
       const urlToken = new URLSearchParams(window.location.search).get("token");
       if (urlToken) {
@@ -2607,6 +2693,8 @@
           renderMascot();
           updateModalPolicyPreview();
           updateModalModelField();
+          updateModalEffortField();
+          orqHooks.refresh();
           termApi.onRuns();
         } catch (_) {
           $("conn-dot").className = "dot error";
@@ -2770,6 +2858,7 @@
         $("nt-error").classList.remove("show");
         updateModalPolicyPreview();
         updateModalModelField();
+        updateModalEffortField();
         $("new-task-modal").classList.add("open");
       };
       const closeModal = () => $("new-task-modal").classList.remove("open");
@@ -2778,8 +2867,9 @@
       $("btn-new-task-runs").addEventListener("click", openModal);
       $("modal-close-btn").addEventListener("click", closeModal);
       $("modal-cancel-btn").addEventListener("click", closeModal);
-      $("nt-privacy").addEventListener("change", () => { updateModalPolicyPreview(); updateModalModelField(); });
-      $("nt-agent").addEventListener("change", updateModalModelField);
+      $("nt-privacy").addEventListener("change", () => { updateModalPolicyPreview(); updateModalModelField(); updateModalEffortField(); });
+      $("nt-agent").addEventListener("change", () => { updateModalModelField(); updateModalEffortField(); });
+      updateModalEffortField();
 
       $("new-task-form").addEventListener("submit", async (e) => {
         e.preventDefault();
@@ -2793,6 +2883,8 @@
         };
         const modelo = $("nt-model").disabled ? "" : $("nt-model").value.trim();
         if (modelo) payload.modelo = modelo;
+        const esfuerzo = $("nt-effort").disabled ? "" : $("nt-effort").value;
+        if (esfuerzo) payload.esfuerzo = esfuerzo;
         const resp = await apiFetch("/tasks", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -2808,6 +2900,7 @@
         $("nt-title").value = "";
         $("nt-prompt").value = "";
         $("nt-model").value = "";
+        $("nt-effort").value = "";
         closeModal();
         upsertRun(created);
         if ($("nt-open-term").checked && termApi.open(created.id, false)) setView("terminales");
@@ -2825,6 +2918,7 @@
           quota_path: $("set-quota-path").value.trim(),
           hide_mascot: $("set-hide-mascot").checked,
           agent_models: collectAgentModels(),
+          agent_effort: collectAgentEffort(),
           orchestrator_profile: $("set-orch-profile").value || null,
           orchestrator_agent: $("set-orch-agent").value || null,
           hidden_profiles: $("set-hidden-profiles").value.split(",").map((x) => x.trim()).filter(Boolean),
@@ -2943,9 +3037,14 @@
           ["/rename ", "Renombra: /rename <título>"],
           ["/agents", "Estado de los agentes"],
           ["/stop", "Cancela las ejecuciones en curso"],
-          ["/model", "Disponible pronto"],
+          ["/model ", "Modelo del orquestador: /model <modelo> (reset = Ajustes)"],
+          ["/effort ", "Esfuerzo de razonamiento: /effort <nivel> (reset = Ajustes)"],
           ["/agent", "Disponible pronto"],
         ];
+        const modelSel = $("orq-model");
+        const effortSel = $("orq-effort");
+        const OTHER = "__otro__";
+        const choice = new Map();   // id -> { modelo?, esfuerzo? } elegido y aún no enviado
         let convs = [];
         let activeId = null;
         const busy = new Set();      // conversaciones con una petición mía en vuelo
@@ -2978,6 +3077,79 @@
           $("orq-send").setAttribute("aria-disabled", thinking ? "true" : "false");
         }
         function setStatus(t) { voiceStatus = t || ""; updateStatus(); }
+
+        /* Composer: [Modelo ▾] [Esfuerzo ▾] por conversación */
+        const MODEL_NICE = { sonnet: "Sonnet", opus: "Opus", haiku: "Haiku" };
+        const modelLabel = (m) => MODEL_NICE[m] || m;
+        function modelCandidates() {
+          const out = (profileInfo.model_options || []).slice();
+          const agent = profileInfo.agent;
+          const prov = { claude: (p) => p === "anthropic", agy: (p) => p === "gemini", local: (p) => p === "local", hermes: (p) => p === "hermes", opencode: (p) => p.startsWith("opencode") }[agent];
+          if (prov && state.models && state.models.providers) {
+            state.models.providers.filter((p) => prov(p.provider) && p.status === "ok").forEach((p) => {
+              (p.models || []).slice(0, 60).forEach((m) => { if (!out.includes(m.id)) out.push(m.id); });
+            });
+          }
+          if (profileInfo.model && !out.includes(profileInfo.model)) out.push(profileInfo.model);
+          return out;
+        }
+        function renderComposer() {
+          const act = convs.find((c) => c.id === activeId) || {};
+          const ch = (activeId && choice.get(activeId)) || {};
+          const curModel = "modelo" in ch ? ch.modelo : (act.modelo || "");
+          const curEffort = "esfuerzo" in ch ? ch.esfuerzo : (act.esfuerzo || "");
+          const editable = profileInfo.model_editable !== false && Boolean(profileInfo.agent);
+          modelSel.hidden = !editable;
+          if (editable) {
+            modelSel.textContent = "";
+            const b = document.createElement("option");
+            b.value = ""; b.textContent = `${modelLabel(profileInfo.model || "Modelo")} (Ajustes)`;
+            modelSel.appendChild(b);
+            const cands = modelCandidates().filter((m) => m !== profileInfo.model);
+            if (curModel && !cands.includes(curModel) && curModel !== profileInfo.model) cands.unshift(curModel);
+            cands.forEach((m) => { const o = document.createElement("option"); o.value = m; o.textContent = modelLabel(m); modelSel.appendChild(o); });
+            const other = document.createElement("option");
+            other.value = OTHER; other.textContent = "otro…";
+            modelSel.appendChild(other);
+            modelSel.value = curModel === profileInfo.model ? "" : curModel;
+          }
+          const levels = profileInfo.effort_levels || [];
+          effortSel.hidden = levels.length === 0;
+          if (levels.length) {
+            fillEffortSelect(effortSel, levels, `Esfuerzo${profileInfo.effort ? " (" + (EFFORT_SHORT[profileInfo.effort] || profileInfo.effort) + ")" : ""}`, curEffort);
+            if (profileInfo.agent === "opencode") {
+              const other = document.createElement("option");
+              other.value = OTHER; other.textContent = "otro…";
+              effortSel.appendChild(other);
+              effortSel.value = curEffort;
+            }
+          }
+        }
+        orqHooks.refresh = renderComposer;
+        function setChoice(key, value) {
+          if (!activeId) return;
+          const ch = choice.get(activeId) || {};
+          ch[key] = value;
+          choice.set(activeId, ch);
+          setStatus(value === "" ? "Se volverá a Ajustes en el próximo mensaje." : "Se aplicará en el próximo mensaje (sin reiniciar la conversación).");
+          renderComposer();
+        }
+        modelSel.addEventListener("change", () => {
+          let v = modelSel.value;
+          if (v === OTHER) {
+            v = (window.prompt("Modelo para este orquestador (texto libre):", "") || "").trim();
+            if (!v) { renderComposer(); return; }
+          }
+          setChoice("modelo", v);
+        });
+        effortSel.addEventListener("change", () => {
+          let v = effortSel.value;
+          if (v === OTHER) {
+            v = (window.prompt("Variante de razonamiento (a-z, 0-9, - o _; máx. 20):", "") || "").trim().toLowerCase();
+            if (!v) { renderComposer(); return; }
+          }
+          setChoice("esfuerzo", v);
+        });
 
         /* Lista lateral */
         function renderList() {
@@ -3021,6 +3193,7 @@
             });
             listEl.appendChild(row);
           });
+          renderComposer();
           const act = convs.find((c) => c.id === activeId);
           $("orq-conv-title").textContent = act ? (act.titulo || "(sin título)") : "Sin conversación";
           $("orq-rename").disabled = !act;
@@ -3108,7 +3281,7 @@
               return;
             }
           } catch (e) { add("sys", `Error de red: ${e.message}`); return; }
-          busy.delete(id); pending.delete(id);
+          busy.delete(id); pending.delete(id); choice.delete(id);
           await loadList();
           if (activeId === id) {
             activeId = null;
@@ -3151,7 +3324,7 @@
             const r = await apiFetch("/api/orchestrator/chat", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text, conversation_id: id }),
+              body: JSON.stringify(Object.assign({ message: text, conversation_id: id }, isCmd ? {} : (choice.get(id) || {}))),
             });
             const data = await r.json().catch(() => ({}));
             if (r.status === 404) {
@@ -3166,6 +3339,7 @@
             if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
             const reply = data.reply || "";
             pending.delete(id);
+            if (!isCmd) choice.delete(id);
             if (data.new_conversation && data.conversation_id) {
               await loadList();
               await select(data.conversation_id);
@@ -3261,7 +3435,8 @@
         function endCall() {
           inCall = false;
           callBtn.classList.remove("on");
-          callBtn.textContent = "Llamar";
+          callBtn.setAttribute("aria-label", "Iniciar llamada de voz");
+          callBtn.setAttribute("aria-pressed", "false");
           if (rec) { try { rec.abort(); } catch (e) {} }
           if (window.speechSynthesis) window.speechSynthesis.cancel();
           setStatus("");
@@ -3275,7 +3450,8 @@
           }
           inCall = true;
           callBtn.classList.add("on");
-          callBtn.textContent = "Colgar";
+          callBtn.setAttribute("aria-label", "Terminar llamada de voz");
+          callBtn.setAttribute("aria-pressed", "true");
           add("sys", "Llamada iniciada. Habla cuando quieras (opera sobre la conversación activa).");
           listen();
         });

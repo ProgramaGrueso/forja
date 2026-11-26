@@ -16,6 +16,10 @@ pub struct Settings {
     /// Modelo por agente (claude, agy, opencode, local). Sin entrada => default en código.
     #[serde(default)]
     pub agent_models: BTreeMap<String, String>,
+    /// Esfuerzo de razonamiento por agente (claude, agy, opencode, hermes). Sin entrada
+    /// => no se pasa ningún flag. `local` no lo admite.
+    #[serde(default)]
+    pub agent_effort: BTreeMap<String, String>,
     /// Perfil de Hermes del orquestador. None => env FORJA_ORCHESTRATOR_PROFILE o `default`.
     #[serde(default)]
     pub orchestrator_profile: Option<String>,
@@ -70,6 +74,7 @@ impl Settings {
                 .into_owned(),
             hide_mascot: false,
             agent_models: BTreeMap::new(),
+            agent_effort: BTreeMap::new(),
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
@@ -97,6 +102,13 @@ impl Settings {
                 .filter(|k| forja_agent::MODEL_AGENTS.contains(k))
                 .ok_or_else(|| format!("agent_models: el agente \"{agent}\" no admite modelo"))?;
             forja_agent::validate_model(model).map_err(|e| format!("agent_models[{kind}]: {e}"))?;
+        }
+        for (agent, effort) in &self.agent_effort {
+            let kind = agent
+                .parse::<forja_core::AgentKind>()
+                .map_err(|_| format!("agent_effort: agente desconocido \"{agent}\""))?;
+            forja_agent::validate_effort(kind, effort)
+                .map_err(|e| format!("agent_effort[{kind}]: {e}"))?;
         }
         // Aquí solo se valida el formato (función pura); que el perfil exista y no
         // esté oculto lo comprueba el orquestador con las reglas de perfiles.
@@ -130,6 +142,11 @@ impl Settings {
         self.agent_models = std::mem::take(&mut self.agent_models)
             .into_iter()
             .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        self.agent_effort = std::mem::take(&mut self.agent_effort)
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_lowercase()))
             .filter(|(_, v)| !v.is_empty())
             .collect();
         self.orchestrator_profile = self
@@ -196,6 +213,8 @@ pub struct SettingsPatch {
     pub orchestrator_profile: Option<String>,
     /// Se fusiona clave a clave con `agent_models` existente.
     pub agent_models: BTreeMap<String, String>,
+    /// Se fusiona clave a clave con `agent_effort` existente.
+    pub agent_effort: BTreeMap<String, String>,
     /// Se UNE con `hidden_profiles` existente (nunca se quita protección).
     pub hidden_profiles: Vec<String>,
 }
@@ -259,6 +278,20 @@ pub fn apply_patch(
         }
     }
 
+    if !patch.agent_effort.is_empty() {
+        let entry = obj
+            .entry("agent_effort".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !entry.is_object() {
+            *entry = serde_json::json!({});
+        }
+        if let Some(efforts) = entry.as_object_mut() {
+            for (agent, effort) in &patch.agent_effort {
+                efforts.insert(agent.clone(), serde_json::Value::String(effort.clone()));
+            }
+        }
+    }
+
     if !patch.hidden_profiles.is_empty() {
         let mut hidden: Vec<String> = obj
             .get("hidden_profiles")
@@ -316,6 +349,7 @@ mod tests {
             quota_path: "/tmp/quota.json".to_string(),
             hide_mascot: false,
             agent_models: BTreeMap::new(),
+            agent_effort: BTreeMap::new(),
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
@@ -411,6 +445,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_effort_validates_per_family_and_normalizes() {
+        let mut s = valid();
+        s.agent_effort.insert(" Claude ".into(), " HIGH ".into());
+        s.agent_effort.insert("agy".into(), "  ".into());
+        s.normalize();
+        assert_eq!(s.agent_effort.len(), 1);
+        assert_eq!(s.agent_effort["claude"], "high");
+        assert!(s.validate().is_ok());
+        for (agent, bad) in [
+            ("claude", "ultra"),
+            ("hermes", "extreme"),
+            ("opencode", "a b"),
+            ("local", "high"),
+            ("mock", "low"),
+            ("nope", "low"),
+        ] {
+            let mut s = valid();
+            s.agent_effort.insert(agent.into(), bad.into());
+            assert!(s.validate().is_err(), "{agent}={bad}");
+        }
+        let mut s = valid();
+        s.agent_effort.insert("hermes".into(), "ultra".into());
+        s.agent_effort.insert("opencode".into(), "high".into());
+        assert!(s.validate().is_ok());
+        let e = {
+            let mut s = valid();
+            s.agent_effort.insert("local".into(), "high".into());
+            s.validate().unwrap_err()
+        };
+        assert!(e.contains("no admite esfuerzo"), "{e}");
+        // Ajustes viejos sin el campo siguen cargando.
+        let old =
+            r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json"}"#;
+        let parsed: Settings = serde_json::from_str(old).unwrap();
+        assert!(parsed.agent_effort.is_empty());
+    }
+
+    #[test]
     fn settings_normalize_trims_and_clears_blanks() {
         let mut s = valid();
         s.agent_models.insert(" Claude ".into(), " opus ".into());
@@ -450,6 +522,7 @@ mod tests {
         let path = dir.path().join("store/settings.json");
         let defaults = Settings::with_defaults("/tmp/s");
         let patch = SettingsPatch {
+            agent_effort: [("claude".to_string(), "high".to_string())].into(),
             orchestrator_agent: Some("claude".into()),
             agent_models: [("claude".to_string(), "opus".to_string())].into(),
             hidden_profiles: vec!["priv".into()],
@@ -478,6 +551,7 @@ mod tests {
             orchestrator_agent: Some("opencode".into()),
             orchestrator_profile: None,
             agent_models: [("claude".to_string(), "opus".to_string())].into(),
+            agent_effort: Default::default(),
             hidden_profiles: vec!["b".into(), "a".into()],
         };
         let out = apply_patch(&path, &patch, &Settings::with_defaults("/otro")).expect("merge");

@@ -245,6 +245,7 @@ impl Scheduler {
             worktree: None,
             attempts: 0,
             model: agent.model(),
+            effort: agent.effort(),
             output: None,
             error: None,
             created_at_ms: now,

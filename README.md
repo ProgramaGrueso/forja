@@ -33,24 +33,39 @@ Cada tarea trabaja en un *worktree* (copia aislada) del repo en su propia rama `
 
 ### Orquestador con voz
 
-En el panel, pestaña **Orquestador**: conversas por texto o pulsas **Llamar** para hablar y que te responda en voz alta, como una llamada. Él delega el trabajo en los agentes de Forja y revisa el resultado antes de decirte que está listo.
+En el panel, pestaña **Orquestador**: conversas por texto o pulsas el icono de **micrófono** (junto a Enviar) para iniciar/terminar una llamada y hablar y que te responda en voz alta, como una llamada. Él delega el trabajo en los agentes de Forja y revisa el resultado antes de decirte que está listo.
 
 - El «cerebro» es cualquiera de tus agentes: `hermes`, `claude`, `opencode`, `agy` o `local`. Se resuelve así: ajuste `orchestrator_agent` (panel → Ajustes) > variable `FORJA_ORCHESTRATOR_AGENT` > automático (el primero instalado en este orden: claude, opencode, agy, local, hermes). Cambiarlo en Ajustes se aplica en caliente y reinicia las sesiones.
 - Con `hermes` mantiene sesión y eliges el perfil: ajuste `orchestrator_profile` > `FORJA_ORCHESTRATOR_PROFILE` > `default`. Los perfiles se **descubren** (`default` + subdirectorios de `$HERMES_HOME/profiles`, o `~/.hermes/profiles`); no hay nombres fijos.
 - Con los demás agentes se hace una llamada one-shot a su CLI (mismo modelo que resuelves por agente en Ajustes) y, como esos CLIs no guardan sesión, Forja reenvía en cada mensaje las instrucciones del orquestador y los últimos 20 intercambios de la conversación.
+- **Delegación sin permisos de shell.** Los orquestadores que no son Hermes (claude, opencode, agy, local) no ejecutan `curl`: terminan su respuesta con líneas de acción y **el servidor** las ejecuta por ellos. Formato exacto, una acción por línea y con el JSON en una sola línea: `[[forja:delegar {"titulo":"...","prompt":"...","agent":"opencode","privacidad":"open","modelo":"...","esfuerzo":"..."}]]` y `[[forja:estado ID]]`. Cada delegación pasa por las mismas validaciones que `POST /tasks` (agente, modelo, esfuerzo, política de privacidad), con un máximo de 5 delegaciones por turno. Esas líneas no se muestran al usuario; en el **siguiente turno** el orquestador recibe «Tareas delegadas» con ID, estado actual y salida resumida (sin secretos) para revisarlas antes de contestar. JSON inválido, acciones rechazadas o el límite generan un aviso en ese siguiente turno, nunca un error. Los bloques solo se interpretan en la salida del orquestador, jamás en la de las tareas (que se reinyecta neutralizada). Hermes sigue delegando con `curl`, sin cambios.
 - Las tareas que el orquestador delega siguen la política de privacidad de siempre (`open`/`sensitive`); elegir otro agente de orquestador no la modifica.
 - La voz usa el navegador (Web Speech API): funciona en Chrome, Edge y Chromium, necesita internet y permiso de micrófono.
 
 ### Orquestador, modelos y terminales en el panel
 
 - **Conversaciones**: en **Orquestador** hay una lista lateral (máx. 20) con un historial independiente por conversación; varias pueden estar «pensando» a la vez. `+ Nueva` crea otra; ✕ la borra (con confirmación). La seleccionada se recuerda.
-- **Comandos `/`**: al escribir `/` aparece el autocompletado. `/new` (conversación nueva), `/help`, `/rename <título>`, `/agents`, `/stop`; `/model` y `/agent` están reservados («disponible pronto»).
-- **Elegir orquestador y modelos** (pestaña **Ajustes**; el selector de agente —y de perfil si es hermes— también está en la cabecera de Orquestador): agente del orquestador y perfil de Hermes (cambiarlos reinicia sus sesiones), perfiles de Hermes ocultos y modelo por agente (`claude`, `agy`, `opencode`, `local`; vacío = default). En **Nueva tarea** el campo opcional «Modelo» lo sobrescribe para esa ejecución (no aplica a `mock` ni `hermes`).
+- **Comandos `/`**: al escribir `/` aparece el autocompletado. `/new` (conversación nueva), `/help`, `/rename <título>`, `/agents`, `/stop`; `/model <modelo>` y `/effort <nivel>` cambian el modelo y el esfuerzo del orquestador **en esa conversación** (sin argumento muestran el actual; `reset` vuelve a Ajustes); `/agent` sigue reservado.
+- **Modelo y esfuerzo en el chat**: junto a Enviar hay dos desplegables compactos `[Modelo ▾] [Esfuerzo ▾]` y el icono de micrófono. Son **por conversación** (el servidor los guarda con ella y el panel los envía en el campo `modelo`/`esfuerzo` del chat), sobrescriben los Ajustes solo para ese orquestador y cambiarlos **no reinicia** la conversación. El de modelo lista los de la familia del orquestador (claude: sonnet/opus/haiku; el resto, lo que expone `/api/models`) más «otro…» de texto libre; el de esfuerzo muestra los niveles de esa familia y se oculta si no la soporta (`local`). Cambiar el agente del orquestador descarta estas elecciones.
+- **Elegir orquestador, modelos y esfuerzo** (pestaña **Ajustes**; el selector de agente —y de perfil si es hermes— también está en la cabecera de Orquestador): agente del orquestador y perfil de Hermes (cambiarlos reinicia sus sesiones), perfiles de Hermes ocultos y, por agente, modelo (`claude`, `agy`, `opencode`, `hermes`, `local`; vacío = default; en hermes vacío = el del perfil) y esfuerzo de razonamiento (select con los niveles de cada familia; `local` y `mock` muestran «sin soporte»). En **Nueva tarea**, «Modelo» y «Esfuerzo» (opcionales) los sobrescriben para esa ejecución; el de esfuerzo cambia sus opciones con el agente y se deshabilita para `mock`/`local`.
+
+### Esfuerzo de razonamiento
+
+Prioridad igual que el modelo: **tarea** (`esfuerzo` en `POST /tasks`, `forja run --effort`) > **Ajustes** (`agent_effort`) > ninguno. Si no configuras nada **no se pasa ningún flag** (comportamiento de siempre). Cada familia tiene su conjunto de valores:
+
+| Agente | Cómo se aplica | Valores |
+| --- | --- | --- |
+| `claude`, `agy` | `--effort <nivel>` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `hermes` | `hermes chat --reasoning <nivel>` (y `-m <modelo>` si fijas modelo) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` |
+| `opencode` | `#variante` añadida al modelo (`provider/model#high`); un esfuerzo explícito reemplaza el `#` que ya traiga el modelo | texto libre `[a-z0-9_-]{1,20}` |
+| `local`, `mock` | no soportado: se rechaza con un mensaje claro | — |
+
+El esfuerzo efectivo queda en `RunRecord.effort` y `GET /api/agents` devuelve por agente `effort`, `effort_levels` (lista vacía = no soporta) y `model_editable`.
 - **Terminales**: vista con 1–4 paneles que muestran en vivo la salida de varias ejecuciones a la vez (stderr en rojo, autoscroll que se pausa si subes, cancelar/limpiar/cerrar). Las tareas nuevas se abren solas en un panel libre.
 
 ### Configuración inicial (`forja init`)
 
-`forja init` detecta los agentes instalados y te pregunta, con un valor por defecto que aceptas con Enter: qué agente orquesta, qué modelo usar por agente (muestra el default) y, si tienes Hermes, qué perfiles ocultar. Escribe `<store_dir>/settings.json` (por defecto `.forja/store/settings.json`) **fusionando** con lo que ya haya: no pisa otros campos, une los modelos y nunca quita perfiles ocultos. Al final imprime el comando para arrancar. `forja init --yes` no pregunta y acepta los defaults (también útil en scripts).
+`forja init` detecta los agentes instalados y te pregunta, con un valor por defecto que aceptas con Enter: qué agente orquesta, qué modelo y qué esfuerzo de razonamiento usar por agente (muestra el default del modelo; en el esfuerzo, Enter = sin configurar) y, si tienes Hermes, qué perfiles ocultar. Escribe `<store_dir>/settings.json` (por defecto `.forja/store/settings.json`) **fusionando** con lo que ya haya: no pisa otros campos, une los modelos y nunca quita perfiles ocultos. Al final imprime el comando para arrancar. `forja init --yes` no pregunta y acepta los defaults (también útil en scripts).
 
 Todo es opcional: sin `settings.json` Forja funciona con defaults y elige el orquestador automáticamente. `settings.json` admite, además de los campos de siempre:
 
@@ -59,6 +74,7 @@ Todo es opcional: sin `settings.json` Forja funciona con defaults y elige el orq
   "orchestrator_agent": "claude",
   "orchestrator_profile": null,
   "agent_models": { "claude": "sonnet" },
+  "agent_effort": { "claude": "high", "hermes": "medium" },
   "hidden_profiles": []
 }
 ```

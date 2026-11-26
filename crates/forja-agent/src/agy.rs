@@ -17,6 +17,8 @@ pub struct AgyCommandOptions {
     pub mode: String,
     pub timeout_secs: u64,
     pub worktree: PathBuf,
+    /// `--effort <nivel>`; None = no se pasa el flag.
+    pub effort: Option<String>,
 }
 
 impl AgyCommandOptions {
@@ -27,12 +29,13 @@ impl AgyCommandOptions {
             mode: DEFAULT_MODE.to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             worktree: worktree.into(),
+            effort: None,
         }
     }
 }
 
 pub fn build_command(opts: &AgyCommandOptions) -> Vec<String> {
-    vec![
+    let mut argv = vec![
         "agy".to_string(),
         "-p".to_string(),
         opts.prompt.clone(),
@@ -46,7 +49,12 @@ pub fn build_command(opts: &AgyCommandOptions) -> Vec<String> {
         format!("{}s", opts.timeout_secs),
         "--add-dir".to_string(),
         opts.worktree.to_string_lossy().into_owned(),
-    ]
+    ];
+    if let Some(effort) = &opts.effort {
+        argv.push("--effort".to_string());
+        argv.push(effort.clone());
+    }
+    argv
 }
 
 const TEXT_FIELDS: [&str; 4] = ["response", "text", "output", "message"];
@@ -125,6 +133,8 @@ pub struct AgyAgent {
     pub binary: String,
     pub model: String,
     pub mode: String,
+    /// Esfuerzo de razonamiento (`--effort`); None = no se pasa.
+    pub effort: Option<String>,
 }
 
 impl Default for AgyAgent {
@@ -139,7 +149,13 @@ impl AgyAgent {
             binary: "agy".to_string(),
             model: model.into(),
             mode: mode.into(),
+            effort: None,
         }
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
     }
 
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
@@ -163,6 +179,16 @@ impl Agent for AgyAgent {
         Some(Arc::new(copy))
     }
 
+    fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+
+    fn with_effort(&self, effort: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.effort = Some(effort.to_string());
+        Some(Arc::new(copy))
+    }
+
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
         Box::pin(async move {
             let opts = AgyCommandOptions {
@@ -171,6 +197,7 @@ impl Agent for AgyAgent {
                 mode: self.mode.clone(),
                 timeout_secs: ctx.timeout_secs,
                 worktree: ctx.worktree.clone(),
+                effort: self.effort.clone(),
             };
             let mut argv = build_command(&opts);
             argv[0] = self.binary.clone();
@@ -183,6 +210,18 @@ impl Agent for AgyAgent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agy_effort_flag_only_when_configured() {
+        let mut opts = AgyCommandOptions::new("p", "/tmp/wt");
+        assert!(!build_command(&opts).contains(&"--effort".to_string()));
+        opts.effort = Some("high".into());
+        let args = build_command(&opts);
+        let i = args.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(args[i + 1], "high");
+        let agent = Agent::with_effort(&AgyAgent::default(), "low").unwrap();
+        assert_eq!(agent.effort().as_deref(), Some("low"));
+    }
+
     use super::*;
 
     #[test]
