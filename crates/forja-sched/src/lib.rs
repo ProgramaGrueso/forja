@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use forja_agent::{Agent, RunContext};
 use forja_core::{ForjaError, Result, RunRecord, RunStatus, Task};
 use forja_store::JsonlStore;
-use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -35,10 +35,69 @@ impl SchedulerConfig {
     }
 }
 
+struct ConcurrencyState {
+    active: usize,
+    limit: usize,
+}
+
+struct ConcurrencyLimiter {
+    state: std::sync::Mutex<ConcurrencyState>,
+    notify: Notify,
+}
+
+struct ConcurrencyPermit {
+    limiter: Arc<ConcurrencyLimiter>,
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut st = self.limiter.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.active = st.active.saturating_sub(1);
+        drop(st);
+        self.limiter.notify.notify_waiters();
+    }
+}
+
+impl ConcurrencyLimiter {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(ConcurrencyState { active: 0, limit }),
+            notify: Notify::new(),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> ConcurrencyPermit {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.active < st.limit {
+                    st.active += 1;
+                    return ConcurrencyPermit {
+                        limiter: Arc::clone(self),
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn set_limit(&self, new_limit: usize) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.limit = new_limit;
+        drop(st);
+        self.notify.notify_waiters();
+    }
+
+    fn limit(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).limit
+    }
+}
+
 struct SchedulerInner {
     config: SchedulerConfig,
     store: JsonlStore,
-    semaphore: Arc<Semaphore>,
+    limiter: Arc<ConcurrencyLimiter>,
     runs: RwLock<HashMap<String, RunRecord>>,
     handles: Mutex<HashMap<String, JoinHandle<()>>>,
     store_lock: Mutex<()>,
@@ -65,14 +124,14 @@ impl Scheduler {
             runs_map.insert(record.id.clone(), record);
         }
 
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
+        let limiter = ConcurrencyLimiter::new(config.max_concurrency);
         let (events, _) = broadcast::channel(128);
 
         Ok(Self {
             inner: Arc::new(SchedulerInner {
                 config,
                 store,
-                semaphore,
+                limiter,
                 runs: RwLock::new(runs_map),
                 handles: Mutex::new(HashMap::new()),
                 store_lock: Mutex::new(()),
@@ -80,6 +139,20 @@ impl Scheduler {
                 events,
             }),
         })
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.inner.limiter.limit()
+    }
+
+    pub fn set_max_concurrency(&self, new_limit: usize) -> Result<()> {
+        if new_limit == 0 {
+            return Err(ForjaError::InvalidInput(
+                "max_concurrency debe ser al menos 1".to_string(),
+            ));
+        }
+        self.inner.limiter.set_limit(new_limit);
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RunRecord> {
@@ -209,10 +282,7 @@ impl Scheduler {
 }
 
 async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Agent>) {
-    let _permit = match Arc::clone(&inner.semaphore).acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => return,
-    };
+    let _permit = inner.limiter.acquire().await;
 
     let wt_path = inner.config.worktrees_dir.join(&run_id);
     let branch = inner
@@ -787,5 +857,48 @@ mod tests {
         assert_eq!(stored.status, RunStatus::Failed);
         assert_eq!(stored.attempts, 3);
         assert_eq!(stored.error, finished.error);
+    }
+
+    #[tokio::test]
+    async fn concurrency_dynamic_limit_updates_live() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let wt_dir = TempDir::new().expect("wt tempdir");
+        let store = JsonlStore::new(store_dir.path()).expect("store");
+
+        let mut config = SchedulerConfig::new(wt_dir.path());
+        config.max_concurrency = 1;
+        let scheduler = Scheduler::new(store, config).expect("scheduler");
+        assert_eq!(scheduler.max_concurrency(), 1);
+        assert!(scheduler.set_max_concurrency(0).is_err());
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let agent: Arc<dyn Agent> = Arc::new(CountingAgent {
+            delay: Duration::from_millis(80),
+            active: Arc::clone(&active),
+            max_observed: Arc::clone(&max_seen),
+        });
+
+        for i in 0..4 {
+            scheduler
+                .submit(
+                    Task::new(format!("Dyn {i}"), "p", Privacy::Open),
+                    Arc::clone(&agent),
+                )
+                .await
+                .expect("submit");
+        }
+
+        // Subir límite en caliente a 3 mientras hay tareas en cola
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        scheduler.set_max_concurrency(3).expect("subir a 3");
+        assert_eq!(scheduler.max_concurrency(), 3);
+
+        scheduler.wait_all().await;
+        assert!(
+            max_seen.load(Ordering::SeqCst) >= 2 && max_seen.load(Ordering::SeqCst) <= 3,
+            "esperaba concurrencia dinámica entre 2 y 3, observada: {}",
+            max_seen.load(Ordering::SeqCst)
+        );
     }
 }

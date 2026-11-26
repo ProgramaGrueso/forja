@@ -541,6 +541,7 @@ mod tests {
 
         let mut next = current.clone();
         next["max_concurrency"] = json!(4);
+        next["port"] = json!(7799);
         next["hide_mascot"] = json!(true);
         let put = |body: Value| {
             Request::builder()
@@ -557,7 +558,7 @@ mod tests {
             .await
             .expect("cuerpo");
         let body: Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(body["restart_required"], json!(["max_concurrency"]));
+        assert_eq!(body["restart_required"], json!(["port"]));
         assert_eq!(body["persisted"], true);
         assert!(path.exists());
 

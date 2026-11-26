@@ -11,8 +11,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use api::AgentMeta;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,6 +28,8 @@ use telemetry::Telemetry;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub scheduler: Scheduler,
@@ -36,6 +39,7 @@ pub struct AppState {
     pub quota: Arc<QuotaService>,
     pub settings: Arc<RwLock<Settings>>,
     pub settings_path: Option<PathBuf>,
+    pub auth_token: Option<String>,
 }
 
 impl AppState {
@@ -67,7 +71,14 @@ impl AppState {
             quota: Arc::new(QuotaService::with_defaults()),
             settings: Arc::new(RwLock::new(settings)),
             settings_path: None,
+            auth_token: None,
         }
+    }
+
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        let t = token.into();
+        self.auth_token = if t.trim().is_empty() { None } else { Some(t) };
+        self
     }
 
     pub fn with_agent(mut self, agent: Arc<dyn Agent>) -> Self {
@@ -106,6 +117,7 @@ impl AppState {
 
     pub(crate) fn on_settings_changed(&self, next: &Settings) {
         self.quota.set_manual_path(PathBuf::from(&next.quota_path));
+        let _ = self.scheduler.set_max_concurrency(next.max_concurrency);
     }
 
     fn get_agent(&self, kind: AgentKind) -> Option<Arc<dyn Agent>> {
@@ -162,8 +174,7 @@ impl IntoResponse for ApiError {
 const PANEL_HTML: &str = include_str!("panel.html");
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(panel_handler))
+    let protected = Router::new()
         .route("/events", get(events_handler))
         .route("/tasks", post(create_task))
         .route("/runs", get(list_runs))
@@ -173,13 +184,53 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/agents", get(api::agents))
         .route("/api/stats", get(api::stats))
         .route("/api/policy", get(api::policy))
-        .route("/api/health", get(api::health))
         .route("/api/quota", get(api::get_quota).put(api::put_quota))
         .route(
             "/api/settings",
             get(api::get_settings).put(api::put_settings),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .route("/", get(panel_handler))
+        .route("/api/health", get(api::health))
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
+}
+
+async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(expected) = state.auth_token.as_deref() else {
+        return next.run(req).await;
+    };
+
+    let bearer_ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|tok| tok == expected);
+
+    let query_ok = req.uri().query().is_some_and(|q| {
+        q.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(k, v)| k == "token" && v == expected)
+    });
+
+    if bearer_ok || query_ok {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "autenticación requerida (Authorization: Bearer <token>)".to_string(),
+            }),
+        )
+            .into_response()
+    }
 }
 
 async fn panel_handler() -> Html<&'static str> {
@@ -514,6 +565,86 @@ mod tests {
             let resp = app.clone().oneshot(req).await.expect("ejecutar POST");
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn api_body_limit_rejects_oversized_payload() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state);
+
+        let huge_prompt = "x".repeat(super::MAX_BODY_BYTES + 4096);
+        let payload = json!({ "titulo": "Grande", "prompt": huge_prompt });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tasks")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("POST gigante");
+
+        let resp = app.oneshot(req).await.expect("ejecutar POST gigante");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn api_bearer_auth_protects_routes_when_enabled() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state.with_auth_token("secreto-local-123"));
+
+        // /api/health sigue accesible sin token
+        let health_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .expect("GET health"),
+            )
+            .await
+            .expect("health");
+        assert_eq!(health_resp.status(), StatusCode::OK);
+
+        // /runs sin token -> 401
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/runs")
+                    .body(Body::empty())
+                    .expect("GET runs"),
+            )
+            .await
+            .expect("runs unauth");
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // /runs con Bearer correcto -> 200
+        let auth_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/runs")
+                    .header(header::AUTHORIZATION, "Bearer secreto-local-123")
+                    .body(Body::empty())
+                    .expect("GET runs auth"),
+            )
+            .await
+            .expect("runs auth");
+        assert_eq!(auth_ok.status(), StatusCode::OK);
+
+        // /events?token=... -> 200 (soporte EventSource)
+        let sse_ok = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/events?token=secreto-local-123")
+                    .body(Body::empty())
+                    .expect("GET events query token"),
+            )
+            .await
+            .expect("events auth");
+        assert_eq!(sse_ok.status(), StatusCode::OK);
     }
 
     #[tokio::test]

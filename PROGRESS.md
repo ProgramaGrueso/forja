@@ -316,7 +316,13 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
   7. Ajustes visuales tras inspeccionar capturas: cabecera móvil sin desbordamiento (`390x844`), `viewBox` dinámico en gráfico ancho CPU/RAM y redacción `"ahora mismo"` en lugar de `"hace ahora"`.
 
 ### U08 — Cierre y REPORTE_UI.md
-- `REPORTE_UI.md` redactado en una página. `./scripts/check.sh` en verde (`88 passed, 0 failed, 1 ignored`).
+- `REPORTE_UI.md` redactado en una página.
+
+### U09 — Mejoras de endurecimiento y operación en caliente (a petición de Juan)
+- **Concurrencia dinámica en caliente (`forja-sched` + `forja-server`):** `ConcurrencyLimiter` con `Mutex` + `Notify` + guard RAII cancel-safe; `Scheduler::set_max_concurrency()` aplica el nuevo límite al instante al guardar Ajustes sin reiniciar `forja serve`.
+- **Límite de cuerpo HTTP (`DefaultBodyLimit::max(256 KiB)`):** rechaza payloads sobredimensionados con `413 Payload Too Large`.
+- **Autenticación Bearer opcional (`forja serve --auth-token <token>`):** middleware en `forja-server` que protege `/api/*` (salvo `/api/health`), `/tasks`, `/runs*` y `/events` (acepta `Authorization: Bearer <token>` y `?token=` para `EventSource`), integrado en `panel.html` vía `apiFetch`.
+- Verificación: `node --check` sobre el JS embebido (`JS syntax OK`), `./scripts/check.sh` -> **91 passed, 0 failed, 1 ignored**, `cargo build --workspace --release` ok.
 
 ## Decisiones (Sesión UI)
 - Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.

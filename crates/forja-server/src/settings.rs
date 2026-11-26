@@ -63,9 +63,6 @@ impl Settings {
     /// Campos cuyo cambio exige reiniciar `forja serve` para tener efecto.
     pub fn restart_required(&self, previous: &Settings) -> Vec<&'static str> {
         let mut fields = Vec::new();
-        if self.max_concurrency != previous.max_concurrency {
-            fields.push("max_concurrency");
-        }
         if self.store_dir != previous.store_dir {
             fields.push("store_dir");
         }
@@ -166,10 +163,7 @@ mod tests {
 
         next.port = 7788;
         next.max_concurrency = 4;
-        assert_eq!(
-            next.restart_required(&prev),
-            vec!["max_concurrency", "port"]
-        );
+        assert_eq!(next.restart_required(&prev), vec!["port"]);
     }
 
     #[test]

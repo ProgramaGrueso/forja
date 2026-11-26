@@ -2199,9 +2199,23 @@
         }
       }
 
-      /* Acciones HTTP */
+      /* Acciones HTTP (soporta token Bearer opcional vía sessionStorage o ?token=) */
+      const urlToken = new URLSearchParams(window.location.search).get("token");
+      if (urlToken) {
+        try { sessionStorage.setItem("forja_auth_token", urlToken); } catch (_) {}
+      }
+      function getAuthToken() {
+        try { return sessionStorage.getItem("forja_auth_token") || ""; } catch (_) { return ""; }
+      }
+      function apiFetch(url, opts = {}) {
+        const tok = getAuthToken();
+        const headers = Object.assign({}, opts.headers || {});
+        if (tok) headers["Authorization"] = `Bearer ${tok}`;
+        return fetch(url, Object.assign({}, opts, { headers }));
+      }
+
       async function cancelRun(runId) {
-        await fetch(`/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+        await apiFetch(`/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
         await refreshCore();
       }
 
@@ -2222,12 +2236,17 @@
       async function refreshCore() {
         try {
           const [runsR, agentsR, statsR, policyR, settingsR] = await Promise.all([
-            fetch("/runs"),
-            fetch("/api/agents"),
-            fetch("/api/stats"),
-            fetch("/api/policy"),
-            fetch("/api/settings"),
+            apiFetch("/runs"),
+            apiFetch("/api/agents"),
+            apiFetch("/api/stats"),
+            apiFetch("/api/policy"),
+            apiFetch("/api/settings"),
           ]);
+          if (runsR.status === 401) {
+            $("conn-dot").className = "dot error";
+            $("conn-text").textContent = "Token requerido (401)";
+            return;
+          }
           if (runsR.ok) {
             state.runs = await runsR.json();
             state.initializedRuns = true;
@@ -2257,7 +2276,7 @@
 
       async function refreshTelemetry() {
         try {
-          const r = await fetch("/api/telemetry");
+          const r = await apiFetch("/api/telemetry");
           if (r.ok) {
             state.telemetry = await r.json();
             renderTelemetry();
@@ -2269,7 +2288,7 @@
 
       async function refreshQuota(forceForm) {
         try {
-          const r = await fetch("/api/quota");
+          const r = await apiFetch("/api/quota");
           if (r.ok) {
             state.quota = await r.json();
             renderProviderBar();
@@ -2283,7 +2302,9 @@
       let retryMs = 1000;
       function connectSse() {
         if (es) { try { es.close(); } catch (_) {} }
-        es = new EventSource("/events");
+        const tok = getAuthToken();
+        const sseUrl = tok ? `/events?token=${encodeURIComponent(tok)}` : "/events";
+        es = new EventSource(sseUrl);
         es.onopen = () => {
           retryMs = 1000;
           state.sseConnected = true;
@@ -2294,10 +2315,10 @@
           try {
             const rec = JSON.parse(ev.data);
             upsertRun(rec);
-            fetch("/api/stats").then((r) => r.ok ? r.json() : null).then((st) => {
+            apiFetch("/api/stats").then((r) => r.ok ? r.json() : null).then((st) => {
               if (st) { state.stats = st; renderSummary(); }
             });
-            fetch("/api/agents").then((r) => r.ok ? r.json() : null).then((ag) => {
+            apiFetch("/api/agents").then((r) => r.ok ? r.json() : null).then((ag) => {
               if (ag) { state.agents = ag; renderSidebar(); renderAgentsView(); }
             });
           } catch (_) {}
@@ -2421,7 +2442,7 @@
           privacidad: $("nt-privacy").value,
           agent: $("nt-agent").value,
         };
-        const resp = await fetch("/tasks", {
+        const resp = await apiFetch("/tasks", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
@@ -2451,7 +2472,7 @@
           quota_path: $("set-quota-path").value.trim(),
           hide_mascot: $("set-hide-mascot").checked,
         };
-        const resp = await fetch("/api/settings", {
+        const resp = await apiFetch("/api/settings", {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
@@ -2490,7 +2511,7 @@
             providers[id] = entry;
           }
         });
-        const resp = await fetch("/api/quota", {
+        const resp = await apiFetch("/api/quota", {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ providers }),

@@ -2,7 +2,7 @@
 
 - **Rama:** `noche/forja-ui` (desde `noche/forja @ 6b488fb`, sin `push`, `main` intacta)
 - **Ventana:** `2026-11-26T05:22:31-05:00` → `2026-11-26T06:02:00-05:00` (~40 min de 3 h)
-- **Verificación final:** `./scripts/check.sh` -> **exit 0** (`88 passed, 0 failed, 1 ignored`), `cargo build --workspace --release` ok, cero URLs externas (`http://`, `https://`, `<script src`, `<link href`) en `panel.html`.
+- **Verificación final:** `./scripts/check.sh` -> **exit 0** (`91 passed, 0 failed, 1 ignored`), `node --check` ok sobre el JS embebido, `cargo build --workspace --release` ok, cero URLs externas (`http://`, `https://`, `<script src`, `<link href`) en `panel.html`.
 
 ## Qué se hizo (`U01`–`U08`)
 - **Backend modular (sin dependencias nuevas):**
@@ -15,11 +15,11 @@
   - Barra fija inferior de proveedores estilo Hermes Desktop con anillos SVG de progreso, colores por umbral (`>80 %` ámbar, `>92 %` rojo), `"sin dato"` apagado, popover detallado y estado SSE + versión a la derecha.
   - Mascota chibi pelirroja original en SVG inline reactiva a estados reales (`idle`, `working`, `celebrate`, `worried`), con `prefers-reduced-motion`, globo interactivo al clic y opción de ocultarla en Ajustes.
   - 6 vistas completas (`Resumen`, `Ejecuciones` con SSE y panel lateral deslizable, `Agentes`, `Telemetría` con gráficos SVG de 5 min y guías 80 %/92 %, `Cuotas` con editor de `quota.json`, `Ajustes`) y modal `Nueva tarea` con política `Sensitive` en vivo.
-- **Auditoría adversaria aplicada:** bloqueo de `..`, `\0` y rutas protegidas (`.hermes`, `.ssh`, `.gnupg`, `.env`) en `PUT /api/settings`; rechazo de tareas con título/prompt vacíos (`400`); sondeo paralelo de cuotas (`1.40 s` en frío vs ~5.5 s); corrección del clic de la mascota, del refresco DOM cada 1 s y de la cabecera móvil.
+- **Auditoría adversaria y mejoras aplicadas:** bloqueo de `..`, `\0` y rutas protegidas (`.hermes`, `.ssh`, `.gnupg`, `.env`) en `PUT /api/settings`; rechazo de tareas vacías (`400`); límite de cuerpo `256 KiB` (`413`); concurrencia dinámica en caliente sin reinicio (`Scheduler::set_max_concurrency`); autenticación Bearer opcional (`--auth-token`); sondeo paralelo de cuotas (`1.40 s` en frío vs ~5.5 s); correcciones de mascota, refresco DOM 1 s y cabecera móvil.
 
 ## Qué quedó fuera / observaciones
 - Nada del plan quedó pendiente.
-- **Mejoras recomendadas a futuro:** (1) autenticar el dashboard si se expone fuera de `127.0.0.1` (hoy escucha solo en loopback); (2) limitar tamaño de cuerpo HTTP (`DefaultBodyLimit`) en `POST /tasks`; (3) reconectar cambios de `max_concurrency` en caliente sin reiniciar `forja serve`; (4) conectar `ClaudeAgent` a un CLI/API real cuando Juan decida el protocolo.
+- Único punto abierto a futuro: conectar `ClaudeAgent` (hoy stub `NotConfigured`) al CLI/API real cuando Juan defina el protocolo deseado.
 
 ## Decisiones y dependencias
 - **Dependencias nuevas:** ninguna (`0` añadidas en Cargo ni en frontend).

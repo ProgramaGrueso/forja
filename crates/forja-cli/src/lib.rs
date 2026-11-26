@@ -52,6 +52,10 @@ pub enum Command {
     Serve {
         #[arg(long, default_value_t = 7777)]
         port: u16,
+
+        /// Token Bearer opcional para proteger las rutas /api/*, /tasks, /runs y /events.
+        #[arg(long)]
+        auth_token: Option<String>,
     },
 }
 
@@ -139,7 +143,7 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
             write_runs_table(&runs, out)?;
             Ok(())
         }
-        Command::Serve { port } => {
+        Command::Serve { port, auth_token } => {
             let settings_path = cli.store_dir.join("settings.json");
             let persisted = forja_server::settings::load_settings(&settings_path)
                 .ok()
@@ -173,9 +177,12 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
                 hide_mascot,
             };
 
-            let state = AppState::new(scheduler)
+            let mut state = AppState::new(scheduler)
                 .with_settings(settings)
                 .with_settings_path(settings_path);
+            if let Some(token) = auth_token {
+                state = state.with_auth_token(token);
+            }
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             writeln!(out, "http://127.0.0.1:{port}")?;
             out.flush()?;
@@ -301,7 +308,10 @@ mod tests {
     fn parse_serve_subcommand() {
         let cli = Cli::try_parse_from(["forja", "serve", "--port", "7777"]).expect("parsear serve");
         match cli.command {
-            Command::Serve { port } => assert_eq!(port, 7777),
+            Command::Serve { port, auth_token } => {
+                assert_eq!(port, 7777);
+                assert!(auth_token.is_none());
+            }
             other => panic!("subcomando inesperado: {other:?}"),
         }
     }
