@@ -2,3 +2,9 @@
 name = "forja-git"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+forja-core = { path = "../forja-core" }
+
+[dev-dependencies]
+tempfile = "3"
