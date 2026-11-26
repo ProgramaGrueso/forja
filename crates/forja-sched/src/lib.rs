@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use forja_agent::{Agent, RunContext};
 use forja_core::{ForjaError, Result, RunRecord, RunStatus, Task};
 use forja_store::JsonlStore;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -43,6 +43,7 @@ struct SchedulerInner {
     handles: Mutex<HashMap<String, JoinHandle<()>>>,
     store_lock: Mutex<()>,
     git_lock: Mutex<()>,
+    events: broadcast::Sender<RunRecord>,
 }
 
 #[derive(Clone)]
@@ -65,6 +66,7 @@ impl Scheduler {
         }
 
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
+        let (events, _) = broadcast::channel(128);
 
         Ok(Self {
             inner: Arc::new(SchedulerInner {
@@ -75,8 +77,13 @@ impl Scheduler {
                 handles: Mutex::new(HashMap::new()),
                 store_lock: Mutex::new(()),
                 git_lock: Mutex::new(()),
+                events,
             }),
         })
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RunRecord> {
+        self.inner.events.subscribe()
     }
 
     pub async fn submit(&self, task: Task, agent: Arc<dyn Agent>) -> Result<RunRecord> {
@@ -103,6 +110,7 @@ impl Scheduler {
             self.inner.store.append_run(&record)?;
             let mut runs = self.inner.runs.write().await;
             runs.insert(run_id.clone(), record.clone());
+            let _ = self.inner.events.send(record.clone());
         }
 
         let inner = Arc::clone(&self.inner);
@@ -192,6 +200,7 @@ impl Scheduler {
 
         if let Some(record) = updated {
             self.inner.store.append_run(&record)?;
+            let _ = self.inner.events.send(record.clone());
             Ok(record)
         } else {
             Err(ForjaError::NotFound(run_id.to_string()))
@@ -230,6 +239,7 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
             record.clone()
         };
         let _ = inner.store.append_run(&maybe_record);
+        let _ = inner.events.send(maybe_record.clone());
         maybe_record.task
     };
 
@@ -261,6 +271,7 @@ async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Age
             record.clone()
         };
         let _ = inner.store.append_run(&updated);
+        let _ = inner.events.send(updated);
     }
 
     let mut handles = inner.handles.lock().await;
@@ -333,6 +344,7 @@ async fn execute_with_retries(
                         record.clone()
                     };
                     let _ = inner.store.append_run(&maybe_record);
+                    let _ = inner.events.send(maybe_record);
                 } else {
                     return Err(err);
                 }

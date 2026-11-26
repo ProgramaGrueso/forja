@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,6 +14,8 @@ use forja_agent::{Agent, AgyAgent, MockAgent};
 use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, Task};
 use forja_sched::Scheduler;
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -90,6 +95,7 @@ const PANEL_HTML: &str = include_str!("panel.html");
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(panel_handler))
+        .route("/events", get(events_handler))
         .route("/tasks", post(create_task))
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
@@ -99,6 +105,17 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn panel_handler() -> Html<&'static str> {
     Html(PANEL_HTML)
+}
+
+async fn events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.scheduler.subscribe()).filter_map(|msg| match msg {
+        Ok(record) => Event::default().event("run").json_data(record).ok().map(Ok),
+        Err(_) => None,
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
@@ -414,5 +431,54 @@ mod tests {
         assert!(body.contains("Cancelar"));
         assert!(body.contains("/cancel"));
         assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn events_sse_streams_run_updates() {
+        use tokio_stream::StreamExt;
+
+        let (state, _store_dir, _wt_dir) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/events")
+            .body(Body::empty())
+            .expect("construir request GET /events");
+
+        let resp = app.oneshot(req).await.expect("ejecutar GET /events");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .expect("content-type SSE presente");
+        assert!(content_type.contains("text/event-stream"));
+
+        let task = forja_core::Task::new("SSE demo", "prompt sse", Privacy::Open);
+        let submitted = scheduler
+            .submit(task, Arc::new(MockAgent::success("hecho")))
+            .await
+            .expect("encolar tarea para SSE");
+
+        let mut stream = resp.into_body().into_data_stream();
+        let first_chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("no debe expirar esperando evento SSE")
+            .expect("debe llegar al menos un chunk SSE")
+            .expect("chunk SSE válido");
+
+        let text = String::from_utf8(first_chunk.to_vec()).expect("UTF-8 válido");
+        assert!(
+            text.contains("event: run"),
+            "esperaba event: run en: {text}"
+        );
+        assert!(
+            text.contains(&submitted.id),
+            "esperaba id {} en: {text}",
+            submitted.id
+        );
     }
 }
