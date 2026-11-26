@@ -33,7 +33,7 @@ impl AgentMeta {
         let (provider, model) = match kind {
             AgentKind::Mock => ("Local", "mock"),
             AgentKind::Agy => ("Gemini", forja_agent::agy::DEFAULT_MODEL),
-            AgentKind::Claude => ("Anthropic", "sin configurar"),
+            AgentKind::Claude => ("Anthropic", forja_agent::claude::DEFAULT_MODEL),
             AgentKind::Opencode => ("OpenCode", forja_agent::opencode::DEFAULT_MODEL),
             AgentKind::Hermes => ("Hermes", forja_agent::hermes::DEFAULT_PROFILE),
             AgentKind::Local => ("Local", forja_agent::local::DEFAULT_MODEL),
@@ -556,14 +556,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_agents_lists_five_available_plus_claude() {
+    async fn api_agents_lists_all_six_available() {
         let (state, _s, _w) = state();
         let app = build_router(state);
 
         let (status, agents) = get_json(app, "/api/agents").await;
         assert_eq!(status, StatusCode::OK);
         let arr = agents.as_array().expect("array de agentes");
-        assert_eq!(arr.len(), 6, "deben listar 5 agentes disponibles + claude");
+        assert_eq!(arr.len(), 6, "deben listar los 6 agentes");
 
         let by_name = |name: &str| {
             arr.iter()
@@ -571,14 +571,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("falta agente {name}"))
         };
 
-        for name in ["mock", "agy", "opencode", "hermes", "local"] {
+        for name in ["mock", "agy", "claude", "opencode", "hermes", "local"] {
             assert_eq!(
                 by_name(name)["available"],
                 true,
                 "{name} debe estar available"
             );
         }
-        assert_eq!(by_name("claude")["available"], false);
+        assert_eq!(by_name("claude")["provider"], "Anthropic");
+        assert_eq!(by_name("claude")["model"], "sonnet");
 
         assert_eq!(by_name("opencode")["provider"], "OpenCode");
         assert_eq!(

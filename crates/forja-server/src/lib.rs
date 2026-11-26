@@ -19,7 +19,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use forja_agent::{Agent, AgyAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent};
+use forja_agent::{
+    Agent, AgyAgent, ClaudeAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent,
+};
 use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, Task};
 use forja_sched::Scheduler;
 use models::ModelService;
@@ -50,13 +52,14 @@ impl AppState {
         let mut agents: HashMap<AgentKind, Arc<dyn Agent>> = HashMap::new();
         agents.insert(AgentKind::Mock, Arc::new(MockAgent::default()));
         agents.insert(AgentKind::Agy, Arc::new(AgyAgent::default()));
+        agents.insert(AgentKind::Claude, Arc::new(ClaudeAgent::default()));
         agents.insert(AgentKind::Opencode, Arc::new(OpencodeAgent::default()));
         agents.insert(AgentKind::Hermes, Arc::new(HermesAgent::default()));
         agents.insert(AgentKind::Local, Arc::new(LocalAgent::default()));
 
         let metas = vec![
             AgentMeta::default_for(AgentKind::Agy, true),
-            AgentMeta::default_for(AgentKind::Claude, false),
+            AgentMeta::default_for(AgentKind::Claude, true),
             AgentMeta::default_for(AgentKind::Hermes, true),
             AgentMeta::default_for(AgentKind::Local, true),
             AgentMeta::default_for(AgentKind::Mock, true),
@@ -99,6 +102,18 @@ impl AppState {
             meta.available = true;
         } else {
             metas.push(AgentMeta::default_for(kind, true));
+        }
+        self
+    }
+
+    /// Quita un agente (queda como no configurado).
+    pub fn without_agent(mut self, kind: AgentKind) -> Self {
+        Arc::make_mut(&mut self.agents).remove(&kind);
+        if let Some(meta) = Arc::make_mut(&mut self.metas)
+            .iter_mut()
+            .find(|m| m.kind == kind)
+        {
+            meta.available = false;
         }
         self
     }
@@ -541,6 +556,7 @@ mod tests {
     #[tokio::test]
     async fn api_post_task_unconfigured_agent_returns_400() {
         let (state, _store_dir, _wt_dir) = test_state();
+        let state = state.without_agent(AgentKind::Claude);
         let app = build_router(state);
 
         let payload = json!({
