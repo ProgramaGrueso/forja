@@ -140,13 +140,42 @@ pub async fn execute_with_writer<W: Write>(cli: Cli, out: &mut W) -> Result<()> 
             Ok(())
         }
         Command::Serve { port } => {
-            let scheduler = build_scheduler(
-                &cli.store_dir,
-                &cli.worktrees_dir,
-                cli.repo,
-                cli.base_branch,
-            )?;
-            let state = AppState::new(scheduler);
+            let settings_path = cli.store_dir.join("settings.json");
+            let persisted = forja_server::settings::load_settings(&settings_path)
+                .ok()
+                .flatten();
+
+            let max_concurrency = persisted.as_ref().map(|s| s.max_concurrency).unwrap_or(2);
+
+            let quota_path = persisted
+                .as_ref()
+                .map(|s| s.quota_path.clone())
+                .unwrap_or_else(|| {
+                    forja_server::quota::default_manual_path()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+
+            let hide_mascot = persisted.as_ref().is_some_and(|s| s.hide_mascot);
+
+            let store = JsonlStore::new(&cli.store_dir)?;
+            let mut sched_cfg = SchedulerConfig::new(&cli.worktrees_dir);
+            sched_cfg.max_concurrency = max_concurrency;
+            sched_cfg.repo_path = cli.repo;
+            sched_cfg.base_branch = cli.base_branch;
+            let scheduler = Scheduler::new(store, sched_cfg)?;
+
+            let settings = forja_server::settings::Settings {
+                max_concurrency,
+                store_dir: cli.store_dir.to_string_lossy().into_owned(),
+                port,
+                quota_path,
+                hide_mascot,
+            };
+
+            let state = AppState::new(scheduler)
+                .with_settings(settings)
+                .with_settings_path(settings_path);
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             writeln!(out, "http://127.0.0.1:{port}")?;
             out.flush()?;

@@ -271,6 +271,22 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 - Sondeo real (solo lectura) de `hermes usage` para copilot, deepseek, nous y gemini: los cuatro salen con código 1 ("No account usage available for provider ..."). Por tanto esos chips mostrarán "sin dato" salvo que Juan rellene `~/.config/forja/quota.json`.
 - Herramientas presentes: `/usr/bin/nvidia-smi` (RTX 4070 Ti SUPER, 16376 MiB), `/usr/bin/chromium` (para capturas headless).
 
+### U02 — Telemetría backend
+- Integrada desde `noche/forja-ui-U02` (`34cb684`): `crates/forja-server/src/telemetry.rs` con `GpuSource`, `SystemSource`, `NvidiaSmiGpu`, `ProcSystem`, parseo y `Telemetry` con buffer circular de 150 muestras cada 2 s.
+- Verificación: `cargo test -p forja-server telemetry` -> `7 passed; 0 failed`.
+
+### U03 — Cuotas backend
+- Integrada desde `noche/forja-ui-U03` (`ded2955` -> merge `334f84a`): `crates/forja-server/src/quota.rs` con `UsageCommand`, `HermesCli` (timeout 15 s), caché TTL 60 s, `ManualQuotaFile` (`~/.config/forja/quota.json`) y fixtures (`hermes_usage_anthropic.json`, `hermes_usage_broken.json`, `hermes_usage_unavailable.json`).
+- Verificación: `cargo test -p forja-server quota` -> `7 passed; 0 failed`.
+
+### U04 — Rutas API y Ajustes
+- Implementados `crates/forja-server/src/settings.rs` y `crates/forja-server/src/api.rs`; cableados en `AppState`, `build_router`, `serve` (sampler de telemetría en segundo plano) y `forja serve`.
+- Rutas añadidas: `GET /api/telemetry`, `GET /api/agents`, `GET /api/stats`, `GET /api/policy`, `GET /api/health`, `GET/PUT /api/quota`, `GET/PUT /api/settings` (conservando `/tasks`, `/runs`, `/runs/{id}`, `/runs/{id}/cancel`, `/events`).
+- Verificación: `cargo test -p forja-server api_` -> `11 passed; 0 failed`.
+
+### U05 — Frontend mínimo obligatorio (en curso)
+- Construyendo dashboard completo tipo Hermes Desktop en `crates/forja-server/src/panel.html`.
+
 ## Decisiones (Sesión UI)
 - Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.
 - Fechas como texto ISO-8601 tal como llegan (no hay `chrono`); la antigüedad ("hace 3 h") se calcula en el navegador.
@@ -283,5 +299,5 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 ## Subagentes (Sesión UI)
 | Hora | Tarea | Rama | Modelo | Resultado |
 |------|-------|------|--------|-----------|
-| 05:24 | U02 | noche/forja-ui-U02 | gemini-4-neon-medium | en curso |
-| 05:24 | U03 | noche/forja-ui-U03 | gemini-4-neon-medium | en curso |
+| 05:24 | U02 | noche/forja-ui-U02 | gemini-4-neon-medium | aceptado (7/7 tests telemetry + check.sh en verde) |
+| 05:24 | U03 | noche/forja-ui-U03 | gemini-4-neon-medium | aceptado (7/7 tests quota + fixtures + check.sh en verde) |

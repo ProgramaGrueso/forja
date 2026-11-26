@@ -1,12 +1,16 @@
+pub mod api;
 pub mod quota;
+pub mod settings;
 pub mod telemetry;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use api::AgentMeta;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -16,7 +20,10 @@ use axum::{Json, Router};
 use forja_agent::{Agent, AgyAgent, MockAgent};
 use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, Task};
 use forja_sched::Scheduler;
+use quota::{default_manual_path, QuotaService};
 use serde::{Deserialize, Serialize};
+use settings::Settings;
+use telemetry::Telemetry;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -24,6 +31,11 @@ use tokio_stream::StreamExt;
 pub struct AppState {
     pub scheduler: Scheduler,
     agents: Arc<HashMap<AgentKind, Arc<dyn Agent>>>,
+    pub(crate) metas: Arc<Vec<AgentMeta>>,
+    pub telemetry: Telemetry,
+    pub quota: Arc<QuotaService>,
+    pub settings: Arc<RwLock<Settings>>,
+    pub settings_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -31,15 +43,69 @@ impl AppState {
         let mut agents: HashMap<AgentKind, Arc<dyn Agent>> = HashMap::new();
         agents.insert(AgentKind::Mock, Arc::new(MockAgent::default()));
         agents.insert(AgentKind::Agy, Arc::new(AgyAgent::default()));
+
+        let metas = vec![
+            AgentMeta::default_for(AgentKind::Agy, true),
+            AgentMeta::default_for(AgentKind::Claude, false),
+            AgentMeta::default_for(AgentKind::Mock, true),
+        ];
+
+        let default_quota = default_manual_path();
+        let settings = Settings {
+            max_concurrency: 2,
+            store_dir: ".forja/store".to_string(),
+            port: 7777,
+            quota_path: default_quota.to_string_lossy().into_owned(),
+            hide_mascot: false,
+        };
+
         Self {
             scheduler,
             agents: Arc::new(agents),
+            metas: Arc::new(metas),
+            telemetry: Telemetry::with_defaults(),
+            quota: Arc::new(QuotaService::with_defaults()),
+            settings: Arc::new(RwLock::new(settings)),
+            settings_path: None,
         }
     }
 
     pub fn with_agent(mut self, agent: Arc<dyn Agent>) -> Self {
-        Arc::make_mut(&mut self.agents).insert(agent.kind(), agent);
+        let kind = agent.kind();
+        Arc::make_mut(&mut self.agents).insert(kind, agent);
+        let metas = Arc::make_mut(&mut self.metas);
+        if let Some(meta) = metas.iter_mut().find(|m| m.kind == kind) {
+            meta.available = true;
+        } else {
+            metas.push(AgentMeta::default_for(kind, true));
+        }
         self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_quota(mut self, quota: Arc<QuotaService>) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    pub fn with_settings(self, settings: Settings) -> Self {
+        self.quota
+            .set_manual_path(PathBuf::from(&settings.quota_path));
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
+        self
+    }
+
+    pub fn with_settings_path(mut self, path: PathBuf) -> Self {
+        self.settings_path = Some(path);
+        self
+    }
+
+    pub(crate) fn on_settings_changed(&self, next: &Settings) {
+        self.quota.set_manual_path(PathBuf::from(&next.quota_path));
     }
 
     fn get_agent(&self, kind: AgentKind) -> Option<Arc<dyn Agent>> {
@@ -103,6 +169,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/api/telemetry", get(api::get_telemetry))
+        .route("/api/agents", get(api::agents))
+        .route("/api/stats", get(api::stats))
+        .route("/api/policy", get(api::policy))
+        .route("/api/health", get(api::health))
+        .route("/api/quota", get(api::get_quota).put(api::put_quota))
+        .route(
+            "/api/settings",
+            get(api::get_settings).put(api::put_settings),
+        )
         .with_state(state)
 }
 
@@ -123,7 +199,10 @@ async fn events_handler(
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, build_router(state)).await?;
+    let sampler = state.telemetry.spawn_sampler();
+    let res = axum::serve(listener, build_router(state)).await;
+    sampler.abort();
+    res?;
     Ok(())
 }
 
