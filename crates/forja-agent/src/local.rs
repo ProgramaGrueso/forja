@@ -210,10 +210,10 @@ mod tests {
         (listener, port)
     }
 
+    /// Puerto en el que nada escucha. Se usa el 1 (tcpmux) y no uno efímero liberado:
+    /// otro test en paralelo podría ocuparlo justo antes del sondeo.
     fn free_port() -> u16 {
-        let (listener, port) = live_port();
-        drop(listener);
-        port
+        1
     }
 
     fn ctx(worktree: &Path, prompt: &str, timeout_secs: u64) -> RunContext {
