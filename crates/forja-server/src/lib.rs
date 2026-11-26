@@ -1,5 +1,6 @@
 pub mod api;
 pub mod models;
+pub mod orchestrator;
 pub mod quota;
 pub mod settings;
 pub mod telemetry;
@@ -45,6 +46,7 @@ pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     pub settings_path: Option<PathBuf>,
     pub auth_token: Option<String>,
+    pub orchestrator: orchestrator::Orchestrator,
 }
 
 impl AppState {
@@ -85,7 +87,13 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             settings_path: None,
             auth_token: None,
+            orchestrator: orchestrator::Orchestrator::from_env(),
         }
+    }
+
+    pub fn with_orchestrator(mut self, orchestrator: orchestrator::Orchestrator) -> Self {
+        self.orchestrator = orchestrator;
+        self
     }
 
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
@@ -214,6 +222,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/agents", get(api::agents))
         .route("/api/stats", get(api::stats))
         .route("/api/models", get(api::get_models))
+        .route("/api/orchestrator/chat", post(orchestrator::chat))
+        .route("/api/orchestrator/reset", post(orchestrator::reset))
         .route("/api/policy", get(api::policy))
         .route("/api/quota", get(api::get_quota).put(api::put_quota))
         .route(
@@ -786,6 +796,8 @@ mod tests {
 
         for id in [
             "view-resumen",
+            "view-orquestador",
+            "orq-call",
             "view-ejecuciones",
             "view-agentes",
             "view-telemetria",

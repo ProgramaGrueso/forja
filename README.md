@@ -29,6 +29,13 @@ Sin instalar, desde el repo de Forja: `cargo run -p forja-cli -- doctor`.
 
 Cada tarea trabaja en un *worktree* (copia aislada) del repo en su propia rama `forja/...`; tu rama de trabajo no se toca hasta que tú decidas fusionar.
 
+### Orquestador con voz
+
+En el panel, pestaña **Orquestador**: conversas por texto o pulsas **Llamar** para hablar y que te responda en voz alta, como una llamada. Él delega el trabajo en los agentes de Forja y revisa el resultado antes de decirte que está listo.
+
+- Usa Hermes como cerebro: `export FORJA_ORCHESTRATOR_PROFILE=tu-perfil` (por defecto `default`; solo perfiles de la lista blanca).
+- La voz usa el navegador (Web Speech API): funciona en Chrome, Edge y Chromium, necesita internet y permiso de micrófono.
+
 ### Si algo falla
 
 - `cargo: command not found`: instala Rust desde https://rustup.rs.

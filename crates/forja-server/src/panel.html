@@ -1001,6 +1001,18 @@
       .view-subtitle { display: none; }
       .topbar-actions .btn { padding: 5px 9px; font-size: 12px; white-space: nowrap; }
     }
+
+    /* Orquestador (chat y llamada de voz) */
+    .orq-wrap { display: flex; flex-direction: column; height: calc(100vh - var(--topbar-h) - var(--provider-bar-h) - 90px); min-height: 360px; gap: 12px; }
+    .orq-log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 14px; background: var(--bg-panel); border: 1px solid var(--border-dim); border-radius: 10px; }
+    .orq-msg { max-width: 78%; padding: 9px 13px; border-radius: 12px; line-height: 1.45; white-space: pre-wrap; font-size: 14px; }
+    .orq-msg.user { align-self: flex-end; background: var(--violet-dim); border: 1px solid var(--border-gothic); }
+    .orq-msg.bot { align-self: flex-start; background: var(--bg-elevated); border: 1px solid var(--border-mid); }
+    .orq-msg.sys { align-self: center; color: var(--text-muted); font-size: 12px; }
+    .orq-bar { display: flex; gap: 8px; align-items: center; }
+    .orq-bar input { flex: 1; background: var(--bg-elevated); border: 1px solid var(--border-mid); border-radius: 8px; color: var(--text-main); padding: 10px 12px; font: inherit; }
+    .orq-call.on { background: var(--emerald-dim); border-color: var(--emerald); color: var(--emerald); box-shadow: 0 0 14px var(--emerald-glow); }
+    .orq-status { font-size: 12px; color: var(--text-muted); min-height: 16px; }
   </style>
 </head>
 <body>
@@ -1035,6 +1047,10 @@
         <button class="nav-item active" data-view="resumen">
           <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>
           <span class="nav-label">Resumen</span>
+        </button>
+        <button class="nav-item" data-view="orquestador">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+          <span class="nav-label">Orquestador</span>
         </button>
         <button class="nav-item" data-view="ejecuciones">
           <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
@@ -1289,6 +1305,22 @@
           <div id="models-grid" class="grid-cards"></div>
         </section>
 
+        <!-- VISTA: ORQUESTADOR -->
+        <section id="view-orquestador" class="view-pane" aria-label="Vista Orquestador">
+          <div class="orq-wrap">
+            <div id="orq-log" class="orq-log" aria-live="polite">
+              <div class="orq-msg sys">Háblale o escríbele. Él delega las tareas en los agentes y revisa el resultado antes de responderte.</div>
+            </div>
+            <div id="orq-status" class="orq-status"></div>
+            <form id="orq-form" class="orq-bar" autocomplete="off">
+              <button id="orq-call" class="btn orq-call" type="button" title="Llamada de voz: él escucha y te responde hablando">Llamar</button>
+              <input id="orq-input" type="text" placeholder="Escribe un mensaje al orquestador" aria-label="Mensaje al orquestador">
+              <button class="btn btn-primary" type="submit">Enviar</button>
+              <button id="orq-reset" class="btn" type="button" title="Empezar una conversación nueva">Nueva</button>
+            </form>
+          </div>
+        </section>
+
         <!-- VISTA 4: TELEMETRÍA -->
         <section id="view-telemetria" class="view-pane" aria-label="Vista Telemetría">
           <div class="kpi-grid">
@@ -1495,6 +1527,7 @@
       };
 
       const VIEW_META = {
+        orquestador: ["Orquestador", "Conversa por texto o por voz; delega en los agentes y revisa sus resultados"],
         resumen: ["Resumen", "Estado general del orquestador y actividad en las últimas 24 h"],
         ejecuciones: ["Ejecuciones", "Cola en vivo conectada por Server-Sent Events (/events)"],
         agentes: ["Agentes", "Rendimiento, disponibilidad y carga por adaptador"],
@@ -2630,6 +2663,131 @@
         }
       }
       window.addEventListener("hashchange", applyHashRoute);
+
+      /* Orquestador: chat + llamada de voz (Web Speech API del navegador) */
+      (function orquestador() {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const log = $("orq-log");
+        const input = $("orq-input");
+        const statusEl = $("orq-status");
+        const callBtn = $("orq-call");
+        let inCall = false;
+        let busy = false;
+        let rec = null;
+
+        function add(kind, text) {
+          const d = document.createElement("div");
+          d.className = `orq-msg ${kind}`;
+          d.textContent = text;
+          log.appendChild(d);
+          log.scrollTop = log.scrollHeight;
+        }
+        function setStatus(t) { statusEl.textContent = t || ""; }
+
+        function speak(text) {
+          return new Promise((resolve) => {
+            if (!window.speechSynthesis) { resolve(); return; }
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = "es-419";
+            const voices = window.speechSynthesis.getVoices().filter((v) => v.lang.toLowerCase().startsWith("es"));
+            if (voices.length) u.voice = voices[0];
+            u.onend = resolve;
+            u.onerror = resolve;
+            window.speechSynthesis.speak(u);
+          });
+        }
+
+        async function send(text) {
+          text = (text || "").trim();
+          if (!text || busy) return;
+          busy = true;
+          add("user", text);
+          setStatus("El orquestador está pensando...");
+          try {
+            const r = await apiFetch("/api/orchestrator/chat", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: text }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+            add("bot", data.reply);
+            if (inCall) {
+              setStatus("Hablando...");
+              await speak(data.reply);
+            }
+          } catch (e) {
+            add("sys", `Error: ${e.message}`);
+          } finally {
+            busy = false;
+            setStatus("");
+            if (inCall) listen();
+          }
+        }
+
+        function listen() {
+          if (!inCall || busy || !SR) return;
+          rec = new SR();
+          rec.lang = "es-419";
+          rec.interimResults = true;
+          rec.continuous = false;
+          let finalText = "";
+          rec.onresult = (ev) => {
+            let interim = "";
+            for (let i = ev.resultIndex; i < ev.results.length; i++) {
+              const t = ev.results[i][0].transcript;
+              if (ev.results[i].isFinal) finalText += t; else interim += t;
+            }
+            setStatus(`Escuchando: ${finalText || interim}`);
+          };
+          rec.onerror = (ev) => {
+            if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+              add("sys", "El navegador no dio permiso al micrófono.");
+              endCall();
+            }
+          };
+          rec.onend = () => {
+            if (!inCall) return;
+            if (finalText.trim()) send(finalText);
+            else if (!busy) listen();
+          };
+          try { rec.start(); setStatus("Escuchando..."); } catch (e) { /* ya activo */ }
+        }
+
+        function endCall() {
+          inCall = false;
+          callBtn.classList.remove("on");
+          callBtn.textContent = "Llamar";
+          if (rec) { try { rec.abort(); } catch (e) {} }
+          if (window.speechSynthesis) window.speechSynthesis.cancel();
+          setStatus("");
+        }
+
+        callBtn.addEventListener("click", () => {
+          if (inCall) { endCall(); add("sys", "Llamada terminada."); return; }
+          if (!SR) {
+            add("sys", "Este navegador no soporta reconocimiento de voz. Usa Chrome, Edge o Zen/Chromium con internet.");
+            return;
+          }
+          inCall = true;
+          callBtn.classList.add("on");
+          callBtn.textContent = "Colgar";
+          add("sys", "Llamada iniciada. Habla cuando quieras.");
+          listen();
+        });
+        $("orq-form").addEventListener("submit", (e) => {
+          e.preventDefault();
+          const t = input.value;
+          input.value = "";
+          send(t);
+        });
+        $("orq-reset").addEventListener("click", async () => {
+          await apiFetch("/api/orchestrator/reset", { method: "POST" });
+          log.innerHTML = "";
+          add("sys", "Conversación nueva.");
+        });
+      })();
 
       /* Arranque y bucles de muestreo */
       const isSnapshot = window.location.search.includes("snapshot=1");
