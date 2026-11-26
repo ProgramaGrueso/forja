@@ -2,3 +2,10 @@
 name = "forja-store"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+forja-core = { path = "../forja-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
