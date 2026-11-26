@@ -1,0 +1,10 @@
+{
+  "provider": "copilot",
+  "source": "oauth_usage_api",
+  "title": "Account limits",
+  "plan": null,
+  "fetched_at": "2026-11-26T10:23:21.949515+00:00",
+  "windows": [],
+  "details": [],
+  "unavailable_reason": "No account usage available for provider 'copilot'"
+}
