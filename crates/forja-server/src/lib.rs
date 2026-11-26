@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use forja_agent::{Agent, AgyAgent, MockAgent};
@@ -85,13 +85,20 @@ impl IntoResponse for ApiError {
     }
 }
 
+const PANEL_HTML: &str = include_str!("panel.html");
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(panel_handler))
         .route("/tasks", post(create_task))
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .with_state(state)
+}
+
+async fn panel_handler() -> Html<&'static str> {
+    Html(PANEL_HTML)
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
@@ -375,5 +382,37 @@ mod tests {
         let body: Value = read_json(resp.into_body()).await;
         let msg = body["error"].as_str().expect("campo error en JSON");
         assert!(msg.contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn panel_get_root_returns_html_without_external_urls() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("construir request GET /");
+
+        let resp = app.oneshot(req).await.expect("ejecutar GET /");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .expect("header content-type presente");
+        assert!(content_type.contains("text/html"));
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("leer cuerpo HTML");
+        let body = String::from_utf8(bytes.to_vec()).expect("HTML UTF-8 válido");
+
+        assert!(body.contains("Forja"));
+        assert!(body.contains("Cancelar"));
+        assert!(body.contains("/cancel"));
+        assert!(!body.contains("http://") && !body.contains("https://"));
     }
 }
