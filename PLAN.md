@@ -27,7 +27,7 @@ Estructura final:
       Crear workspace con los 7 crates vacíos (lib.rs con un test trivial; cli con main), rust-toolchain
       stable, .gitignore (target/), scripts/check.sh ejecutable.
       Hecho cuando: `./scripts/check.sh` sale 0 y `cargo build --workspace` sale 0.
-- [ ] T02 forja-core: tipos y errores (30 min)
+- [x] T02 forja-core: tipos y errores (30 min)
       Task{id,titulo,prompt,privacidad}, Privacy{Open,Sensitive}, AgentKind{Mock,Agy,Claude},
       RunStatus{Pending,Running,Done,Failed,Cancelled}, ForjaError con thiserror. Serde en todo.
       Hecho cuando: `cargo test -p forja-core` pasa con >=6 tests (ida y vuelta serde, Display de errores).

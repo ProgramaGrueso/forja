@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T01 — Workspace y scripts
-- Tarea en curso: T02 — forja-core: tipos y errores
+- Última tarea cerrada: T02 — forja-core: tipos y errores
+- Tarea en curso: T03 — forja-core: política de privacidad
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -14,20 +14,30 @@
 - Estado: terminada
 - Hora de inicio / fin: 2026-11-25T23:57:41-05:00 / 2026-11-25T23:58:31-05:00
 - Quién la hizo: agente principal
-- Commits: (pendiente de hash en commit T01)
+- Commits: 5fbde52 T01: workspace con 7 crates y scripts/check.sh
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
   `./scripts/check.sh && cargo build --workspace` -> exit 0; 7/7 crates pasaron `fmt`, `clippy -D warnings`, `test` (7 tests ok) y `cargo build --workspace` (`Finished dev profile ... in 0.05s`).
 - Intentos fallidos (máx. 3): ninguno.
 - Notas para retomar: workspace listo.
 
 ### T02 — forja-core: tipos y errores
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-25T23:58:35-05:00 / 2026-11-25T23:59:42-05:00
+- Quién la hizo: agente principal
+- Commits: (en commit T02)
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-core && ./scripts/check.sh` -> exit 0; `forja-core`: `test result: ok. 7 passed; 0 failed; 0 ignored`; workspace completo en verde.
+- Intentos fallidos (máx. 3): ninguno (solo `cargo fmt` inicial).
+- Notas para retomar: Task, Privacy, AgentKind, RunStatus, RunRecord y ForjaError definidos y exportados.
+
+### T03 — forja-core: política de privacidad
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-25T23:58:35-05:00 /
+- Hora de inicio / fin: 2026-11-25T23:59:45-05:00 /
 - Quién la hizo: agente principal
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: definir Task, Privacy, AgentKind, RunStatus, ForjaError con serde y thiserror en forja-core.
+- Notas para retomar: implementar allowed_agents(Privacy)->Vec<AgentKind> y check_policy(Privacy, AgentKind)->Result<()>.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
