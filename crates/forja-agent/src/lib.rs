@@ -18,7 +18,10 @@ pub use claude::ClaudeAgent;
 pub use hermes::HermesAgent;
 pub use local::LocalAgent;
 pub use mock::{MockAgent, MockBehavior, MockFileWrite};
-pub use opencode::OpencodeAgent;
+pub use opencode::{
+    build_command as build_opencode_command, parse_opencode_output, OpencodeAgent,
+    OpencodeCommandOptions,
+};
 pub use runner::{CommandResult, Runner};
 
 #[derive(Debug, Clone)]
