@@ -1524,7 +1524,7 @@
       }
 
       /* Navegación y barra lateral */
-      function setView(view) {
+      function setView(view, updateHash = true) {
         if (!VIEW_META[view]) return;
         state.view = view;
         document.querySelectorAll(".nav-item").forEach((b) => {
@@ -1537,6 +1537,9 @@
         $("view-subtitle").textContent = VIEW_META[view][1];
         $("sidebar").classList.remove("mobile-open");
         $("sidebar-backdrop").classList.remove("open");
+        if (updateHash && window.location.hash !== `#${view}`) {
+          history.replaceState(null, "", `#${view}`);
+        }
       }
 
       function updateSideTabs() {
@@ -1747,7 +1750,7 @@
       }
 
       /* Gráficos SVG puros */
-      function renderLineSvg(svgEl, seriesList) {
+      function renderLineSvg(svgEl, seriesList, showThresholds = false) {
         const W = 600, H = 150, padL = 34, padR = 10, padT = 12, padB = 20;
         const plotW = W - padL - padR;
         const plotH = H - padT - padB;
@@ -1756,6 +1759,12 @@
           const y = padT + plotH - (pct / 100) * plotH;
           grid += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="#192030" stroke-width="1"/>`;
           grid += `<text x="${padL - 5}" y="${(y + 3).toFixed(1)}" text-anchor="end" fill="#596275" font-size="9.5" font-family="monospace">${pct}</text>`;
+        }
+        if (showThresholds) {
+          const y80 = padT + plotH - 0.8 * plotH;
+          const y92 = padT + plotH - 0.92 * plotH;
+          grid += `<line x1="${padL}" y1="${y80.toFixed(1)}" x2="${W - padR}" y2="${y80.toFixed(1)}" stroke="rgba(245,158,11,0.45)" stroke-dasharray="4 4" stroke-width="1"/>`;
+          grid += `<line x1="${padL}" y1="${y92.toFixed(1)}" x2="${W - padR}" y2="${y92.toFixed(1)}" stroke="rgba(239,68,68,0.5)" stroke-dasharray="4 4" stroke-width="1"/>`;
         }
 
         let paths = "";
@@ -2025,7 +2034,7 @@
           values: hist.map((s) => (s.gpu && s.gpu.memory_total_mib > 0) ? (s.gpu.memory_used_mib / s.gpu.memory_total_mib) * 100 : null),
           stroke: "#10b981",
           fill: "rgba(16, 185, 129, 0.14)",
-        }]);
+        }], true);
         renderLineSvg($("chart-gpu-svg"), [{
           values: hist.map((s) => s.gpu ? s.gpu.utilization_percent : null),
           stroke: "#8b5cf6",
@@ -2124,6 +2133,26 @@
         settingsFilledOnce = true;
       }
 
+      function syncAgentSelects() {
+        if (!state.agents || state.agents.length === 0) return;
+        const filterSel = $("filter-agent");
+        const prevFilter = filterSel.value || "all";
+        filterSel.innerHTML = `<option value="all">Todos los agentes</option>` +
+          state.agents.map((ag) => `<option value="${esc(ag.name)}">${esc(ag.name)}</option>`).join("");
+        if (Array.from(filterSel.options).some((o) => o.value === prevFilter)) {
+          filterSel.value = prevFilter;
+        }
+
+        const ntSel = $("nt-agent");
+        const prevNt = ntSel.value || "mock";
+        ntSel.innerHTML = state.agents.map((ag) =>
+          `<option value="${esc(ag.name)}" data-label="${esc(ag.name)} (${esc(ag.provider)})">${esc(ag.name)} (${esc(ag.provider)})</option>`
+        ).join("");
+        if (Array.from(ntSel.options).some((o) => o.value === prevNt)) {
+          ntSel.value = prevNt;
+        }
+      }
+
       /* Política en vivo en modal Nueva tarea */
       function updateModalPolicyPreview() {
         const priv = $("nt-privacy").value;
@@ -2138,7 +2167,7 @@
         Array.from(sel.options).forEach((opt) => {
           const ok = allowed.includes(opt.value);
           opt.disabled = !ok;
-          const base = opt.value === "mock" ? "mock (local determinista)" : opt.value === "agy" ? "agy (Gemini CLI)" : "claude (Anthropic)";
+          const base = opt.dataset.label || (opt.value === "mock" ? "mock (local determinista)" : opt.value === "agy" ? "agy (Gemini CLI)" : "claude (Anthropic)");
           opt.textContent = ok ? base : `${base} — bloqueado por política`;
         });
         if (!allowed.includes(sel.value) && allowed.length > 0) {
@@ -2179,7 +2208,10 @@
             state.runs = await runsR.json();
             state.initializedRuns = true;
           }
-          if (agentsR.ok) state.agents = await agentsR.json();
+          if (agentsR.ok) {
+            state.agents = await agentsR.json();
+            syncAgentSelects();
+          }
           if (statsR.ok) state.stats = await statsR.json();
           if (policyR.ok) state.policy = await policyR.json();
           if (settingsR.ok) {
@@ -2451,8 +2483,40 @@
         refreshQuota(false);
       });
 
+      $("set-hide-mascot").addEventListener("change", () => {
+        if (state.settings) {
+          state.settings.hide_mascot = $("set-hide-mascot").checked;
+          renderMascot();
+        }
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          closeModal();
+          state.selectedRunId = null;
+          renderDrawer();
+          state.openPopoverProvider = null;
+          $("provider-popover").classList.remove("open");
+        }
+      });
+
+      function applyHashRoute() {
+        const raw = (window.location.hash || "").replace(/^#/, "").trim();
+        if (!raw) return;
+        if (VIEW_META[raw]) {
+          setView(raw, false);
+        } else if (raw === "nueva") {
+          openModal();
+        } else if (raw === "nueva-sensitive") {
+          $("nt-privacy").value = "sensitive";
+          openModal();
+        }
+      }
+      window.addEventListener("hashchange", applyHashRoute);
+
       /* Arranque y bucles de muestreo */
       updateSideTabs();
+      applyHashRoute();
       refreshCore();
       refreshTelemetry();
       refreshQuota(true);

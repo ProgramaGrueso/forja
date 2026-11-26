@@ -568,6 +568,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panel_views_modal_filters_and_settings_present() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("GET /");
+        let resp = app.oneshot(req).await.expect("ejecutar GET /");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("leer");
+        let html = String::from_utf8(bytes.to_vec()).expect("UTF-8");
+
+        for id in [
+            "view-resumen",
+            "view-ejecuciones",
+            "view-agentes",
+            "view-telemetria",
+            "view-cuotas",
+            "view-ajustes",
+            "new-task-modal",
+            "nt-policy-banner",
+            "filter-status",
+            "filter-agent",
+            "settings-form",
+            "set-hide-mascot",
+            "provider-popover",
+            "detail-drawer",
+        ] {
+            assert!(html.contains(id), "falta elemento #{id} en panel.html");
+        }
+    }
+
+    #[tokio::test]
     async fn events_sse_streams_run_updates() {
         use tokio_stream::StreamExt;
 

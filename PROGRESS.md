@@ -288,6 +288,11 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 - Reescrito `crates/forja-server/src/panel.html` como aplicación de escritorio oscura con acentos esmeralda/violeta: barra lateral colapsable (logo, pestañas `EJECUCIONES | AGENTES`, navegación, lista de agentes agrupada por proveedor, ejecuciones recientes), barra fija de proveedores con anillos circulares y popover de detalle, mascota chibi pelirroja original en SVG inline reactiva a estados reales (`idle`, `working`, `celebrate`, `worried` + `prefers-reduced-motion`), Telemetría con gráficos SVG de 5 min y Ejecuciones en vivo con SSE `/events` y panel lateral.
 - Verificación: `cargo test -p forja-server panel && ./scripts/check.sh` en verde; cero URLs externas (`http://`, `https://`, `<script src`, `<link href`).
 
+### U06 — Vistas restantes, modal con política en vivo, filtros y pulido responsive
+- Completadas e integradas las vistas `Resumen` (KPIs + gráfico horario 24 h SVG + últimas ejecuciones + pulso de hardware), `Agentes` (tarjetas con proveedor, modelo, estado, total, tasa de éxito y duración media), `Cuotas` (tarjetas por proveedor + formulario editable de `quota.json` vía `PUT /api/quota`) y `Ajustes` (concurrencia, store_dir, puerto, ruta de `quota.json`, ocultar mascota con vista previa inmediata y aviso de reinicio).
+- Modal `Nueva tarea` sincronizado dinámicamente con `/api/agents` y `/api/policy` (al seleccionar `sensitive`, bloquea `agy`/`mock` y explica la política antes de enviar).
+- Añadido enrutamiento por hash (`#resumen`, `#ejecuciones`, `#agentes`, `#telemetria`, `#cuotas`, `#ajustes`), guías de alerta 80 % / 92 % en el gráfico de VRAM, atajo `Escape` y soporte responsive móvil con menú deslizable.
+
 ## Decisiones (Sesión UI)
 - Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.
 - Fechas como texto ISO-8601 tal como llegan (no hay `chrono`); la antigüedad ("hace 3 h") se calcula en el navegador.

@@ -17,7 +17,7 @@ Restricciones: sin dependencias Rust nuevas; frontend HTML+CSS+JS vanilla embebi
       Verificación: `cargo test -p forja-server panel`.
 
 ## Resto
-- [ ] U06 Vistas Resumen, Agentes, Cuotas, Ajustes; modal "Nueva tarea" con política en vivo; filtros; responsive móvil (45 min).
+- [x] U06 Vistas Resumen, Agentes, Cuotas, Ajustes; modal "Nueva tarea" con política en vivo; filtros; responsive móvil (45 min).
       Verificación: `cargo test -p forja-server panel`.
 - [ ] U07 Prueba de humo real en 7788 con curl a todas las rutas + capturas con chromium headless en docs/capturas/ (30 min).
       Verificación: salidas reales pegadas en PROGRESS.md; servidor apagado al final.
