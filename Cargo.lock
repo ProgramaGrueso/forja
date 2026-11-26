@@ -78,6 +78,15 @@ dependencies = [
 [[package]]
 name = "forja-sched"
 version = "0.1.0"
+dependencies = [
+ "forja-agent",
+ "forja-core",
+ "forja-git",
+ "forja-store",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "forja-server"
@@ -86,6 +95,11 @@ version = "0.1.0"
 [[package]]
 name = "forja-store"
 version = "0.1.0"
+dependencies = [
+ "forja-core",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "futures-core"
