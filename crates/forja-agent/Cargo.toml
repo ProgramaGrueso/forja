@@ -1,0 +1,4 @@
+[package]
+name = "forja-agent"
+version.workspace = true
+edition.workspace = true

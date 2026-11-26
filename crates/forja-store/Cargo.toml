@@ -1,0 +1,4 @@
+[package]
+name = "forja-store"
+version.workspace = true
+edition.workspace = true

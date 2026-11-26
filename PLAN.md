@@ -23,7 +23,7 @@ Estructura final:
     crates/forja-cli     binario `forja`
 
 ## Fase 0 — Cimientos
-- [ ] T01 Workspace y scripts (20 min)
+- [x] T01 Workspace y scripts (20 min)
       Crear workspace con los 7 crates vacíos (lib.rs con un test trivial; cli con main), rust-toolchain
       stable, .gitignore (target/), scripts/check.sh ejecutable.
       Hecho cuando: `./scripts/check.sh` sale 0 y `cargo build --workspace` sale 0.

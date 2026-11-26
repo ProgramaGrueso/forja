@@ -1,0 +1,4 @@
+[package]
+name = "forja-core"
+version.workspace = true
+edition.workspace = true

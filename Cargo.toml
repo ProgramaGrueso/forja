@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forja-core",
+    "crates/forja-git",
+    "crates/forja-agent",
+    "crates/forja-store",
+    "crates/forja-sched",
+    "crates/forja-server",
+    "crates/forja-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

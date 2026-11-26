@@ -1,0 +1,4 @@
+[package]
+name = "forja-server"
+version.workspace = true
+edition.workspace = true

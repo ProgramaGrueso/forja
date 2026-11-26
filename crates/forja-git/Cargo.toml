@@ -1,0 +1,4 @@
+[package]
+name = "forja-git"
+version.workspace = true
+edition.workspace = true

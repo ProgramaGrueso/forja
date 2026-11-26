@@ -1,0 +1,8 @@
+[package]
+name = "forja-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "forja"
+path = "src/main.rs"
