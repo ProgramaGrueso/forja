@@ -293,6 +293,31 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 - Modal `Nueva tarea` sincronizado dinámicamente con `/api/agents` y `/api/policy` (al seleccionar `sensitive`, bloquea `agy`/`mock` y explica la política antes de enviar).
 - Añadido enrutamiento por hash (`#resumen`, `#ejecuciones`, `#agentes`, `#telemetria`, `#cuotas`, `#ajustes`), guías de alerta 80 % / 92 % en el gráfico de VRAM, atajo `Escape` y soporte responsive móvil con menú deslizable.
 
+### U07 — Prueba de humo real (puerto 7788), auditoría adversaria y capturas
+- Salidas reales con `curl` contra `./target/release/forja --store-dir /tmp/forja-ui/store --worktrees-dir /tmp/forja-ui/wt serve --port 7788`:
+  - `GET /` -> `HTTP 200 text/html; charset=utf-8`
+  - `GET /api/health` -> `HTTP 200` `{"status":"ok","version":"0.1.0"}`
+  - `GET /api/policy` -> `HTTP 200` `{"open":["agy","mock","claude"],"sensitive":["claude"]}`
+  - `GET /api/settings` -> `HTTP 200`; `PUT /api/settings` (válido) -> `HTTP 200` (`persisted: true`); `PUT /api/settings` (`.hermes`) -> `HTTP 400`
+  - `POST /tasks` (`mock` open) -> `HTTP 201` (termina en `done`); `POST /tasks` (`agy` sensitive) -> `HTTP 403`; `POST /tasks` (título vacío) -> `HTTP 400`
+  - `GET /api/agents` -> `HTTP 200` (`claude` unconfigured, `agy` idle, `mock` idle `total:1, done:1`)
+  - `GET /api/stats` -> `HTTP 200` (`total:1, done_24h:1`, 24 buckets)
+  - `GET /api/telemetry` -> `HTTP 200` (`NVIDIA GeForce RTX 4070 Ti SUPER`, `2352/16376 MiB`, `42.89 °C`, `CPU 3.9%`, `RAM 16076424/65739000 KiB`)
+  - `GET /api/quota` (frío en paralelo) -> `HTTP 200` en `1.40s` (`Anthropic` 65.0 % usado / 35 % libre desde `hermes`; resto `no_data`); `PUT /api/quota` válido -> `HTTP 200`, inválido (`percent_remaining: 150`) -> `HTTP 400`.
+- Servidor en puerto `7788` apagado limpiamente (`ps` vacío).
+- Capturas headless con Chromium guardadas y revisadas visualmente en `docs/capturas/`: `01-resumen.png`, `02-ejecuciones.png`, `03-telemetria.png`, `04-cuotas.png`, `05-agentes.png`, `06-ajustes.png`, `07-movil.png`.
+- Correcciones de auditoría adversaria y revisión visual:
+  1. Bloqueo de `..`, `\0` y rutas protegidas (`.hermes`, `.ssh`, `.gnupg`, `.env`) en `Settings::validate()`.
+  2. Rechazo de `titulo`/`prompt` vacíos en `POST /tasks` (`400 Bad Request`).
+  3. Sondeo paralelo con `std::thread::scope` + `refresh_lock` en `QuotaService::get_all()` (latencia en frío reducida de ~5.5 s a `1.40 s`, sin estampida ante concurrencia).
+  4. Clic de la mascota arreglado para alternar globo en barra expandida y flotante en barra colapsada.
+  5. Refresco de duración en vivo cada 1 s mediante `data-live-duration` sin reconstruir todo el DOM de tabla ni resetear el scroll del drawer.
+  6. Aviso en el modal cuando `sensitive` selecciona `claude` y este aún está sin configurar.
+  7. Ajustes visuales tras inspeccionar capturas: cabecera móvil sin desbordamiento (`390x844`), `viewBox` dinámico en gráfico ancho CPU/RAM y redacción `"ahora mismo"` en lugar de `"hace ahora"`.
+
+### U08 — Cierre y REPORTE_UI.md
+- `REPORTE_UI.md` redactado en una página. `./scripts/check.sh` en verde (`88 passed, 0 failed, 1 ignored`).
+
 ## Decisiones (Sesión UI)
 - Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.
 - Fechas como texto ISO-8601 tal como llegan (no hay `chrono`); la antigüedad ("hace 3 h") se calcula en el navegador.
