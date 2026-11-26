@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T17 (documentación)
-- Tarea en curso: T18 (pasada final: release build y auditoría de código)
+- Última tarea cerrada: T18 (pasada final) — T01..T18 y X1..X3 completas
+- Tarea en curso: (ninguna — sesión cerrada)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -181,13 +181,14 @@
 - Notas para retomar: arranca T18 (pasada final + auditoría + release build) y luego X1–X3 si procede.
 
 ### T18 — Pasada final
-- Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:28:10-05:00 /
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:28:10-05:00 / 2026-11-26T00:32:10-05:00
 - Quién la hizo: agente principal
-- Commits:
+- Commits: (en commit final T18)
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
-- Intentos fallidos (máx. 3):
-- Notas para retomar: `cargo build --workspace --release` ok (9.88s), 0 TODO/unimplemented!/unwrap/expect fuera de tests. Cerrando opcionales X1–X3 antes del REPORTE.md final.
+  `./scripts/check.sh && cargo build --workspace --release && ! grep -rn "todo!\|unimplemented!" crates && ! grep -rn "push" crates/forja-git/src` -> exit 0; 61 tests passed, 0 failed, 1 ignored (`agy_real`, también verificado en verde en 6.42s); 0 `todo!`/`unimplemented!`/`unwrap`/`expect` en código no-test; `release` compilado sin warnings.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: `REPORTE.md` y `ENTREGA.md` generados; sesión nocturna finalizada en verde.
 
 ### X1 — Prueba real con agy (#[ignore])
 - Estado: terminada
@@ -195,25 +196,35 @@
 - Quién la hizo: agente principal
 - Commits: 0967e30 X1: prueba real con agy marcada #[ignore] en forja-agent
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
-  `cargo test -p forja-agent -- --ignored agy_real && ./scripts/check.sh` -> exit 0; `agy_real_trivial_prompt_in_temp_worktree ... ok` en 6.42s (1 intento); workspace en verde (1 ignored en ejecución normal).
+  `cargo test -p forja-agent -- --ignored agy_real && ./scripts/check.sh` -> exit 0; `agy_real_trivial_prompt_in_temp_worktree ... ok` en 6.42s (1 intento); workspace en verde.
 - Intentos fallidos (máx. 3): ninguno.
-- Notas para retomar: X2 completada.
+- Notas para retomar: integración real con `agy` verificada.
 
 ### X2 — Adaptador Claude stub (NotConfigured)
 - Estado: terminada
 - Hora de inicio / fin: 2026-11-26T00:29:35-05:00 / 2026-11-26T00:29:54-05:00
 - Quién la hizo: agente principal
-- Commits: (en commit X2)
+- Commits: 48c7ad8 X2: adaptador stub ClaudeAgent (NotConfigured) en forja-agent
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
-  `cargo test -p forja-agent claude && ./scripts/check.sh` -> exit 0; `claude_stub_returns_not_configured ... ok`; workspace: 60 tests en verde (1 ignored).
+  `cargo test -p forja-agent claude && ./scripts/check.sh` -> exit 0; `claude_stub_returns_not_configured ... ok`.
 - Intentos fallidos (máx. 3): ninguno.
-- Notas para retomar: siguiente opcional X3 (SSE en `/events`).
+- Notas para retomar: stub `ClaudeAgent` listo.
+
+### X3 — Streaming SSE en /events
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:30:30-05:00 / 2026-11-26T00:32:09-05:00
+- Quién la hizo: agente principal
+- Commits: 9854e10 X3: streaming SSE de estados en GET /events
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-server events && ./scripts/check.sh` -> exit 0; `events_sse_streams_run_updates ... ok`; workspace: 61 tests en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: broadcast channel en `Scheduler::subscribe()` conectado a `GET /events` (`text/event-stream`).
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
 
 ## Dependencias añadidas fuera de la lista permitida
-- (ninguna)
+- `tokio-stream = { version = "0.1", features = ["sync"] }` en `crates/forja-server/Cargo.toml` para envolver `tokio::sync::broadcast::Receiver` como `Stream` en `GET /events` (X3).
 
 ## Decisiones tomadas por mi cuenta (para que Juan las revise)
 - Modelo para subagentes: `gemini-4-neon-low` para tareas acotadas/mecánicas, `gemini-4-neon-medium` para concurrencia/integración, `gemini-4-neon-high` para reintentos complejos.

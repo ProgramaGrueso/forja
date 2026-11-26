@@ -96,7 +96,7 @@ Estructura final:
       docs/ARQUITECTURA.md (un párrafo por crate y sus fronteras).
       Hecho cuando: `test -s README.md && test -s docs/ARQUITECTURA.md` sale 0 y todos los comandos del README
       que sean ejecutables corren sin error.
-- [ ] T18 Pasada final (30 min)
+- [x] T18 Pasada final (30 min)
       `cargo build --workspace --release`, revisión de TODO/unwrap/expect en código no-test (justificar o eliminar),
       REPORTE.md.
       Hecho cuando: `./scripts/check.sh` sale 0 y `grep -rn "todo!\|unimplemented!" crates` no devuelve nada.
