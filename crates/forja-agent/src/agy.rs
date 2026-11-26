@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use forja_core::AgentKind;
 use serde_json::Value;
@@ -150,6 +151,16 @@ impl AgyAgent {
 impl Agent for AgyAgent {
     fn kind(&self) -> AgentKind {
         AgentKind::Agy
+    }
+
+    fn model(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
+    fn with_model(&self, model: &str) -> Option<Arc<dyn Agent>> {
+        let mut copy = self.clone();
+        copy.model = model.to_string();
+        Some(Arc::new(copy))
     }
 
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {

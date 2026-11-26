@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,12 @@ pub struct Settings {
     pub quota_path: String,
     #[serde(default)]
     pub hide_mascot: bool,
+    /// Modelo por agente (claude, agy, opencode, local). Sin entrada => default en código.
+    #[serde(default)]
+    pub agent_models: BTreeMap<String, String>,
+    /// Perfil de Hermes del orquestador. None => env FORJA_ORCHESTRATOR_PROFILE o `default`.
+    #[serde(default)]
+    pub orchestrator_profile: Option<String>,
 }
 
 pub const MAX_CONCURRENCY_LIMIT: usize = 16;
@@ -57,7 +64,34 @@ impl Settings {
         if !self.quota_path.ends_with(".json") {
             return Err("quota_path debe apuntar a un archivo .json".to_string());
         }
+        for (agent, model) in &self.agent_models {
+            let kind = agent
+                .parse::<forja_core::AgentKind>()
+                .ok()
+                .filter(|k| forja_agent::MODEL_AGENTS.contains(k))
+                .ok_or_else(|| format!("agent_models: el agente \"{agent}\" no admite modelo"))?;
+            forja_agent::validate_model(model).map_err(|e| format!("agent_models[{kind}]: {e}"))?;
+        }
+        if let Some(profile) = &self.orchestrator_profile {
+            forja_agent::hermes::validate_profile(profile)
+                .map_err(|e| format!("orchestrator_profile: {e}"))?;
+        }
         Ok(())
+    }
+
+    /// Normaliza antes de validar: recorta modelos, quita entradas vacías y
+    /// convierte un perfil en blanco en `None` (vuelve al valor por defecto).
+    pub fn normalize(&mut self) {
+        self.agent_models = std::mem::take(&mut self.agent_models)
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        self.orchestrator_profile = self
+            .orchestrator_profile
+            .take()
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty());
     }
 
     /// Campos cuyo cambio exige reiniciar `forja serve` para tener efecto.
@@ -110,6 +144,8 @@ mod tests {
             port: 7777,
             quota_path: "/tmp/quota.json".to_string(),
             hide_mascot: false,
+            agent_models: BTreeMap::new(),
+            orchestrator_profile: None,
         }
     }
 
@@ -151,6 +187,58 @@ mod tests {
         let mut s = valid();
         s.quota_path = "/tmp/bad\0.json".to_string();
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn settings_validate_agent_models_and_profile() {
+        let mut s = valid();
+        s.agent_models.insert("claude".into(), "opus".into());
+        s.orchestrator_profile = Some("claudia".into());
+        assert!(s.validate().is_ok());
+
+        for bad in ["", "   ", "a\nb", "a\tb", "--flag", &"x".repeat(101)] {
+            let mut s = valid();
+            s.agent_models.insert("claude".into(), bad.to_string());
+            assert!(s.validate().is_err(), "modelo {bad:?} debía rechazarse");
+        }
+        let mut s = valid();
+        s.agent_models.insert("mock".into(), "x".into());
+        assert!(s.validate().is_err());
+        s.agent_models.clear();
+        s.agent_models.insert("nope".into(), "x".into());
+        assert!(s.validate().is_err());
+
+        // El perfil privado jamás puede elegirse.
+        for bad in ["intimo", "mama", "../default", "root", ""] {
+            let mut s = valid();
+            s.orchestrator_profile = Some(bad.to_string());
+            assert!(s.validate().is_err(), "perfil {bad:?} debía rechazarse");
+        }
+    }
+
+    #[test]
+    fn settings_normalize_trims_and_clears_blanks() {
+        let mut s = valid();
+        s.agent_models.insert(" Claude ".into(), " opus ".into());
+        s.agent_models.insert("agy".into(), "  ".into());
+        s.orchestrator_profile = Some("  ".into());
+        s.normalize();
+        assert_eq!(s.agent_models.len(), 1);
+        assert_eq!(s.agent_models["claude"], "opus");
+        assert_eq!(s.orchestrator_profile, None);
+        s.orchestrator_profile = Some(" Yuuki ".into());
+        s.normalize();
+        assert_eq!(s.orchestrator_profile.as_deref(), Some("yuuki"));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn settings_old_json_without_new_fields_still_loads() {
+        let old =
+            r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json"}"#;
+        let s: Settings = serde_json::from_str(old).expect("compat");
+        assert!(s.agent_models.is_empty());
+        assert_eq!(s.orchestrator_profile, None);
     }
 
     #[test]

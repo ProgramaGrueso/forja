@@ -5,7 +5,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -32,18 +32,42 @@ pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<ChatReply, String>>
 /// Motor de conversación; se sustituye por un doble en las pruebas.
 pub trait ChatBackend: Send + Sync {
     fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_>;
+
+    /// Perfil activo (None si el backend no tiene perfiles).
+    fn profile(&self) -> Option<String> {
+        None
+    }
+
+    /// Cambia el perfil en caliente (no-op si el backend no tiene perfiles).
+    fn set_profile(&self, _profile: &str) {}
 }
 
 /// Backend real: `hermes -p <perfil> chat --query-file <f> -Q --oneshot [--resume <id>]`.
 pub struct HermesBackend {
-    profile: String,
+    profile: RwLock<String>,
 }
 
 impl HermesBackend {
     pub fn from_env() -> Self {
-        let wanted = std::env::var(PROFILE_ENV).unwrap_or_else(|_| "default".to_string());
-        Self { profile: wanted }
+        Self {
+            profile: RwLock::new(resolve_profile(None, env_profile().as_deref())),
+        }
     }
+}
+
+/// Perfil del orquestador: ajustes > env `FORJA_ORCHESTRATOR_PROFILE` > `default`.
+pub fn resolve_profile(setting: Option<&str>, env: Option<&str>) -> String {
+    let nonblank = |s: &&str| !s.trim().is_empty();
+    setting
+        .filter(nonblank)
+        .or(env.filter(nonblank))
+        .unwrap_or("default")
+        .trim()
+        .to_string()
+}
+
+fn env_profile() -> Option<String> {
+    std::env::var(PROFILE_ENV).ok()
 }
 
 pub fn build_argv(profile: &str, query_file: &Path, resume: Option<&str>) -> Vec<String> {
@@ -74,9 +98,20 @@ pub fn parse_session_id(stderr: &str) -> Option<String> {
 }
 
 impl ChatBackend for HermesBackend {
+    fn profile(&self) -> Option<String> {
+        self.profile.read().ok().map(|p| p.clone())
+    }
+
+    fn set_profile(&self, profile: &str) {
+        if let Ok(mut p) = self.profile.write() {
+            *p = profile.to_string();
+        }
+    }
+
     fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
         Box::pin(async move {
-            let profile = validate_profile(&self.profile).map_err(|e| e.to_string())?;
+            let wanted = self.profile().unwrap_or_default();
+            let profile = validate_profile(&wanted).map_err(|e| e.to_string())?;
             let dir = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -145,6 +180,22 @@ impl Orchestrator {
 
     fn current_session(&self) -> Option<String> {
         self.session.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Aplica el perfil de los ajustes (con env y `default` como respaldo). Si el
+    /// perfil cambia, se reinicia la sesión. Devuelve el perfil efectivo.
+    pub fn apply_profile(&self, setting: Option<&str>) -> Result<String, String> {
+        let wanted = resolve_profile(setting, env_profile().as_deref());
+        let profile = validate_profile(&wanted).map_err(|e| e.to_string())?;
+        if self.backend.profile().as_deref() != Some(profile.as_str()) {
+            self.backend.set_profile(&profile);
+            self.reset();
+        }
+        Ok(profile)
+    }
+
+    pub fn profile(&self) -> Option<String> {
+        self.backend.profile()
     }
 
     fn reset(&self) {
@@ -275,6 +326,63 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Doble con perfil, para probar el cambio en caliente.
+    struct Profiled(RwLock<String>);
+
+    impl ChatBackend for Profiled {
+        fn chat(&self, _prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+            Box::pin(async move {
+                Ok(ChatReply {
+                    text: "ok".into(),
+                    session_id: Some("s1".into()),
+                })
+            })
+        }
+        fn profile(&self) -> Option<String> {
+            Some(self.0.read().unwrap().clone())
+        }
+        fn set_profile(&self, p: &str) {
+            *self.0.write().unwrap() = p.to_string();
+        }
+    }
+
+    #[test]
+    fn resolve_profile_priority_settings_env_default() {
+        assert_eq!(resolve_profile(Some("claudia"), Some("yuuki")), "claudia");
+        assert_eq!(resolve_profile(None, Some("yuuki")), "yuuki");
+        assert_eq!(resolve_profile(Some("  "), Some("yuuki")), "yuuki");
+        assert_eq!(resolve_profile(None, None), "default");
+        assert_eq!(resolve_profile(Some(""), Some(" ")), "default");
+    }
+
+    #[tokio::test]
+    async fn apply_profile_switches_hot_and_resets_session_only_on_change() {
+        let backend = Arc::new(Profiled(RwLock::new("default".into())));
+        let orq = Orchestrator::new(backend.clone());
+        orq.say("hola", 7777, None).await.unwrap();
+        assert!(orq.current_session().is_some());
+
+        // Mismo perfil efectivo: la sesión se conserva (si el env no interfiere).
+        if std::env::var(PROFILE_ENV).is_err() {
+            assert_eq!(orq.apply_profile(None).unwrap(), "default");
+            assert!(orq.current_session().is_some());
+        }
+
+        assert_eq!(orq.apply_profile(Some("Claudia")).unwrap(), "claudia");
+        assert_eq!(backend.profile().as_deref(), Some("claudia"));
+        assert!(orq.current_session().is_none());
+    }
+
+    #[test]
+    fn apply_profile_rejects_private_and_unknown_profiles() {
+        let backend = Arc::new(Profiled(RwLock::new("default".into())));
+        let orq = Orchestrator::new(backend.clone());
+        for bad in ["intimo", "mama", "otro"] {
+            assert!(orq.apply_profile(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(backend.profile().as_deref(), Some("default"));
     }
 
     #[test]

@@ -172,6 +172,7 @@ impl Scheduler {
             branch: None,
             worktree: None,
             attempts: 0,
+            model: agent.model(),
             output: None,
             error: None,
             created_at_ms: now,

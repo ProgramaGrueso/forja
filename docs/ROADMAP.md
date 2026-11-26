@@ -6,15 +6,16 @@ alguien que acaba de clonar el repo.
 
 ## Experiencia de primer arranque
 
-- **Selector de modelo por agente en el panel.** Hoy los modelos están fijos en
-  código (`claude` = sonnet, `agy` = gemini-4-neon-medium, `opencode` =
-  opencode-go/deepseek-v4.1-flash, `local` = moe) y solo se puede elegir el
-  agente, no su modelo. Cambiar a un campo persistido en Ajustes con override
-  por `--model` en el CLI y por tarea.
-- **Selector del orquestador en Ajustes.** Hoy el perfil se fija sólo con
-  `FORJA_ORCHESTRATOR_PROFILE` al arrancar (lista blanca: default, claudia,
-  yuuki) y el modelo es el del perfil de Hermes, fuera de Forja. Debe poder
-  elegirse perfil en el panel, con el env var como valor por defecto.
+- **[Backend hecho] Selector de modelo por agente.** `Settings.agent_models`
+  (claude, agy, opencode, local) persistido; prioridad override por tarea
+  (`forja run --model`, campo `modelo` en `POST /tasks`) > Ajustes > default en
+  código; el modelo efectivo queda en `RunRecord.model` y `GET /api/agents` lo
+  devuelve. Falta pintarlo en `panel.html` (Ajustes y formulario de tarea).
+- **[Backend hecho] Selector del orquestador en Ajustes.**
+  `Settings.orchestrator_profile` (lista blanca: default, claudia, yuuki)
+  > `FORJA_ORCHESTRATOR_PROFILE` > `default`; se aplica en caliente al hacer
+  `PUT /api/settings` (resetea la sesión) y `GET /api/orchestrator/profile`
+  informa perfil, origen y perfiles elegibles. Falta el selector en el panel.
 - **Wizard de `forja doctor`** que detecte agentes instalados y proponga una
   configuración mínima que funcione (modelo por agente, perfil del orquestador).
 

@@ -238,9 +238,64 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
+/// Metadatos con el modelo efectivo (ajustes > default en código) de cada agente.
+pub fn effective_metas(
+    metas: &[AgentMeta],
+    agent_models: &std::collections::BTreeMap<String, String>,
+) -> Vec<AgentMeta> {
+    metas
+        .iter()
+        .map(|meta| {
+            let mut meta = meta.clone();
+            if forja_agent::MODEL_AGENTS.contains(&meta.kind) {
+                if let Some(m) = agent_models
+                    .get(&meta.kind.to_string())
+                    .map(|m| m.trim())
+                    .filter(|m| !m.is_empty())
+                {
+                    meta.model = m.to_string();
+                }
+            }
+            meta
+        })
+        .collect()
+}
+
 pub async fn agents(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     let runs = state.scheduler.list_runs().await;
-    Json(build_agent_views(&state.metas, &runs))
+    let models = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .agent_models
+        .clone();
+    Json(build_agent_views(
+        &effective_metas(&state.metas, &models),
+        &runs,
+    ))
+}
+
+/// Perfil efectivo del orquestador, su origen y los perfiles elegibles.
+pub async fn orchestrator_profile(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let configured = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .orchestrator_profile
+        .clone();
+    let env = std::env::var(crate::orchestrator::PROFILE_ENV).ok();
+    let source = if configured.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        "settings"
+    } else if env.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        "env"
+    } else {
+        "default"
+    };
+    Json(json!({
+        "profile": state.orchestrator.profile(),
+        "source": source,
+        "allowed": forja_agent::hermes::ALLOWED_PROFILES,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,10 +346,11 @@ pub async fn put_settings(
     State(state): State<AppState>,
     body: Result<Json<Settings>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(next) = match body {
+    let Json(mut next) = match body {
         Ok(json) => json,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.body_text()),
     };
+    next.normalize();
     if let Err(msg) = next.validate() {
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
@@ -451,6 +507,7 @@ mod tests {
             branch: None,
             worktree: None,
             attempts: 1,
+            model: None,
             output: None,
             error: (status == RunStatus::Failed).then(|| "fallo".to_string()),
             created_at_ms: created,
@@ -641,6 +698,166 @@ mod tests {
             .expect("request roto");
         let resp = app.oneshot(req).await.expect("PUT roto");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn put_settings_json(app: axum::Router, body: Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request PUT");
+        let resp = app.oneshot(req).await.expect("PUT");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("cuerpo");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    async fn post_task(app: axum::Router, body: Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tasks")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request POST");
+        let resp = app.oneshot(req).await.expect("POST");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("cuerpo");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    #[tokio::test]
+    async fn api_agent_models_in_settings_shown_in_agents_and_validated() {
+        let (state, _s, _w) = state();
+        let app = build_router(state);
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+
+        let mut next = current.clone();
+        next["agent_models"] = json!({"claude": "opus", "local": " qwen "});
+        let (status, body) = put_settings_json(app.clone(), next.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["agent_models"]["local"], "qwen");
+
+        let (_, agents) = get_json(app.clone(), "/api/agents").await;
+        let model_of = |n: &str| {
+            agents
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == n)
+                .unwrap()["model"]
+                .clone()
+        };
+        assert_eq!(model_of("claude"), "opus");
+        assert_eq!(model_of("local"), "qwen");
+        assert_eq!(model_of("agy"), "gemini-4-neon-medium");
+
+        for bad in [
+            json!({"claude": "a\nb"}),
+            json!({"claude": "x".repeat(101)}),
+            json!({"mock": "x"}),
+        ] {
+            let mut n = current.clone();
+            n["agent_models"] = bad;
+            let (status, _) = put_settings_json(app.clone(), n).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_task_model_priority_override_over_settings_over_default() {
+        use std::sync::Arc;
+
+        use forja_agent::{ClaudeAgent, OpencodeAgent};
+        let (state, _s, _w) = state();
+        // Programas inexistentes: ningún agente real se ejecuta.
+        let state = state
+            .with_agent(Arc::new(
+                ClaudeAgent::default().with_program("/nonexistent/claude"),
+            ))
+            .with_agent(Arc::new(
+                OpencodeAgent::default().with_program("/nonexistent/opencode"),
+            ));
+        let app = build_router(state);
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+        let mut next = current.clone();
+        next["agent_models"] = json!({"claude": "opus"});
+        assert_eq!(put_settings_json(app.clone(), next).await.0, StatusCode::OK);
+
+        let task = |agent: &str, modelo: Option<&str>| {
+            let mut t = json!({"titulo": "t", "prompt": "p", "agent": agent});
+            if let Some(m) = modelo {
+                t["modelo"] = json!(m);
+            }
+            t
+        };
+        // override por tarea > ajustes
+        let (st, r) = post_task(app.clone(), task("claude", Some("haiku"))).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        assert_eq!(r["model"], "haiku");
+        // ajustes > default
+        let (_, r) = post_task(app.clone(), task("claude", None)).await;
+        assert_eq!(r["model"], "opus");
+        // default en código
+        let (_, r) = post_task(app.clone(), task("opencode", None)).await;
+        assert_eq!(r["model"], "opencode-go/deepseek-v4.1-flash");
+        // override inválido / agente sin modelo
+        let (st, _) = post_task(app.clone(), task("claude", Some("--x"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = post_task(app.clone(), task("mock", Some("x"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // mock sin modelo sigue funcionando y no registra modelo
+        let (st, r) = post_task(app, task("mock", None)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert!(r.get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_orchestrator_profile_hot_switch_and_whitelist() {
+        let (state, _s, _w) = state();
+        let app = build_router(state);
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+
+        let mut next = current.clone();
+        next["orchestrator_profile"] = json!("Claudia");
+        let (st, body) = put_settings_json(app.clone(), next).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
+        assert_eq!(prof["profile"], "claudia");
+        assert_eq!(prof["source"], "settings");
+        assert!(prof["allowed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p != "intimo" && p != "mama"));
+
+        // Perfiles privados o desconocidos: 400 y el perfil no cambia.
+        for bad in ["intimo", "mama", "otro"] {
+            let mut n = current.clone();
+            n["orchestrator_profile"] = json!(bad);
+            let (st, _) = put_settings_json(app.clone(), n).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (_, prof) = get_json(app.clone(), "/api/orchestrator/profile").await;
+        assert_eq!(prof["profile"], "claudia");
+
+        // Quitar el ajuste vuelve a env/default.
+        let mut n = current.clone();
+        n["orchestrator_profile"] = json!(null);
+        assert_eq!(put_settings_json(app.clone(), n).await.0, StatusCode::OK);
+        let (_, prof) = get_json(app, "/api/orchestrator/profile").await;
+        let expected = crate::orchestrator::resolve_profile(
+            None,
+            std::env::var(crate::orchestrator::PROFILE_ENV)
+                .ok()
+                .as_deref(),
+        );
+        assert_eq!(prof["profile"], json!(expected));
+        assert_ne!(prof["source"], "settings");
     }
 
     #[tokio::test]

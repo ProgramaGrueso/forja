@@ -99,6 +99,7 @@ mod tests {
             branch: Some("forja/run-1".to_string()),
             worktree: Some("/tmp/wt".to_string()),
             attempts: 1,
+            model: None,
             output: Some("ok".to_string()),
             error: None,
             created_at_ms: 1000,

@@ -75,6 +75,8 @@ impl AppState {
             port: 7777,
             quota_path: default_quota.to_string_lossy().into_owned(),
             hide_mascot: false,
+            agent_models: Default::default(),
+            orchestrator_profile: None,
         };
 
         Self {
@@ -144,6 +146,9 @@ impl AppState {
     pub fn with_settings(self, settings: Settings) -> Self {
         self.quota
             .set_manual_path(PathBuf::from(&settings.quota_path));
+        let _ = self
+            .orchestrator
+            .apply_profile(settings.orchestrator_profile.as_deref());
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
         self
     }
@@ -156,6 +161,44 @@ impl AppState {
     pub(crate) fn on_settings_changed(&self, next: &Settings) {
         self.quota.set_manual_path(PathBuf::from(&next.quota_path));
         let _ = self.scheduler.set_max_concurrency(next.max_concurrency);
+        let _ = self
+            .orchestrator
+            .apply_profile(next.orchestrator_profile.as_deref());
+    }
+
+    /// Agente listo para una tarea: modelo por tarea > ajustes > el que ya traía
+    /// el agente registrado (default en código).
+    pub(crate) fn agent_for_task(
+        &self,
+        kind: AgentKind,
+        task_model: Option<&str>,
+    ) -> Result<Arc<dyn Agent>> {
+        let base = self
+            .get_agent(kind)
+            .ok_or_else(|| ForjaError::NotConfigured(format!("agente {kind} no configurado")))?;
+        let task_model = match task_model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => Some(forja_agent::validate_model(m)?),
+            None => None,
+        };
+        let from_settings = self
+            .settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .agent_models
+            .get(&kind.to_string())
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let explicit_task = task_model.is_some();
+        match task_model.or(from_settings) {
+            None => Ok(base),
+            Some(model) => match base.with_model(&model) {
+                Some(agent) => Ok(agent),
+                None if explicit_task => Err(ForjaError::InvalidInput(format!(
+                    "el agente {kind} no admite elegir modelo"
+                ))),
+                None => Ok(base),
+            },
+        }
     }
 
     fn get_agent(&self, kind: AgentKind) -> Option<Arc<dyn Agent>> {
@@ -179,6 +222,9 @@ pub struct CreateTaskRequest {
     pub privacidad: Privacy,
     #[serde(default = "default_agent")]
     pub agent: AgentKind,
+    /// Override de modelo solo para esta tarea (prioridad sobre los ajustes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modelo: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +300,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/stats", get(api::stats))
         .route("/api/models", get(api::get_models))
         .route("/api/orchestrator/chat", post(orchestrator::chat))
+        .route("/api/orchestrator/profile", get(api::orchestrator_profile))
         .route("/api/orchestrator/reset", post(orchestrator::reset))
         .route("/api/policy", get(api::policy))
         .route("/api/quota", get(api::get_quota).put(api::put_quota))
@@ -347,12 +394,7 @@ async fn create_task(
         )));
     }
 
-    let agent = state.get_agent(req.agent).ok_or_else(|| {
-        ApiError(ForjaError::NotConfigured(format!(
-            "agente {} no configurado",
-            req.agent
-        )))
-    })?;
+    let agent = state.agent_for_task(req.agent, req.modelo.as_deref())?;
 
     let task = Task::new(titulo, prompt, req.privacidad);
     let record = state.scheduler.submit(task, agent).await?;

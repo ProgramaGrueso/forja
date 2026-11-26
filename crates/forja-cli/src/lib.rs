@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -6,10 +7,8 @@ use std::sync::Arc;
 mod friendly;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use forja_agent::{
-    Agent, AgyAgent, ClaudeAgent, HermesAgent, LocalAgent, MockAgent, OpencodeAgent,
-};
-use forja_core::{ForjaError, Privacy, Result, RunRecord, RunStatus, Task};
+use forja_agent::Agent;
+use forja_core::{AgentKind, ForjaError, Privacy, Result, RunRecord, RunStatus, Task};
 use forja_sched::{Scheduler, SchedulerConfig};
 use forja_server::AppState;
 use forja_store::JsonlStore;
@@ -47,6 +46,10 @@ pub enum Command {
 
         #[arg(long)]
         title: Option<String>,
+
+        /// Modelo solo para esta ejecución (prioridad sobre Ajustes y el default).
+        #[arg(long)]
+        model: Option<String>,
 
         prompt: String,
     },
@@ -86,15 +89,40 @@ pub enum CliAgent {
 }
 
 impl CliAgent {
-    fn build_agent(self) -> Arc<dyn Agent> {
+    fn kind(self) -> AgentKind {
         match self {
-            Self::Mock => Arc::new(MockAgent::default()),
-            Self::Agy => Arc::new(AgyAgent::default()),
-            Self::Claude => Arc::new(ClaudeAgent::default()),
-            Self::Opencode => Arc::new(OpencodeAgent::default()),
-            Self::Hermes => Arc::new(HermesAgent::default()),
-            Self::Local => Arc::new(LocalAgent::default()),
+            Self::Mock => AgentKind::Mock,
+            Self::Agy => AgentKind::Agy,
+            Self::Claude => AgentKind::Claude,
+            Self::Opencode => AgentKind::Opencode,
+            Self::Hermes => AgentKind::Hermes,
+            Self::Local => AgentKind::Local,
         }
+    }
+
+    /// Modelo: `--model` > ajustes persistidos > default en código.
+    fn build_agent(
+        self,
+        model: Option<&str>,
+        agent_models: &BTreeMap<String, String>,
+    ) -> Result<Arc<dyn Agent>> {
+        let kind = self.kind();
+        let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => {
+                if forja_agent::default_model(kind).is_none() {
+                    return Err(ForjaError::InvalidInput(format!(
+                        "el agente {kind} no admite --model"
+                    )));
+                }
+                Some(forja_agent::validate_model(m)?)
+            }
+            None => None,
+        };
+        Ok(forja_agent::build_agent(
+            kind,
+            model.as_deref(),
+            agent_models,
+        ))
     }
 }
 
@@ -136,14 +164,17 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             agent,
             privacy,
             title,
+            model,
             prompt,
         } => {
+            let agent_models = load_agent_models(&cli.store_dir);
+            let built = agent.build_agent(model.as_deref(), &agent_models)?;
             let scheduler =
                 build_scheduler(&cli.store_dir, &cli.worktrees_dir, cli.repo, base_branch)?;
             let titulo = title.unwrap_or_else(|| derive_title(&prompt));
             let task = Task::new(titulo, prompt, privacy.into());
 
-            let submitted = scheduler.submit(task, agent.build_agent()).await?;
+            let submitted = scheduler.submit(task, built).await?;
             let finished = scheduler.wait_run(&submitted.id).await?;
 
             writeln!(out, "id: {}", finished.id)?;
@@ -198,6 +229,13 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 });
 
             let hide_mascot = persisted.as_ref().is_some_and(|s| s.hide_mascot);
+            let agent_models = persisted
+                .as_ref()
+                .map(|s| s.agent_models.clone())
+                .unwrap_or_default();
+            let orchestrator_profile = persisted
+                .as_ref()
+                .and_then(|s| s.orchestrator_profile.clone());
 
             let store = JsonlStore::new(&cli.store_dir)?;
             let mut sched_cfg = SchedulerConfig::new(&cli.worktrees_dir);
@@ -213,6 +251,8 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 port,
                 quota_path,
                 hide_mascot,
+                agent_models,
+                orchestrator_profile,
             };
 
             let mut state = AppState::new(scheduler)
@@ -238,6 +278,15 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             forja_server::serve(addr, state).await
         }
     }
+}
+
+/// Modelos por agente de `settings.json` (vacío si no existe o es inválido).
+fn load_agent_models(store_dir: &std::path::Path) -> BTreeMap<String, String> {
+    forja_server::settings::load_settings(&store_dir.join("settings.json"))
+        .ok()
+        .flatten()
+        .map(|s| s.agent_models)
+        .unwrap_or_default()
 }
 
 fn build_scheduler(
@@ -297,6 +346,59 @@ mod tests {
     use super::{execute_with_writer, Cli, CliAgent, CliPrivacy, Command};
 
     #[test]
+    fn run_model_flag_parses_and_resolves_with_priority() {
+        use std::collections::BTreeMap;
+        let cli = Cli::try_parse_from([
+            "forja",
+            "run",
+            "--agent",
+            "claude",
+            "--privacy",
+            "open",
+            "--model",
+            "opus",
+            "hola",
+        ])
+        .expect("parsear --model");
+        let Command::Run { model, agent, .. } = cli.command else {
+            panic!("esperaba run");
+        };
+        assert_eq!(model.as_deref(), Some("opus"));
+
+        let settings: BTreeMap<String, String> =
+            [("claude".to_string(), "haiku".to_string())].into();
+        // --model > ajustes > default
+        assert_eq!(
+            agent
+                .build_agent(Some("opus"), &settings)
+                .unwrap()
+                .model()
+                .as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            agent
+                .build_agent(None, &settings)
+                .unwrap()
+                .model()
+                .as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(
+            CliAgent::Local
+                .build_agent(None, &settings)
+                .unwrap()
+                .model()
+                .as_deref(),
+            Some("moe")
+        );
+        // Mock/hermes no admiten --model; modelos inválidos se rechazan.
+        assert!(CliAgent::Mock.build_agent(Some("x"), &settings).is_err());
+        assert!(CliAgent::Hermes.build_agent(Some("x"), &settings).is_err());
+        assert!(agent.build_agent(Some("--bad"), &settings).is_err());
+    }
+
+    #[test]
     fn parse_run_subcommand() {
         let cli = Cli::try_parse_from([
             "forja",
@@ -333,6 +435,7 @@ mod tests {
                 privacy,
                 title,
                 prompt,
+                ..
             } => {
                 assert_eq!(agent, CliAgent::Mock);
                 assert_eq!(privacy, CliPrivacy::Open);
