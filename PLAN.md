@@ -64,7 +64,7 @@ Estructura final:
 - [x] T10 forja-store (40 min)
       JSONL append-only en un directorio configurable: append_run, list_runs, get_run. Tolera línea corrupta.
       Hecho cuando: `cargo test -p forja-store` pasa, incluido un test con una línea corrupta en medio.
-- [ ] T11 forja-sched: cola y concurrencia (50 min)
+- [x] T11 forja-sched: cola y concurrencia (50 min)
       Planificador con máximo N ejecuciones simultáneas (por defecto 2), estados persistidos en el store.
       Hecho cuando: `cargo test -p forja-sched concurrency` pasa; un test lanza 6 tareas mock y comprueba
       que nunca hay más de N a la vez.
