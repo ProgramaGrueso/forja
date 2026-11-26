@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Formato, clippy y pruebas
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml fija el canal `stable`; rustfmt y clippy no vienen
+      # instalados por defecto y ./scripts/check.sh los exige.
+      - name: Instalar Rust estable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Caché de Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Puerta de calidad
+        run: ./scripts/check.sh
