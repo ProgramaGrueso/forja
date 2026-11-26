@@ -22,7 +22,7 @@ pub use opencode::{
     build_command as build_opencode_command, parse_opencode_output, OpencodeAgent,
     OpencodeCommandOptions,
 };
-pub use runner::{CommandResult, Runner};
+pub use runner::{with_output_sink, CommandResult, OutputSink, OutputStream, Runner};
 
 #[derive(Debug, Clone)]
 pub struct RunContext {
