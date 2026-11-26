@@ -21,14 +21,16 @@ alguien que acaba de clonar el repo.
 
 ## Conversaciones
 
-- **Varias conversaciones en el orquestador.** Hoy el server guarda una sola
-  sesión (`session: Arc<Mutex<Option<String>>>`) y el botón "Nueva" la pisa.
-  Falta: mapa `conversación → session_id`, `conversation_id` en
-  `/api/orchestrator/chat`, endpoints para listar/crear/borrar y una lista
-  lateral con historial por conversación.
-- **Comandos de barra ampliados.** Hoy el panel resuelve `/new` y `/help`; falta
-  `/model`, `/agent`, `/stop` y que `/new` cree una conversación nueva en vez de
-  pisar la única.
+- ~~**Varias conversaciones en el orquestador.**~~ **Hecho en backend**: mapa
+  `conversación → {título, session_id, historial}` (máx. 20 conversaciones y 500
+  mensajes c/u, en memoria), `conversation_id` opcional en
+  `/api/orchestrator/chat` y `/reset` (por defecto `principal`), y
+  `GET|POST /api/orchestrator/conversations`, `GET|DELETE .../conversations/{id}`.
+  Sin mutex durante la llamada a Hermes. Pendiente: lista lateral en el panel.
+- **Comandos de barra ampliados.** **Hecho en servidor**: `/new` (crea
+  conversación y devuelve `conversation_id` + `new_conversation`), `/help`,
+  `/rename`, `/agents`, `/stop`. `/model` y `/agent` están reservados y responden
+  "disponible pronto". Pendiente: usarlos desde el panel.
 
 ## Terminales en paralelo (estilo Orca)
 

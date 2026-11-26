@@ -2,18 +2,20 @@
 //! delega tareas en Forja y revisa sus resultados. El panel lo usa por texto o
 //! por voz (Web Speech API en el navegador).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use axum::extract::State;
+use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::Json;
 use forja_agent::hermes::validate_profile;
 use forja_agent::Runner;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use crate::AppState;
 
@@ -160,26 +162,193 @@ pub fn system_prompt(port: u16, token: Option<&str>) -> String {
     )
 }
 
+/// Id de la conversación por defecto (la que usan `/chat` y `/reset` sin `conversation_id`).
+pub const PRINCIPAL: &str = "principal";
+/// Máximo de conversaciones vivas (incluida la principal).
+pub const MAX_CONVERSATIONS: usize = 20;
+/// Máximo de mensajes por conversación; al pasarse se descartan los más antiguos.
+pub const MAX_MESSAGES: usize = 500;
+const MAX_TITLE_CHARS: usize = 60;
+const AUTO_TITLE_WORDS: usize = 6;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Message {
+    pub rol: String,
+    pub texto: String,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub titulo: String,
+    pub mensajes: usize,
+    pub creado: u64,
+    pub actualizado: u64,
+    /// Hay una llamada a Hermes en curso.
+    pub ocupada: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConversationDetail {
+    #[serde(flatten)]
+    pub resumen: ConversationSummary,
+    pub historial: Vec<Message>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatError {
+    NotFound,
+    /// Ya hay una llamada en curso en esa conversación.
+    Busy,
+    /// Cancelada con `/stop`.
+    Cancelled,
+    Backend(String),
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatError::NotFound => write!(f, "conversación no encontrada"),
+            ChatError::Busy => write!(f, "la conversación ya tiene una llamada en curso"),
+            ChatError::Cancelled => write!(f, "llamada cancelada"),
+            ChatError::Backend(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    /// Se alcanzó `MAX_CONVERSATIONS`.
+    LimitReached,
+}
+
+struct InFlight {
+    seq: u64,
+    cancel: Arc<Notify>,
+}
+
+struct Conversation {
+    title: String,
+    session_id: Option<String>,
+    messages: Vec<Message>,
+    created: u64,
+    updated: u64,
+    in_flight: Option<InFlight>,
+}
+
+impl Conversation {
+    fn new(title: &str) -> Self {
+        let now = now_ms();
+        Self {
+            title: title.to_string(),
+            session_id: None,
+            messages: Vec::new(),
+            created: now,
+            updated: now,
+            in_flight: None,
+        }
+    }
+
+    fn push(&mut self, rol: &str, texto: &str) {
+        let ts = now_ms();
+        self.messages.push(Message {
+            rol: rol.to_string(),
+            texto: texto.to_string(),
+            ts,
+        });
+        if self.messages.len() > MAX_MESSAGES {
+            let excess = self.messages.len() - MAX_MESSAGES;
+            self.messages.drain(..excess);
+        }
+        self.updated = ts;
+    }
+
+    fn summary(&self, id: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            titulo: self.title.clone(),
+            mensajes: self.messages.len(),
+            creado: self.created,
+            actualizado: self.updated,
+            ocupada: self.in_flight.is_some(),
+        }
+    }
+}
+
+struct Inner {
+    map: HashMap<String, Conversation>,
+    counter: u64,
+    seq: u64,
+}
+
+/// Título automático: primeras palabras del primer mensaje.
+pub fn auto_title(message: &str) -> String {
+    let words: Vec<&str> = message.split_whitespace().take(AUTO_TITLE_WORDS).collect();
+    clamp_title(&words.join(" "))
+}
+
+fn clamp_title(title: &str) -> String {
+    title.trim().chars().take(MAX_TITLE_CHARS).collect()
+}
+
+/// Libera la marca "en curso" aunque la petición HTTP se aborte a mitad.
+struct InFlightGuard {
+    inner: Arc<Mutex<Inner>>,
+    id: String,
+    seq: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut g = lock(&self.inner);
+        if let Some(c) = g.map.get_mut(&self.id) {
+            if c.in_flight.as_ref().is_some_and(|f| f.seq == self.seq) {
+                c.in_flight = None;
+            }
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Clone)]
 pub struct Orchestrator {
     backend: Arc<dyn ChatBackend>,
-    session: Arc<Mutex<Option<String>>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Orchestrator {
     pub fn new(backend: Arc<dyn ChatBackend>) -> Self {
+        let mut map = HashMap::new();
+        map.insert(PRINCIPAL.to_string(), Conversation::new("Principal"));
         Self {
             backend,
-            session: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(Inner {
+                map,
+                counter: 0,
+                seq: 0,
+            })),
         }
     }
 
+    /// Único punto donde se decide el backend (y con él el perfil de Hermes).
     pub fn from_env() -> Self {
         Self::new(Arc::new(HermesBackend::from_env()))
     }
 
-    fn current_session(&self) -> Option<String> {
-        self.session.lock().ok().and_then(|g| g.clone())
+    /// Sesión de Hermes de la conversación principal.
+    pub fn current_session(&self) -> Option<String> {
+        self.session_of(PRINCIPAL)
     }
 
     /// Aplica el perfil de los ajustes (con env y `default` como respaldo). Si el
@@ -189,7 +358,7 @@ impl Orchestrator {
         let profile = validate_profile(&wanted).map_err(|e| e.to_string())?;
         if self.backend.profile().as_deref() != Some(profile.as_str()) {
             self.backend.set_profile(&profile);
-            self.reset();
+            self.reset_all_sessions();
         }
         Ok(profile)
     }
@@ -198,38 +367,248 @@ impl Orchestrator {
         self.backend.profile()
     }
 
-    fn reset(&self) {
-        if let Ok(mut g) = self.session.lock() {
-            *g = None;
+    /// Olvida la sesión de Hermes de todas las conversaciones (cambio de perfil).
+    fn reset_all_sessions(&self) {
+        let mut g = lock(&self.inner);
+        for c in g.map.values_mut() {
+            if let Some(f) = c.in_flight.take() {
+                f.cancel.notify_one();
+            }
+            c.session_id = None;
         }
     }
 
+    pub fn session_of(&self, id: &str) -> Option<String> {
+        lock(&self.inner)
+            .map
+            .get(id)
+            .and_then(|c| c.session_id.clone())
+    }
+
+    /// Crea una conversación; `title` vacío = se titula con el primer mensaje.
+    pub fn create(&self, title: Option<&str>) -> Result<ConversationSummary, CreateError> {
+        let mut g = lock(&self.inner);
+        if g.map.len() >= MAX_CONVERSATIONS {
+            return Err(CreateError::LimitReached);
+        }
+        g.counter += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
+        while g.map.contains_key(&id) {
+            g.counter += 1;
+            id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
+        }
+        let conv = Conversation::new(&clamp_title(title.unwrap_or("")));
+        let summary = conv.summary(&id);
+        g.map.insert(id, conv);
+        Ok(summary)
+    }
+
+    /// Lista por actividad reciente (la más nueva primero).
+    pub fn list(&self) -> Vec<ConversationSummary> {
+        let g = lock(&self.inner);
+        let mut v: Vec<ConversationSummary> = g.map.iter().map(|(id, c)| c.summary(id)).collect();
+        v.sort_by(|a, b| {
+            b.actualizado
+                .cmp(&a.actualizado)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        v
+    }
+
+    pub fn get(&self, id: &str) -> Option<ConversationDetail> {
+        let g = lock(&self.inner);
+        g.map.get(id).map(|c| ConversationDetail {
+            resumen: c.summary(id),
+            historial: c.messages.clone(),
+        })
+    }
+
+    /// Borra una conversación (cancelando su llamada en curso). La principal no
+    /// desaparece: se vacía. Devuelve `false` si no existe.
+    pub fn delete(&self, id: &str) -> bool {
+        let mut g = lock(&self.inner);
+        if id == PRINCIPAL {
+            if let Some(c) = g.map.get_mut(PRINCIPAL) {
+                if let Some(f) = c.in_flight.take() {
+                    f.cancel.notify_one();
+                }
+                *c = Conversation::new("Principal");
+            }
+            return true;
+        }
+        match g.map.remove(id) {
+            Some(c) => {
+                if let Some(f) = c.in_flight {
+                    f.cancel.notify_one();
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Olvida la sesión de Hermes y el historial, conservando id y título.
+    pub fn reset_conversation(&self, id: &str) -> bool {
+        let mut g = lock(&self.inner);
+        match g.map.get_mut(id) {
+            Some(c) => {
+                if let Some(f) = c.in_flight.take() {
+                    f.cancel.notify_one();
+                }
+                c.session_id = None;
+                c.messages.clear();
+                c.updated = now_ms();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reinicia la conversación principal.
+    pub fn reset(&self) {
+        self.reset_conversation(PRINCIPAL);
+    }
+
+    pub fn rename(&self, id: &str, title: &str) -> bool {
+        let mut g = lock(&self.inner);
+        match g.map.get_mut(id) {
+            Some(c) => {
+                c.title = clamp_title(title);
+                c.updated = now_ms();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Cancela la llamada en curso de la conversación. `true` si había algo.
+    pub fn stop(&self, id: &str) -> bool {
+        let g = lock(&self.inner);
+        match g.map.get(id).and_then(|c| c.in_flight.as_ref()) {
+            Some(f) => {
+                f.cancel.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Habla en la conversación principal.
     pub async fn say(
         &self,
         message: &str,
         port: u16,
         token: Option<&str>,
     ) -> Result<String, String> {
-        let resume = self.current_session();
+        self.say_in(PRINCIPAL, message, port, token)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Habla en una conversación. El mutex nunca se mantiene durante la llamada
+    /// a Hermes: se clona la sesión, se suelta, se llama y se vuelve a tomar.
+    pub async fn say_in(
+        &self,
+        id: &str,
+        message: &str,
+        port: u16,
+        token: Option<&str>,
+    ) -> Result<String, ChatError> {
+        let (resume, cancel, seq) = {
+            let mut g = lock(&self.inner);
+            g.seq += 1;
+            let seq = g.seq;
+            let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
+            if conv.in_flight.is_some() {
+                return Err(ChatError::Busy);
+            }
+            if conv.title.is_empty() {
+                conv.title = auto_title(message);
+            }
+            conv.push("usuario", message);
+            let cancel = Arc::new(Notify::new());
+            conv.in_flight = Some(InFlight {
+                seq,
+                cancel: cancel.clone(),
+            });
+            (conv.session_id.clone(), cancel, seq)
+        };
+        let _guard = InFlightGuard {
+            inner: self.inner.clone(),
+            id: id.to_string(),
+            seq,
+        };
         let prompt = if resume.is_some() {
             message.to_string()
         } else {
             format!("{}{message}", system_prompt(port, token))
         };
-        let reply = self.backend.chat(prompt, resume).await?;
-        if let (Some(id), Ok(mut g)) = (reply.session_id, self.session.lock()) {
-            *g = Some(id);
+        let outcome = tokio::select! {
+            r = self.backend.chat(prompt, resume) => Some(r),
+            _ = cancel.notified() => None,
+        };
+        let mut g = lock(&self.inner);
+        let Some(conv) = g.map.get_mut(id) else {
+            // Borrada mientras hablaba: no hay dónde guardar nada.
+            return match outcome {
+                Some(Ok(reply)) => Ok(reply.text),
+                Some(Err(e)) => Err(ChatError::Backend(e)),
+                None => Err(ChatError::Cancelled),
+            };
+        };
+        match outcome {
+            Some(Ok(reply)) => {
+                if let Some(sid) = reply.session_id {
+                    conv.session_id = Some(sid);
+                }
+                conv.push("orquestador", &reply.text);
+                Ok(reply.text)
+            }
+            Some(Err(e)) => Err(ChatError::Backend(e)),
+            None => {
+                conv.push("sistema", "Llamada cancelada con /stop.");
+                Err(ChatError::Cancelled)
+            }
         }
-        Ok(reply.text)
     }
 }
 
-/// Comandos de barra que el panel resuelve sin llamar a Hermes.
+/// Comandos de barra que el servidor resuelve sin llamar a Hermes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     New,
     Help,
+    Rename(String),
+    Agents,
+    Stop,
+    /// Reservado: lo implementa otro stream.
+    Model(String),
+    /// Reservado: lo implementa otro stream.
+    Agent(String),
     Unknown(String),
+}
+
+/// (comando, descripción) para `/help`.
+pub const COMMAND_HELP: &[(&str, &str)] = &[
+    ("/new", "crea una conversación nueva"),
+    ("/help", "muestra esta lista"),
+    ("/rename <título>", "cambia el título de la conversación"),
+    ("/agents", "lista los agentes de Forja y su estado"),
+    ("/stop", "cancela la llamada en curso de la conversación"),
+    ("/model", "disponible pronto"),
+    ("/agent", "disponible pronto"),
+];
+
+pub fn help_text() -> String {
+    let mut s = String::from("Comandos:");
+    for (cmd, desc) in COMMAND_HELP {
+        s.push_str(&format!("\n{cmd}: {desc}"));
+    }
+    s
 }
 
 /// Devuelve `None` si el mensaje no es un comando (va normal al orquestador).
@@ -238,14 +617,17 @@ pub fn parse_command(message: &str) -> Option<Command> {
     if !trimmed.starts_with('/') {
         return None;
     }
-    let word = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let word = parts.next().unwrap_or_default().to_lowercase();
+    let arg = parts.next().unwrap_or_default().trim().to_string();
     Some(match word.as_str() {
         "/new" | "/reset" | "/nueva" => Command::New,
         "/help" | "/ayuda" | "/comandos" => Command::Help,
+        "/rename" | "/renombrar" => Command::Rename(arg),
+        "/agents" | "/agentes" => Command::Agents,
+        "/stop" | "/parar" => Command::Stop,
+        "/model" => Command::Model(arg),
+        "/agent" => Command::Agent(arg),
         _ => Command::Unknown(word),
     })
 }
@@ -253,11 +635,38 @@ pub fn parse_command(message: &str) -> Option<Command> {
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatResponse {
     reply: String,
+    conversation_id: String,
+}
+
+fn conv_id(raw: &Option<String>) -> String {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(PRINCIPAL)
+        .to_string()
+}
+
+fn not_found() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "conversación no encontrada" })),
+    )
+}
+
+fn limit_reached() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!("límite de {MAX_CONVERSATIONS} conversaciones; borra alguna")
+        })),
+    )
 }
 
 pub async fn chat(
@@ -271,43 +680,170 @@ pub async fn chat(
             Json(json!({"error": "el mensaje no puede estar vacío"})),
         );
     }
+    let id = conv_id(&req.conversation_id);
     let port = state.settings.read().map(|s| s.port).unwrap_or(7777);
     if let Some(cmd) = parse_command(message) {
-        return match cmd {
-            Command::New => {
-                state.orchestrator.reset();
-                (
-                    StatusCode::OK,
-                    Json(json!({ "reply": "Sesión nueva. ¿Qué hacemos?" })),
-                )
-            }
-            Command::Help => (
-                StatusCode::OK,
-                Json(json!({
-                    "reply": "Comandos: /new para empezar una sesión nueva, /help para ver esto."
-                })),
-            ),
-            Command::Unknown(cmd) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("comando desconocido: {cmd}. Usa /new o /help.")
-                })),
-            ),
-        };
+        return run_command(&state, &id, cmd).await;
     }
     match state
         .orchestrator
-        .say(message, port, state.auth_token.as_deref())
+        .say_in(&id, message, port, state.auth_token.as_deref())
         .await
     {
-        Ok(reply) => (StatusCode::OK, Json(json!(ChatResponse { reply }))),
-        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))),
+        Ok(reply) => (
+            StatusCode::OK,
+            Json(json!(ChatResponse {
+                reply,
+                conversation_id: id
+            })),
+        ),
+        Err(ChatError::NotFound) => not_found(),
+        Err(ChatError::Busy) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": ChatError::Busy.to_string() })),
+        ),
+        Err(ChatError::Cancelled) => (
+            StatusCode::OK,
+            Json(json!({
+                "reply": "Llamada cancelada.",
+                "conversation_id": id,
+                "cancelled": true
+            })),
+        ),
+        Err(ChatError::Backend(error)) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": error })))
+        }
     }
 }
 
-pub async fn reset(State(state): State<AppState>) -> StatusCode {
-    state.orchestrator.reset();
-    StatusCode::NO_CONTENT
+async fn run_command(state: &AppState, id: &str, cmd: Command) -> (StatusCode, Json<Value>) {
+    let orq = &state.orchestrator;
+    let ok = |v: Value| (StatusCode::OK, Json(v));
+    match cmd {
+        Command::New => match orq.create(None) {
+            Ok(c) => ok(json!({
+                "reply": "Conversación nueva. ¿Qué hacemos?",
+                "conversation_id": c.id,
+                "new_conversation": true
+            })),
+            Err(CreateError::LimitReached) => limit_reached(),
+        },
+        Command::Help => ok(json!({ "reply": help_text(), "conversation_id": id })),
+        Command::Rename(title) => {
+            if title.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "uso: /rename <título>" })),
+                );
+            }
+            if !orq.rename(id, &title) {
+                return not_found();
+            }
+            ok(json!({
+                "reply": format!("Título cambiado a: {}", clamp_title(&title)),
+                "conversation_id": id
+            }))
+        }
+        Command::Agents => {
+            let runs = state.scheduler.list_runs().await;
+            let views = crate::api::build_agent_views(&state.metas, &runs);
+            let mut lines = vec!["Agentes de Forja:".to_string()];
+            for v in &views {
+                lines.push(format!(
+                    "{} ({}, {}): {}, {}",
+                    v.name,
+                    v.provider,
+                    v.model,
+                    if v.available {
+                        "disponible"
+                    } else {
+                        "no disponible"
+                    },
+                    v.state
+                ));
+            }
+            ok(json!({
+                "reply": lines.join("\n"),
+                "conversation_id": id,
+                "agents": views
+            }))
+        }
+        Command::Stop => {
+            let stopped = orq.stop(id);
+            let reply = if stopped {
+                "Cancelando la llamada en curso."
+            } else {
+                "No hay nada en curso en esta conversación."
+            };
+            ok(json!({ "reply": reply, "conversation_id": id, "stopped": stopped }))
+        }
+        Command::Model(_) | Command::Agent(_) => {
+            ok(json!({ "reply": "Disponible pronto.", "conversation_id": id }))
+        }
+        Command::Unknown(cmd) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("comando desconocido: {cmd}. Usa /help para ver la lista.")
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResetRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+}
+
+pub async fn reset(State(state): State<AppState>, body: Option<Json<ResetRequest>>) -> StatusCode {
+    let id = conv_id(&body.and_then(|Json(b)| b.conversation_id));
+    if state.orchestrator.reset_conversation(&id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateRequest {
+    #[serde(default, alias = "titulo")]
+    pub title: Option<String>,
+}
+
+pub async fn list_conversations(State(state): State<AppState>) -> Json<Vec<ConversationSummary>> {
+    Json(state.orchestrator.list())
+}
+
+pub async fn create_conversation(
+    State(state): State<AppState>,
+    body: Option<Json<CreateRequest>>,
+) -> (StatusCode, Json<Value>) {
+    let title = body.and_then(|Json(b)| b.title);
+    match state.orchestrator.create(title.as_deref()) {
+        Ok(c) => (StatusCode::CREATED, Json(json!(c))),
+        Err(CreateError::LimitReached) => limit_reached(),
+    }
+}
+
+pub async fn get_conversation(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> (StatusCode, Json<Value>) {
+    match state.orchestrator.get(&id) {
+        Some(d) => (StatusCode::OK, Json(json!(d))),
+        None => not_found(),
+    }
+}
+
+pub async fn delete_conversation(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> StatusCode {
+    if state.orchestrator.delete(&id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +969,408 @@ mod tests {
         drop(calls);
         orq.reset();
         assert!(orq.current_session().is_none());
+    }
+
+    /// Doble que da una sesión distinta por conversación nueva y reutiliza la recibida.
+    struct SessionFake {
+        n: Mutex<u32>,
+        calls: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl SessionFake {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                n: Mutex::new(0),
+                calls: Mutex::new(vec![]),
+            })
+        }
+    }
+
+    impl ChatBackend for SessionFake {
+        fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
+            Box::pin(async move {
+                let sid = resume.clone().unwrap_or_else(|| {
+                    let mut n = self.n.lock().unwrap();
+                    *n += 1;
+                    format!("sess-{n}")
+                });
+                self.calls.lock().unwrap().push((prompt, resume));
+                Ok(ChatReply {
+                    text: "ok".into(),
+                    session_id: Some(sid),
+                })
+            })
+        }
+    }
+
+    /// Doble que bloquea hasta que `n` llamadas están en vuelo a la vez.
+    struct BarrierFake(tokio::sync::Barrier);
+
+    impl ChatBackend for BarrierFake {
+        fn chat(&self, _prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+            Box::pin(async move {
+                self.0.wait().await;
+                Ok(ChatReply {
+                    text: "par".into(),
+                    session_id: None,
+                })
+            })
+        }
+    }
+
+    /// Doble que nunca responde (para `/stop`).
+    struct HangFake;
+
+    impl ChatBackend for HangFake {
+        fn chat(&self, _prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn conversations_have_isolated_sessions_and_history() {
+        let fake = SessionFake::new();
+        let orq = Orchestrator::new(fake.clone());
+        let a = orq.create(Some("A")).unwrap().id;
+        let b = orq.create(Some("B")).unwrap().id;
+        orq.say_in(&a, "hola a", 1, None).await.unwrap();
+        orq.say_in(&b, "hola b", 1, None).await.unwrap();
+        orq.say("hola p", 1, None).await.unwrap();
+        let (sa, sb, sp) = (
+            orq.session_of(&a).unwrap(),
+            orq.session_of(&b).unwrap(),
+            orq.current_session().unwrap(),
+        );
+        assert!(sa != sb && sb != sp && sa != sp);
+        orq.say_in(&a, "otra", 1, None).await.unwrap();
+        assert_eq!(orq.session_of(&a).unwrap(), sa);
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.last().unwrap().1.as_deref(), Some(sa.as_str()));
+        drop(calls);
+        let da = orq.get(&a).unwrap();
+        assert_eq!(da.historial.len(), 4);
+        assert_eq!(da.historial[0].rol, "usuario");
+        assert_eq!(da.historial[1].rol, "orquestador");
+        assert_eq!(orq.get(&b).unwrap().historial.len(), 2);
+        assert_eq!(orq.get(PRINCIPAL).unwrap().historial.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_conversations_talk_at_the_same_time() {
+        let orq = Orchestrator::new(Arc::new(BarrierFake(tokio::sync::Barrier::new(2))));
+        let a = orq.create(None).unwrap().id;
+        let b = orq.create(None).unwrap().id;
+        let (o1, o2) = (orq.clone(), orq.clone());
+        let work = async move {
+            tokio::join!(o1.say_in(&a, "uno", 1, None), o2.say_in(&b, "dos", 1, None))
+        };
+        // Si un lock se mantuviera durante la llamada, el Barrier nunca se liberaría.
+        let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(5), work)
+            .await
+            .expect("las dos conversaciones deben avanzar a la vez");
+        assert_eq!(ra.unwrap(), "par");
+        assert_eq!(rb.unwrap(), "par");
+    }
+
+    #[tokio::test]
+    async fn same_conversation_rejects_overlapping_calls_and_stop_cancels() {
+        let orq = Orchestrator::new(Arc::new(HangFake));
+        let id = orq.create(None).unwrap().id;
+        let (o, i) = (orq.clone(), id.clone());
+        let task = tokio::spawn(async move { o.say_in(&i, "cuelga", 1, None).await });
+        while !orq.get(&id).unwrap().resumen.ocupada {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(orq.say_in(&id, "otra", 1, None).await, Err(ChatError::Busy));
+        assert!(orq.stop(&id));
+        assert_eq!(task.await.unwrap(), Err(ChatError::Cancelled));
+        let d = orq.get(&id).unwrap();
+        assert!(!d.resumen.ocupada);
+        assert_eq!(d.historial.last().unwrap().rol, "sistema");
+        assert!(!orq.stop(&id), "ya no hay nada en curso");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_conversation_but_principal_is_only_cleared() {
+        let orq = Orchestrator::new(SessionFake::new());
+        let a = orq.create(None).unwrap().id;
+        orq.say_in(&a, "hola", 1, None).await.unwrap();
+        assert!(orq.delete(&a));
+        assert!(orq.get(&a).is_none());
+        assert!(!orq.delete(&a));
+        assert_eq!(orq.say_in(&a, "x", 1, None).await, Err(ChatError::NotFound));
+        orq.say("p", 1, None).await.unwrap();
+        assert!(orq.delete(PRINCIPAL));
+        assert!(orq.current_session().is_none());
+        assert_eq!(orq.get(PRINCIPAL).unwrap().historial.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn limits_on_conversations_and_messages() {
+        let orq = Orchestrator::new(SessionFake::new());
+        // La principal ya cuenta.
+        for _ in 1..MAX_CONVERSATIONS {
+            orq.create(None).unwrap();
+        }
+        assert_eq!(orq.create(None), Err(CreateError::LimitReached));
+        assert_eq!(orq.list().len(), MAX_CONVERSATIONS);
+        for i in 0..(MAX_MESSAGES / 2 + 10) {
+            orq.say(&format!("m{i}"), 1, None).await.unwrap();
+        }
+        let d = orq.get(PRINCIPAL).unwrap();
+        assert_eq!(d.historial.len(), MAX_MESSAGES);
+        assert_eq!(d.resumen.mensajes, MAX_MESSAGES);
+        assert!(d.historial.last().unwrap().texto == "ok");
+        // Se descartaron los más antiguos.
+        assert!(d.historial.iter().all(|m| m.texto != "m0"));
+    }
+
+    #[tokio::test]
+    async fn title_is_automatic_from_first_message_and_rename_wins() {
+        let orq = Orchestrator::new(SessionFake::new());
+        let a = orq.create(None).unwrap().id;
+        assert_eq!(orq.get(&a).unwrap().resumen.titulo, "");
+        orq.say_in(&a, "uno dos tres cuatro cinco seis siete ocho", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            orq.get(&a).unwrap().resumen.titulo,
+            "uno dos tres cuatro cinco seis"
+        );
+        orq.say_in(&a, "otro mensaje distinto", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            orq.get(&a).unwrap().resumen.titulo,
+            "uno dos tres cuatro cinco seis"
+        );
+        assert!(orq.rename(&a, "  Mi título  "));
+        assert_eq!(orq.get(&a).unwrap().resumen.titulo, "Mi título");
+        assert!(!orq.rename("nope", "x"));
+        let named = orq.create(Some("Fijo")).unwrap().id;
+        orq.say_in(&named, "hola", 1, None).await.unwrap();
+        assert_eq!(orq.get(&named).unwrap().resumen.titulo, "Fijo");
+    }
+
+    #[test]
+    fn parses_new_commands() {
+        assert_eq!(
+            parse_command("/rename Mi chat  largo"),
+            Some(Command::Rename("Mi chat  largo".into()))
+        );
+        assert_eq!(parse_command("/rename"), Some(Command::Rename("".into())));
+        assert_eq!(parse_command("/agents"), Some(Command::Agents));
+        assert_eq!(parse_command("/stop"), Some(Command::Stop));
+        assert_eq!(
+            parse_command("/model gpt x"),
+            Some(Command::Model("gpt x".into()))
+        );
+        assert_eq!(
+            parse_command("/agent claude"),
+            Some(Command::Agent("claude".into()))
+        );
+        let help = help_text();
+        for (cmd, _) in COMMAND_HELP {
+            assert!(help.contains(cmd));
+        }
+    }
+
+    mod http {
+        use super::*;
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Method, Request};
+        use forja_sched::{Scheduler, SchedulerConfig};
+        use forja_store::JsonlStore;
+        use tempfile::TempDir;
+        use tower::ServiceExt;
+
+        fn app(orq: Orchestrator) -> (axum::Router, TempDir, TempDir) {
+            let s = TempDir::new().unwrap();
+            let w = TempDir::new().unwrap();
+            let store = JsonlStore::new(s.path()).unwrap();
+            let sched = Scheduler::new(store, SchedulerConfig::new(w.path())).unwrap();
+            let state = AppState::new(sched).with_orchestrator(orq);
+            (crate::build_router(state), s, w)
+        }
+
+        async fn call(
+            app: &axum::Router,
+            method: Method,
+            uri: &str,
+            body: Option<Value>,
+        ) -> (StatusCode, Value) {
+            let mut b = Request::builder().method(method).uri(uri);
+            let body = match body {
+                Some(v) => {
+                    b = b.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(v.to_string())
+                }
+                None => Body::empty(),
+            };
+            let resp = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, v)
+        }
+
+        #[tokio::test]
+        async fn chat_without_conversation_id_uses_principal_and_reset_works() {
+            let orq = Orchestrator::new(SessionFake::new());
+            let (app, _s, _w) = app(orq.clone());
+            let (st, v) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/chat",
+                Some(json!({"message": "hola"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(v["reply"], "ok");
+            assert_eq!(v["conversation_id"], PRINCIPAL);
+            assert!(orq.current_session().is_some());
+            let (st, _) = call(&app, Method::POST, "/api/orchestrator/reset", None).await;
+            assert_eq!(st, StatusCode::NO_CONTENT);
+            assert!(orq.current_session().is_none());
+        }
+
+        #[tokio::test]
+        async fn crud_endpoints_and_conversation_id_in_chat() {
+            let (app, _s, _w) = app(Orchestrator::new(SessionFake::new()));
+            let (st, v) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/conversations",
+                Some(json!({"title": "Uno"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED);
+            let id = v["id"].as_str().unwrap().to_string();
+            let (_, v) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/chat",
+                Some(json!({"message": "hola", "conversation_id": id})),
+            )
+            .await;
+            assert_eq!(v["conversation_id"], id.as_str());
+            let (st, v) = call(
+                &app,
+                Method::GET,
+                &format!("/api/orchestrator/conversations/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(v["titulo"], "Uno");
+            assert_eq!(v["historial"].as_array().unwrap().len(), 2);
+            let (_, v) = call(&app, Method::GET, "/api/orchestrator/conversations", None).await;
+            assert_eq!(v.as_array().unwrap().len(), 2);
+            // reset por conversación
+            let (st, _) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/reset",
+                Some(json!({"conversation_id": id})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::NO_CONTENT);
+            let (st, _) = call(
+                &app,
+                Method::DELETE,
+                &format!("/api/orchestrator/conversations/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::NO_CONTENT);
+            let (st, _) = call(
+                &app,
+                Method::GET,
+                &format!("/api/orchestrator/conversations/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            let (st, _) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/chat",
+                Some(json!({"message": "hola", "conversation_id": id})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn slash_commands_over_http() {
+            let orq = Orchestrator::new(SessionFake::new());
+            let (app, _s, _w) = app(orq.clone());
+            let chat = |msg: &'static str, id: Option<&'static str>| {
+                let app = app.clone();
+                async move {
+                    call(
+                        &app,
+                        Method::POST,
+                        "/api/orchestrator/chat",
+                        Some(json!({"message": msg, "conversation_id": id})),
+                    )
+                    .await
+                }
+            };
+            let (st, v) = chat("/new", None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(v["new_conversation"], true);
+            let new_id = v["conversation_id"].as_str().unwrap().to_string();
+            assert_ne!(new_id, PRINCIPAL);
+            assert!(orq.get(&new_id).is_some());
+
+            let (_, v) = chat("/help", None).await;
+            let r = v["reply"].as_str().unwrap();
+            assert!(r.contains("/rename") && r.contains("/stop") && r.contains("/agents"));
+
+            let (st, _) = chat("/rename", None).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+            let (st, v) = chat("/rename Nuevo nombre", None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(v["conversation_id"], PRINCIPAL);
+            assert_eq!(orq.get(PRINCIPAL).unwrap().resumen.titulo, "Nuevo nombre");
+
+            let (st, v) = chat("/agents", None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(v["reply"].as_str().unwrap().contains("mock"));
+            assert!(!v["agents"].as_array().unwrap().is_empty());
+
+            let (st, v) = chat("/stop", None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(v["stopped"], false);
+            assert!(v["reply"].as_str().unwrap().contains("nada en curso"));
+
+            for cmd in ["/model x", "/agent claude"] {
+                let (st, v) = chat(cmd, None).await;
+                assert_eq!(st, StatusCode::OK);
+                assert!(v["reply"].as_str().unwrap().contains("pronto"));
+            }
+            let (st, _) = chat("/loquesea", None).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+            // los comandos no entran en el historial ni llaman al backend
+            assert_eq!(orq.get(PRINCIPAL).unwrap().historial.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn new_command_reports_limit() {
+            let orq = Orchestrator::new(SessionFake::new());
+            for _ in 1..MAX_CONVERSATIONS {
+                orq.create(None).unwrap();
+            }
+            let (app, _s, _w) = app(orq);
+            let (st, _) = call(
+                &app,
+                Method::POST,
+                "/api/orchestrator/chat",
+                Some(json!({"message": "/new"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CONFLICT);
+        }
     }
 }
