@@ -56,7 +56,7 @@ Estructura final:
       Runner ejecuta el comando con tokio::process, con timeout y captura de stdout/stderr. Test con
       tests/fake_agy.sh (script que imprime JSON y sale 0/1 según variable de entorno).
       Hecho cuando: `cargo test -p forja-agent runner` pasa; cubre éxito, código distinto de 0 y timeout.
-- [ ] T09 forja-agent: parseo de salida de agy (30 min)
+- [x] T09 forja-agent: parseo de salida de agy (30 min)
       Tolerante: si el JSON no parsea, devuelve el texto crudo como AgentOutput y un aviso, sin panic.
       Hecho cuando: `cargo test -p forja-agent parse` pasa con JSON válido, JSON roto y salida vacía.
 

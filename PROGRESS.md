@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T08 (forja-agent Runner) y T10 (forja-store JSONL)
-- Tarea en curso: T09 (forja-agent: parseo de salida de agy)
+- Última tarea cerrada: T09 (forja-agent parseo y AgyAgent) — Fase 1 completa
+- Tarea en curso: T11 (forja-sched: cola y concurrencia)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -101,13 +101,23 @@
 - Notas para retomar: `Runner` y `fake_agy.sh` integrados.
 
 ### T09 — forja-agent: parseo de salida de agy
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:08:55-05:00 / 2026-11-26T00:11:12-05:00
+- Quién la hizo: subagente noche/forja-T09 (verificado e integrado por agente principal)
+- Commits: e483c5c T09: parseo tolerante de salida de agy y AgyAgent en forja-agent
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-agent parse && ./scripts/check.sh` -> exit 0; `parse`: `test result: ok. 5 passed; 0 failed; 0 ignored`; `forja-agent`: `19 passed`; workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: Fase 1 cerrada. Arranca T11 (`forja-sched`: cola y concurrencia).
+
+### T11 — forja-sched: cola y concurrencia
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:08:55-05:00 /
-- Quién la hizo: subagente noche/forja-T09
+- Hora de inicio / fin: 2026-11-26T00:11:25-05:00 /
+- Quién la hizo: subagente noche/forja-T11
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T09.
+- Notas para retomar: worktree ../forja-wt-T11.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
@@ -132,6 +142,7 @@
 | 00:04 | T05 | noche/forja-T05 | gemini-4-neon-low | aceptado (5/5 tests forja-git, 0 grep push + check.sh en verde a la primera) |
 | 00:07 | T08 | noche/forja-T08 | gemini-4-neon-medium | aceptado (4/4 tests runner + fake_agy.sh + check.sh en verde a la primera) |
 | 00:07 | T10 | noche/forja-T10 | gemini-4-neon-low | aceptado (4/4 tests forja-store + línea corrupta + check.sh en verde a la primera) |
+| 00:09 | T09 | noche/forja-T09 | gemini-4-neon-low | aceptado (5/5 tests parse + AgyAgent + check.sh en verde a la primera) |
 
 ## Siguiente paso exacto
 Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.
