@@ -380,3 +380,72 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
   `NotConfigured` (lo pedido: "junto a Mock y Agy"); `ENTREGA.md` reescrito para V00.
 - Notas para retomar: base lista para que otros trabajen en paralelo; los stubs devuelven
   `NotConfigured` hasta que alguien implemente el Runner real de cada adaptador.
+
+---
+
+# Sesión V03 — Adaptador real de Hermes (worktree forja-wt-V03)
+
+## Estado
+- Rama: noche/forja-V03 (desde noche/forja-V00 @ b4cb72d)
+- Inicio: 2026-11-26T06:50:00-05:00 (aprox.)
+- Tarea: V03 — reemplazar el stub de `crates/forja-agent/src/hermes.rs` por el adaptador real.
+
+## Registro
+### V03 — HermesAgent real (build_command + Runner + lista blanca de perfiles)
+- Estado: terminada (revisión independiente: ACEPTA)
+- Quién la hizo: agente principal (GLM-5.3 vía opencode)
+- Investigación previa (solo lectura, sin gasto de saldo):
+  - `hermes --help`: `-p <perfil>` aparece en el epílogo ("Run any command against a named
+    profile's home (also --profile)"); se consume pre-argparse, por eso no sale en la línea
+    de uso. `hermes chat --help`: confirma `--query-file PATH`, `-Q/--quiet`, `--oneshot`.
+  - `hermes profile list`: perfiles reales = default, claudia, intimo, mama, yuuki → la lista
+    blanca pedida ["default","claudia","yuuki"] excluye exactamente los privados intimo/mama
+    (coincide con `HIDDEN_HERMES_PROFILES` de forja-server/models.rs).
+  - Código fuente de hermes (`_parser.py`, `cli_single_query.py`): regex de nombre
+    `^[a-z0-9][a-z0-9_-]{0,63}$` con casefold previo (lo espeja `validate_profile`); en modo
+    quieto la respuesta final va a stdout y `session_id:` a stderr (lo espeja el parseo y el
+    script falso).
+- Cambios:
+  - `crates/forja-agent/src/hermes.rs`: adaptador real. `build_command` pura (argv
+    `hermes -p <perfil> chat --query-file <archivo> -Q --oneshot`), `validate_profile`
+    (normaliza trim+minúsculas, valida charset espejando la regex de hermes y aplica la lista
+    blanca ANTES de crear el temp o el proceso), prompt en archivo temporal
+    `forja-hermes-prompt-<uuid v4>.txt` en `std::env::temp_dir()`, borrado SIEMPRE
+    (paso explícito con aviso en warnings + `PromptFileGuard` con Drop para cancelaciones
+    + limpieza best-effort si falla la escritura), `parse_hermes_output` tolerante (vacío →
+    aviso; texto crudo recortado → respuesta), programa ausente → `ForjaError::Agent` con
+    mensaje claro en español (mapea `ErrorKind::NotFound`), cwd = `ctx.worktree`, sin shell.
+    Campo `program` (defecto "hermes") + `with_program()` para apuntar tests al script falso.
+  - `crates/forja-agent/tests/fake_hermes.sh` (nuevo, ejecutable): falso `hermes` sin red ni
+    LLM; verifica la forma del argv, informa `query_file:`/`cwd:` en stderr para que los tests
+    comprueben limpieza y cwd, y se dirige por el contenido del prompt (FAKE:fail /
+    FAKE:timeout / FAKE:empty / eco literal).
+  - `crates/forja-agent/Cargo.toml` + `Cargo.lock`: línea `uuid.workspace = true` (uuid ya
+    estaba en `[workspace.dependencies]`, permitida por PLAN.md y ya compilada vía
+    forja-core/forja-sched: ningún crate nuevo entra al grafo). DECISIÓN PROPIA: la tarea
+    pedía "nombre único con uuid" y PLAN.md permite uuid; es la única desviación de "no
+    toques otro archivo" (documentada también en ENTREGA.md).
+- Tests nuevos en hermes.rs (11, todos en verde): defaults, forma exacta de build_command
+  (ruta con espacios/comillas), argv[0] reemplazable, acepta blancos+normaliza, rechaza
+  desconocidos/privados (intimo, mama, INTIMO, MaMa...), rechaza nombres inválidos
+  (vacío, ../yuuki, espacios, /, ;, 65 chars), parseo texto/vacío, éxito verbatim con
+  comillas+saltos+metacaracteres (verifica cwd y borrado del temp), código ≠ 0 (verifica
+  borrado del temp aunque falle), timeout 1s, salida vacía (aviso + borrado), programa
+  inexistente (mensaje claro), perfiles privados rechazados antes de ejecutar nada.
+- Comando de verificación y resultado real:
+  `cargo test -p forja-agent` -> `test result: ok. 37 passed; 0 failed; 1 ignored`
+  (antes 26+1: +11 de hermes); `./scripts/check.sh` -> **exit 0** (fmt, clippy -D warnings,
+  `cargo test --workspace`: 123 passed, 0 failed, 1 ignored = desglose forja-agent 37+1
+  ignored · forja-cli 8 · e2e 1 · forja-core 12 · forja-git 5 · forja-sched 8 ·
+  forja-server 48 · forja-store 4).
+- Intentos fallidos (máx. 3): uno menor de compilación (`executed` necesitaba `mut` para
+  `as_mut()`) y un `cargo fmt` (dos expresiones largas); corregidos al momento.
+- Revisión independiente: subagente con OTRO modelo (`opencode-go/kimi-k2.7-code`; el
+  Claude externo `opencode/claude-fable-5-2` falló por saldo del proveedor) en modo
+  auditor adversarial de solo lectura. **VEREDICTO: ACEPTA.** Hallazgos: guard movido ANTES
+  de la escritura del temp (corregido) y longitud de perfil en caracteres no bytes
+  (corregido); doble fallo comando+borrado sin aviso, E/S síncrona en Drop y mensaje de
+  nombre inválido sin lista blanca aceptados con justificación (menores/cosméticos, ver
+  ENTREGA.md). Re-verificado tras corregir: `./scripts/check.sh` -> exit 0 de nuevo.
+- Notas para retomar: opencode.rs y local.rs siguen siendo stubs NotConfigured (tareas V01/V02
+  de otros worktrees); hermes real queda operativo para `forja run --agent hermes`.
