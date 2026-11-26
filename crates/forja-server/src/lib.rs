@@ -3,6 +3,7 @@ pub mod delegation;
 pub mod models;
 pub mod orchestrator;
 pub mod quota;
+mod security;
 pub mod settings;
 pub mod telemetry;
 
@@ -386,6 +387,18 @@ async fn mascot_handler(Path(name): Path<String>) -> Response {
 const PANEL_HTML: &str = include_str!("panel.html");
 
 pub fn build_router(state: AppState) -> Router {
+    let port = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .port;
+    build_router_for_port(state, port)
+}
+
+/// Igual que [`build_router`], pero con el puerto real en el que escucha el
+/// servidor (relevante si se vincula un puerto efímero). El puerto se usa para
+/// validar `Host`/`Origin` contra DNS rebinding y CSRF.
+fn build_router_for_port(state: AppState, port: u16) -> Router {
     let protected = Router::new()
         .route("/events", get(events_handler))
         .route("/tasks", post(create_task))
@@ -426,6 +439,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mascot/{name}", get(mascot_handler))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(move |req, next| {
+            security::guard(port, req, next)
+        }))
         .with_state(state)
 }
 
@@ -477,8 +493,9 @@ async fn events_handler(
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let port = listener.local_addr()?.port();
     let sampler = state.telemetry.spawn_sampler();
-    let res = axum::serve(listener, build_router(state)).await;
+    let res = axum::serve(listener, build_router_for_port(state, port)).await;
     sampler.abort();
     res?;
     Ok(())
@@ -645,6 +662,7 @@ mod tests {
             "prompt": "Ejecuta una prueba"
         });
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -670,6 +688,7 @@ mod tests {
         assert_eq!(finished.status, RunStatus::Done);
 
         let list_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/runs")
             .body(Body::empty())
@@ -687,6 +706,7 @@ mod tests {
         assert_eq!(runs[0].status, RunStatus::Done);
 
         let get_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri(format!("/runs/{}", created.id))
             .body(Body::empty())
@@ -711,6 +731,7 @@ mod tests {
             "agent": "agy"
         });
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -740,6 +761,7 @@ mod tests {
             "agent": "mock"
         });
         let create_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -757,6 +779,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let cancel_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri(format!("/runs/{}/cancel", created.id))
             .body(Body::empty())
@@ -773,6 +796,7 @@ mod tests {
         assert_eq!(cancelled.status, RunStatus::Cancelled);
 
         let get_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri(format!("/runs/{}", created.id))
             .body(Body::empty())
@@ -789,6 +813,7 @@ mod tests {
         let app = build_router(state);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/runs/no-existe")
             .body(Body::empty())
@@ -804,6 +829,7 @@ mod tests {
         assert!(body["error"].as_str().is_some());
 
         let cancel_req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/runs/no-existe/cancel")
             .body(Body::empty())
@@ -827,6 +853,7 @@ mod tests {
             "agent": "claude"
         });
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -851,6 +878,7 @@ mod tests {
             json!({"titulo": "ok", "prompt": "  \n "}),
         ] {
             let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7777")
                 .method(Method::POST)
                 .uri("/tasks")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -869,6 +897,7 @@ mod tests {
         let huge_prompt = "x".repeat(super::MAX_BODY_BYTES + 4096);
         let payload = json!({ "titulo": "Grande", "prompt": huge_prompt });
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -889,6 +918,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .method(Method::GET)
                     .uri("/api/health")
                     .body(Body::empty())
@@ -903,6 +933,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .method(Method::GET)
                     .uri("/runs")
                     .body(Body::empty())
@@ -917,6 +948,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .method(Method::GET)
                     .uri("/runs")
                     .header(header::AUTHORIZATION, "Bearer secreto-local-123")
@@ -931,6 +963,7 @@ mod tests {
         let sse_ok = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .method(Method::GET)
                     .uri("/events?token=secreto-local-123")
                     .body(Body::empty())
@@ -947,6 +980,7 @@ mod tests {
         let app = build_router(state);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
@@ -982,6 +1016,7 @@ mod tests {
         let app = build_router(state);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
@@ -1041,6 +1076,7 @@ mod tests {
             ("nada.webp", StatusCode::NOT_FOUND),
         ] {
             let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7777")
                 .uri(format!("/mascot/{name}"))
                 .body(Body::empty())
                 .expect("GET mascot");
@@ -1060,6 +1096,7 @@ mod tests {
         let app = build_router(state);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
@@ -1148,6 +1185,7 @@ mod tests {
         let res = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .uri("/api/models")
                     .body(Body::empty())
                     .unwrap(),
@@ -1182,6 +1220,7 @@ mod tests {
         let app = build_router(state);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri("/events")
             .body(Body::empty())
@@ -1268,6 +1307,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:7777")
                     .method(Method::GET)
                     .uri(uri)
                     .body(Body::empty())
@@ -1404,5 +1444,212 @@ mod tests {
         assert_eq!(outputs.len(), 1, "since=1 salta el primero: {all}");
         assert!(all.contains("linea 2"));
         assert!(all.contains("event: status"));
+    }
+
+    fn guarded_request(
+        method: Method,
+        uri: &str,
+        host: Option<&str>,
+        origin: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        builder.body(body).expect("construir request con guardas")
+    }
+
+    #[tokio::test]
+    async fn security_rejects_foreign_and_malformed_hosts() {
+        let (state, _s, _w) = test_state();
+        let app = build_router(state);
+
+        for host in [
+            "evil.example:7777",
+            "localhost.evil.example:7777",
+            "127.0.0.1:9999",
+            "0.0.0.0:7777",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(guarded_request(
+                    Method::GET,
+                    "/api/health",
+                    Some(host),
+                    None,
+                    Body::empty(),
+                ))
+                .await
+                .expect("respuesta health");
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "host {host}");
+            let body: Value = read_json(res.into_body()).await;
+            assert!(body["error"].as_str().is_some(), "cuerpo de error JSON");
+        }
+
+        // Sin Host no se puede verificar el destino: también se rechaza.
+        let missing = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::GET,
+                "/api/health",
+                None,
+                None,
+                Body::empty(),
+            ))
+            .await
+            .expect("respuesta sin host");
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        // El panel y la mascota (rutas públicas) pasan por la misma guarda.
+        let panel = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::GET,
+                "/",
+                Some("evil.example:7777"),
+                None,
+                Body::empty(),
+            ))
+            .await
+            .expect("respuesta panel");
+        assert_eq!(panel.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn security_accepts_all_local_host_forms() {
+        let (state, _s, _w) = test_state();
+        let app = build_router(state);
+
+        for host in ["localhost:7777", "127.0.0.1:7777", "[::1]:7777"] {
+            let res = app
+                .clone()
+                .oneshot(guarded_request(
+                    Method::GET,
+                    "/api/health",
+                    Some(host),
+                    None,
+                    Body::empty(),
+                ))
+                .await
+                .expect("respuesta health");
+            assert_eq!(res.status(), StatusCode::OK, "host {host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn security_rejects_invalid_origin_on_mutating_and_read_routes() {
+        let (state, _s, _w) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+
+        let payload = json!({ "titulo": "CSRF", "prompt": "no debe crearse" }).to_string();
+        for origin in [
+            "http://evil.example",
+            "http://evil.example:7777",
+            "http://localhost:9999",
+            "null",
+            "https://localhost:7777",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(guarded_request(
+                    Method::POST,
+                    "/tasks",
+                    Some("127.0.0.1:7777"),
+                    Some(origin),
+                    Body::from(payload.clone()),
+                ))
+                .await
+                .expect("respuesta POST /tasks");
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "origin {origin}");
+        }
+        // Ninguna petición rechazada debe haber llegado al planificador.
+        assert!(scheduler.list_runs().await.is_empty());
+
+        // Lecturas cross-origin también se bloquean (fuga de datos).
+        let read = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::GET,
+                "/runs",
+                Some("127.0.0.1:7777"),
+                Some("http://evil.example:7777"),
+                Body::empty(),
+            ))
+            .await
+            .expect("respuesta GET /runs");
+        assert_eq!(read.status(), StatusCode::FORBIDDEN);
+
+        // SSE /events (origen inválido) también.
+        let events = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::GET,
+                "/events",
+                Some("127.0.0.1:7777"),
+                Some("http://evil.example:7777"),
+                Body::empty(),
+            ))
+            .await
+            .expect("respuesta GET /events");
+        assert_eq!(events.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn security_allows_valid_local_origin_and_cli_requests() {
+        let (state, _s, _w) = test_state();
+        let scheduler = state.scheduler.clone();
+        let app = build_router(state);
+
+        let body = json!({ "titulo": "Local", "prompt": "permitida" }).to_string();
+        let res = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::POST,
+                "/tasks",
+                Some("127.0.0.1:7777"),
+                Some("http://localhost:7777"),
+                Body::from(body.clone()),
+            ))
+            .await
+            .expect("POST /tasks con origin local");
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Sin Origin (curl/agentes locales) también se permite.
+        let res = app
+            .clone()
+            .oneshot(guarded_request(
+                Method::POST,
+                "/tasks",
+                Some("localhost:7777"),
+                None,
+                Body::from(body),
+            ))
+            .await
+            .expect("POST /tasks sin origin");
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        assert_eq!(scheduler.list_runs().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn security_rejects_cross_site_fetch_metadata() {
+        let (state, _s, _w) = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/health")
+            .header(header::HOST, "127.0.0.1:7777")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .expect("request cross-site");
+        let res = app.oneshot(req).await.expect("respuesta");
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 }

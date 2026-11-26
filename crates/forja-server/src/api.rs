@@ -540,6 +540,7 @@ mod tests {
 
     async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::GET)
             .uri(uri)
             .body(Body::empty())
@@ -720,6 +721,7 @@ mod tests {
         next["hide_mascot"] = json!(true);
         let put = |body: Value| {
             Request::builder()
+                .header(header::HOST, "127.0.0.1:7777")
                 .method(Method::PUT)
                 .uri("/api/settings")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -746,6 +748,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::PUT)
             .uri("/api/settings")
             .header(header::CONTENT_TYPE, "application/json")
@@ -757,6 +760,7 @@ mod tests {
 
     async fn put_settings_json(app: axum::Router, body: Value) -> (StatusCode, Value) {
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::PUT)
             .uri("/api/settings")
             .header(header::CONTENT_TYPE, "application/json")
@@ -772,6 +776,7 @@ mod tests {
 
     async fn post_task(app: axum::Router, body: Value) -> (StatusCode, Value) {
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::POST)
             .uri("/tasks")
             .header(header::CONTENT_TYPE, "application/json")
@@ -1238,6 +1243,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::PUT)
             .uri("/api/quota")
             .header(header::CONTENT_TYPE, "application/json")
@@ -1263,6 +1269,7 @@ mod tests {
         // Validación rechaza percent_remaining fuera de rango
         let bad = json!({ "providers": { "gemini": { "percent_remaining": 150.0 } } });
         let req_bad = Request::builder()
+            .header(header::HOST, "127.0.0.1:7777")
             .method(Method::PUT)
             .uri("/api/quota")
             .header(header::CONTENT_TYPE, "application/json")

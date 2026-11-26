@@ -2595,6 +2595,7 @@ mod tests {
                 let app = app.clone();
                 async move {
                     let req = Request::builder()
+                        .header(header::HOST, "127.0.0.1:7777")
                         .method(Method::POST)
                         .uri("/api/orchestrator/chat")
                         .header(header::CONTENT_TYPE, "application/json")
@@ -2641,6 +2642,7 @@ mod tests {
                 let app = app.clone();
                 async move {
                     let req = Request::builder()
+                        .header(header::HOST, "127.0.0.1:7777")
                         .method(Method::POST)
                         .uri("/api/orchestrator/chat")
                         .header(header::CONTENT_TYPE, "application/json")
@@ -2700,7 +2702,10 @@ mod tests {
             uri: &str,
             body: Option<Value>,
         ) -> (StatusCode, Value) {
-            let mut b = Request::builder().method(method).uri(uri);
+            let mut b = Request::builder()
+                .header(header::HOST, "127.0.0.1:7777")
+                .method(method)
+                .uri(uri);
             let body = match body {
                 Some(v) => {
                     b = b.header(header::CONTENT_TYPE, "application/json");
