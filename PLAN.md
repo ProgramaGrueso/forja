@@ -36,14 +36,14 @@ Estructura final:
       Hecho cuando: `cargo test -p forja-core policy` pasa, con un test que prueba que Sensitive nunca devuelve Agy.
 
 ## Fase 1 — Git y agentes
-- [ ] T04 forja-git: crear worktree (45 min)
+- [x] T04 forja-git: crear worktree (45 min)
       fn create_worktree(repo, base_branch, nueva_rama, destino)->Result<PathBuf>, usando std::process::Command
       con `git`. Tests con tempfile creando un repo real.
       Hecho cuando: `cargo test -p forja-git create` pasa y el test verifica que la rama y la carpeta existen.
 - [ ] T05 forja-git: estado y commit (30 min)
       fn status_clean, fn commit_all(msg), fn current_branch. Nunca ejecuta push (no debe existir ninguna función con push).
       Hecho cuando: `cargo test -p forja-git` pasa y `grep -rn "push" crates/forja-git/src` no devuelve nada.
-- [ ] T06 forja-agent: trait Agent y MockAgent (30 min)
+- [x] T06 forja-agent: trait Agent y MockAgent (30 min)
       trait Agent { fn kind(&self)->AgentKind; async fn run(&self, ctx:&RunContext)->Result<AgentOutput>; }
       MockAgent configurable: éxito, fallo, tardanza, y escribe un archivo en el worktree.
       Hecho cuando: `cargo test -p forja-agent mock` pasa con casos de éxito, fallo y timeout.
