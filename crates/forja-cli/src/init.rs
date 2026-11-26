@@ -21,11 +21,13 @@ pub struct InitEnv {
     pub installed: Vec<String>,
     /// Perfiles de Hermes descubiertos (incluye `default`); vacío si no hay Hermes.
     pub hermes_profiles: Vec<String>,
+    /// Entorno de skills; `None` omite la oferta de instalarlas.
+    pub skills: Option<crate::skills::SkillsEnv>,
 }
 
 impl InitEnv {
     /// Detecta el entorno real: `PATH` y el directorio de perfiles de Hermes.
-    pub fn detect() -> Self {
+    pub fn detect(store_dir: &Path) -> Self {
         let installed: Vec<String> = AUTO_ORDER
             .iter()
             .filter(|a| agent_installed(a))
@@ -39,6 +41,7 @@ impl InitEnv {
         Self {
             installed,
             hermes_profiles,
+            skills: crate::skills::SkillsEnv::detect(store_dir).ok(),
         }
     }
 }
@@ -322,8 +325,75 @@ pub fn run_init<R: BufRead, W: Write>(
         )
         .map_err(io_err)?;
     }
+    offer_skills(input, out, yes, env)?;
     writeln!(out, "Para arrancar: {}", start_command(store_dir)).map_err(io_err)?;
     Ok(settings)
+}
+
+/// Ofrece instalar las skills de Forja: muestra primero el dry-run y solo escribe si
+/// el usuario responde que sí (con `--yes` nunca instala: solo muestra el comando).
+fn offer_skills<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    yes: bool,
+    env: &InitEnv,
+) -> Result<()> {
+    use crate::skills;
+    let Some(senv) = &env.skills else {
+        return Ok(());
+    };
+    let sel = skills::Selection::default();
+    let plan = skills::resolve_targets(senv, &sel).and_then(|targets| {
+        let all = skills::select_skills(&skills::catalog(), &[])?;
+        Ok(skills::plan_install(&targets, &all, false))
+    });
+    let items = match plan {
+        Ok(items) => items,
+        Err(e) => {
+            writeln!(out, "Skills: no se pudo preparar la instalación ({e}).").map_err(io_err)?;
+            return Ok(());
+        }
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "Skills de Forja (DRY-RUN, aún no se escribe nada; cada agente las carga de su carpeta):"
+    )
+    .map_err(io_err)?;
+    skills::print_plan(out, &items, false)?;
+    let pending = items.iter().filter(|i| i.action.writes()).count();
+    if pending == 0 {
+        return Ok(());
+    }
+    if yes {
+        writeln!(
+            out,
+            "Para instalarlas: forja skills install --yes (o elige agente/skill con --agent/--skill)."
+        )
+        .map_err(io_err)?;
+        return Ok(());
+    }
+    let answer = ask(
+        input,
+        out,
+        false,
+        &format!("¿Instalar ahora las {pending} skills pendientes? (s/n)"),
+        "n",
+    )?
+    .to_lowercase();
+    if matches!(answer.as_str(), "s" | "si" | "sí" | "y" | "yes") {
+        let n = skills::apply(&items)?;
+        writeln!(out, "{n} skills instaladas.").map_err(io_err)?;
+    } else {
+        writeln!(
+            out,
+            "Skills sin instalar. Cuando quieras: forja skills install --yes"
+        )
+        .map_err(io_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -344,6 +414,7 @@ mod tests {
         InitEnv {
             installed: installed.iter().map(|s| s.to_string()).collect(),
             hermes_profiles: profiles.iter().map(|s| s.to_string()).collect(),
+            skills: None,
         }
     }
 

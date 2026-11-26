@@ -98,6 +98,32 @@ Variables de entorno: `FORJA_ORCHESTRATOR_AGENT`, `FORJA_ORCHESTRATOR_PROFILE`, 
 
 Los datos (historial y worktrees) se guardan en `.forja/` dentro de donde ejecutes el comando; está en `.gitignore`.
 
+## Skills
+
+Forja trae 15 skills genéricas (depuración sistemática, TDD, revisión previa al commit, simplificación, planes, spikes, GitHub/`gh`, inspección de repos, depuradores Python/Node, QA exploratorio, diagramas de arquitectura, delegación a sub-agentes) y dos propias: `forja-orquestador` (cómo delegar: agentes, privacidad `open`/`sensitive`, modelo y esfuerzo, bloques `[[forja:delegar ...]]` y API `/tasks`) y `forja-revision` (checklist para revisar el resultado de un agente).
+
+**De dónde salen.** Se curaron a partir de las skills que usan los agentes del autor (Claude Code, OpenCode, Hermes, Agy): sin contenido personal ni de proyectos privados, solo con licencia que permite redistribuir (MIT). La tabla de procedencia (origen, autor, licencia) está en [`skills/README.md`](skills/README.md). Van **embebidas en el binario** (`build.rs` genera la tabla con `include_str!`, sin dependencias nuevas): para añadir o editar una skill, cambia `skills/<nombre>/SKILL.md` y recompila.
+
+**Cada agente carga las suyas desde su propia carpeta**; Forja no las sirve en caliente, las copia ahí:
+
+| Agente | Carpeta |
+| --- | --- |
+| `claude` | `~/.claude/skills` |
+| `opencode` | `~/.config/opencode/skills` (o `$XDG_CONFIG_HOME/opencode/skills`) |
+| `agy` | `~/.gemini/skills` (agy también lee `~/.agents/skills`, con menos prioridad) |
+| `hermes` | `<HERMES_HOME base>/skills` para `default`, `<base>/profiles/<perfil>/skills` para otro perfil |
+
+```bash
+forja skills list                       # las incluidas
+forja skills status                     # por agente instalado, cuáles ya están
+forja skills install                    # DRY-RUN: muestra qué copiaría y dónde
+forja skills install --yes              # copia (nunca sobrescribe sin --force, nunca borra)
+forja skills install --agent hermes --profile uno --skill spike --yes
+forja skills uninstall --yes            # solo quita lo que Forja instaló (marcador .forja-skill)
+```
+
+Opciones: `--agent` (claude, opencode, agy, hermes; por defecto todos los detectados), `--skill N` (repetible), `--profile P` (solo hermes; por defecto `default`), `--force` (actualiza una skill existente; nunca sigue enlaces simbólicos). `install` y `uninstall` son dry-run salvo `--yes`. Los perfiles de Hermes ocultos (`hidden_profiles` / `FORJA_HIDDEN_PROFILES`) se rechazan también aquí. `forja init` muestra el dry-run y pregunta si instalarlas (con `--yes` solo lo muestra).
+
 ## Arquitectura
 
 ```text

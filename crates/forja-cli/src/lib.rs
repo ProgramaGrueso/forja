@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 mod friendly;
 pub mod init;
+pub mod skills;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use forja_agent::Agent;
@@ -91,6 +92,57 @@ pub enum Command {
     /// escribe `<store_dir>/settings.json` (sin pisar lo que ya tengas).
     Init {
         /// No pregunta nada: acepta los valores por defecto.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Skills genéricas incluidas en Forja: listar, ver estado, instalar y quitar.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SkillsCommand {
+    /// Lista las skills incluidas en este binario.
+    List,
+
+    /// Muestra, por cada agente instalado, qué skills de Forja ya están.
+    Status {
+        /// Un agente concreto: claude, opencode, agy o hermes.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Perfil de Hermes (por defecto `default`).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+
+    /// Copia las skills a la carpeta de cada agente. Sin `--yes` solo muestra qué haría.
+    Install {
+        #[arg(long)]
+        agent: Option<String>,
+        /// Una skill concreta (repetible). Por defecto, todas.
+        #[arg(long)]
+        skill: Vec<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        /// Permite sobrescribir una skill existente (nunca sigue enlaces simbólicos).
+        #[arg(long)]
+        force: bool,
+        /// Aplica los cambios (sin esto es un dry-run).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Quita solo lo que Forja instaló (carpetas con marcador `.forja-skill`).
+    Uninstall {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        skill: Vec<String>,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -253,7 +305,7 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                     out,
                     &cli.store_dir,
                     false,
-                    &init::InitEnv::detect(),
+                    &init::InitEnv::detect(&cli.store_dir),
                 )?;
             }
             Ok(())
@@ -265,9 +317,44 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 out,
                 &cli.store_dir,
                 yes,
-                &init::InitEnv::detect(),
+                &init::InitEnv::detect(&cli.store_dir),
             )?;
             Ok(())
+        }
+        Command::Skills { action } => {
+            let selection = |agent: Option<String>, skill: Vec<String>, profile: Option<String>| {
+                skills::Selection {
+                    agents: agent.into_iter().collect(),
+                    skills: skill,
+                    profile,
+                }
+            };
+            match action {
+                SkillsCommand::List => skills::cmd_list(out),
+                SkillsCommand::Status { agent, profile } => {
+                    let env = skills::SkillsEnv::detect(&cli.store_dir)?;
+                    skills::cmd_status(out, &env, &selection(agent, Vec::new(), profile))
+                }
+                SkillsCommand::Install {
+                    agent,
+                    skill,
+                    profile,
+                    force,
+                    yes,
+                } => {
+                    let env = skills::SkillsEnv::detect(&cli.store_dir)?;
+                    skills::cmd_install(out, &env, &selection(agent, skill, profile), force, yes)
+                }
+                SkillsCommand::Uninstall {
+                    agent,
+                    skill,
+                    profile,
+                    yes,
+                } => {
+                    let env = skills::SkillsEnv::detect(&cli.store_dir)?;
+                    skills::cmd_uninstall(out, &env, &selection(agent, skill, profile), yes)
+                }
+            }
         }
         Command::Serve {
             port,
