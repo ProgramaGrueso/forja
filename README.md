@@ -158,16 +158,20 @@ Opciones: `--agent` (claude, opencode, agy, hermes; por defecto todos los detect
                   | forja-server  |  |    forja-sched    |  (cola, semáforo N, reintentos, política)
                   | API REST + UI |->+---+---+---+---+---+
                   +---------------+      |   |   |   |
-                                         |   |   |   +------------------+
-                         +---------------+   |   +----------+           |
-                         v                   v              v           v
-                 +--------------+    +-------------+  +-----------+  +------------+
-                 |  forja-git   |    | forja-agent |  |forja-store|  | forja-core |
-                 | (worktrees)  |    | Mock / Agy  |  |  (JSONL)  |  |tipos/policy|
-                 +------+-------+    +------+------+  +-----+-----+  +------------+
-                        |                   |               |              ^
-                        +-------------------+---------------+--------------+
+                                         |   |   |   +---------------------+
+                         +---------------+   |   +----------+              |
+                         v                   v              v              v
+                 +--------------+    +------------------+  +-----------+  +------------+
+                 |  forja-git   |    |   forja-agent    |  |forja-store|  | forja-core |
+                 | (worktrees)  |    | Mock, Agy,       |  |  (JSONL)  |  |tipos/policy|
+                 |              |    | Claude, OpenCode,|  |           |  |            |
+                 |              |    | Hermes, Local    |  |           |  |            |
+                 +------+-------+    +--------+---------+  +-----+-----+  +------------+
+                        |                     |                |              ^
+                        +---------------------+----------------+--------------+
 ```
+
+Los seis adaptadores de `forja-agent` —`mock`, `agy`, `claude`, `opencode`, `hermes` y `local`— son funcionales: cada uno invoca su CLI (o el servicio local, en `local`) sin shell y devuelve `NotConfigured` solo si el binario o servicio no está instalado.
 
 Para el detalle de cada crate y sus fronteras, consulta [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md); el historial de desarrollo está en `docs/historial/`.
 

@@ -57,7 +57,9 @@ alguien que acaba de clonar el repo.
   historial por conversación, estado «pensando» independiente por conversación,
   borrar con confirmación, renombrar y selección recordada en `localStorage`.
 - ~~**Comandos de barra ampliados.**~~ **Hecho**: `/new`, `/help`, `/rename`, `/agents`,
-  `/stop` (el servidor los resuelve; `/model` y `/agent` responden «disponible pronto»).
+  `/stop` (el servidor los resuelve); `/model` y `/effort` cambian modelo y esfuerzo de la
+  conversación (sin argumento muestran el valor y `reset` vuelve a Ajustes). `/agent` sigue
+  reservado y responde «disponible pronto».
   El panel autocompleta al escribir `/`, cambia a la conversación nueva tras `/new` y
   muestra las respuestas de comandos como mensajes del sistema.
 
@@ -71,3 +73,27 @@ alguien que acaba de clonar el repo.
   (stderr en otro color, autoscroll con pausa al subir, limpiar/cerrar/cancelar, estado),
   selector de ejecución, apertura automática de las tareas nuevas en un panel libre,
   reconexión con `?since=seq` y tope de 5000 líneas en el DOM.
+
+## Pendientes actuales
+
+- **Persistencia de conversaciones.** Las conversaciones del orquestador viven solo en
+  memoria (máx. 20 conversaciones y 500 mensajes por conversación) y se pierden al
+  reiniciar el servidor. Falta guardarlas en `forja-store` y recuperarlas al arrancar,
+  sin romper la selección ni los límites actuales.
+- **Cierre del ciclo de revisión en el panel.** Cada tarea termina en su rama `forja/...`
+  y el panel muestra el resultado, pero no hay diff ni forma de fusionar o descartar ese
+  worktree desde la interfaz. Falta exponer el diff, añadir a `forja-git` las operaciones
+  de fusión y borrado de worktree (hoy solo crea, consulta y commitea) y los botones
+  correspondientes en el detalle de la ejecución.
+- **Reacción del orquestador al terminar las tareas.** El orquestador recibe el estado de
+  lo delegado en el turno siguiente, no cuando la tarea acaba; falta que se le notifique
+  (o se le despierte) al completarse una delegación para que revise el resultado y
+  continúe sin esperar a que el usuario escriba.
+- **División de archivos grandes.** `panel.html` (~3.800 líneas), `orchestrator.rs`
+  (~2.900) y `api.rs` (~1.300) concentran demasiado código en un solo archivo. Conviene
+  partirlos en módulos (plantilla/JS del panel, comandos y delegación del orquestador,
+  rutas por recurso) sin cambiar el comportamiento ni la API.
+- **Privacidad configurable.** `Privacy` solo admite `open` y `sensitive` y se elige en
+  cada tarea; no hay valor por defecto ni política por agente o repositorio en
+  `settings.json` ni en el panel. Falta configurarla y aplicarla de forma consistente en
+  `forja run`, `POST /tasks` y las delegaciones del orquestador.
