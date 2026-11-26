@@ -3084,7 +3084,7 @@
         function modelCandidates() {
           const out = (profileInfo.model_options || []).slice();
           const agent = profileInfo.agent;
-          const prov = { claude: (p) => p === "anthropic", agy: (p) => p === "gemini", local: (p) => p === "local", hermes: (p) => p === "hermes", opencode: (p) => p.startsWith("opencode") }[agent];
+          const prov = { claude: (p) => p === "anthropic", agy: (p) => p === "gemini", local: (p) => p === "local", opencode: (p) => p.startsWith("opencode") }[agent];
           if (prov && state.models && state.models.providers) {
             state.models.providers.filter((p) => prov(p.provider) && p.status === "ok").forEach((p) => {
               (p.models || []).slice(0, 60).forEach((m) => { if (!out.includes(m.id)) out.push(m.id); });
