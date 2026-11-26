@@ -509,10 +509,62 @@ mod tests {
             .expect("leer cuerpo HTML");
         let body = String::from_utf8(bytes.to_vec()).expect("HTML UTF-8 válido");
 
+        let lower = body.to_ascii_lowercase();
         assert!(body.contains("Forja"));
         assert!(body.contains("Cancelar"));
         assert!(body.contains("/cancel"));
         assert!(!body.contains("http://") && !body.contains("https://"));
+        assert!(!lower.contains("<script src"));
+        assert!(!lower.contains("<link href"));
+    }
+
+    #[tokio::test]
+    async fn panel_contains_nav_agents_provider_bar_and_mascot_svg() {
+        let (state, _store_dir, _wt_dir) = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("construir request GET /");
+
+        let resp = app.oneshot(req).await.expect("ejecutar GET /");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("leer HTML");
+        let html = String::from_utf8(bytes.to_vec()).expect("HTML UTF-8");
+
+        // Ítems de navegación y pestañas laterales
+        for item in [
+            "EJECUCIONES",
+            "AGENTES",
+            "Resumen",
+            "Ejecuciones",
+            "Agentes",
+            "Telemetría",
+            "Cuotas",
+            "Ajustes",
+        ] {
+            assert!(html.contains(item), "falta ítem de navegación: {item}");
+        }
+
+        // Agentes base en barra lateral
+        for ag in ["agy", "claude", "mock"] {
+            assert!(html.contains(ag), "falta agente en HTML: {ag}");
+        }
+
+        // Barra de proveedores fija abajo
+        for prov in ["Anthropic", "Copilot", "DeepSeek", "Nous", "Gemini"] {
+            assert!(html.contains(prov), "falta proveedor en barra: {prov}");
+        }
+        assert!(html.contains("id=\"provider-bar\""));
+
+        // Mascota SVG inline y soporte prefers-reduced-motion
+        assert!(html.contains("id=\"forja-mascot\""));
+        assert!(html.contains("<svg id=\"forja-mascot\""));
+        assert!(html.contains("prefers-reduced-motion"));
     }
 
     #[tokio::test]

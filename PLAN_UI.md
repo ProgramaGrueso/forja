@@ -13,7 +13,7 @@ Restricciones: sin dependencias Rust nuevas; frontend HTML+CSS+JS vanilla embebi
       Verificación: `cargo test -p forja-server quota`.
 - [x] U04 Rutas API (45 min): registro de agentes (proveedor, modelo, disponibilidad), `GET /api/agents`, `GET /api/stats`, `GET /api/policy`, `GET /api/health`, `GET/PUT /api/settings`, `GET /api/telemetry`, `GET/PUT /api/quota`; cableado en `forja serve`.
       Verificación: `cargo test -p forja-server api_`.
-- [ ] U05 Frontend mínimo (60 min): app a pantalla completa con barra lateral colapsable (logo, pestañas, navegación, agentes, ejecuciones recientes), barra de proveedores fija con popover, mascota SVG reactiva, vistas Telemetría y Ejecuciones en vivo (SSE con reconexión, panel lateral, cancelar).
+- [x] U05 Frontend mínimo (60 min): app a pantalla completa con barra lateral colapsable (logo, pestañas, navegación, agentes, ejecuciones recientes), barra de proveedores fija con popover, mascota SVG reactiva, vistas Telemetría y Ejecuciones en vivo (SSE con reconexión, panel lateral, cancelar).
       Verificación: `cargo test -p forja-server panel`.
 
 ## Resto

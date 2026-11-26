@@ -284,8 +284,9 @@ Sesión nocturna cerrada; ver sección "Sesión UI".
 - Rutas añadidas: `GET /api/telemetry`, `GET /api/agents`, `GET /api/stats`, `GET /api/policy`, `GET /api/health`, `GET/PUT /api/quota`, `GET/PUT /api/settings` (conservando `/tasks`, `/runs`, `/runs/{id}`, `/runs/{id}/cancel`, `/events`).
 - Verificación: `cargo test -p forja-server api_` -> `11 passed; 0 failed`.
 
-### U05 — Frontend mínimo obligatorio (en curso)
-- Construyendo dashboard completo tipo Hermes Desktop en `crates/forja-server/src/panel.html`.
+### U05 — Frontend mínimo obligatorio
+- Reescrito `crates/forja-server/src/panel.html` como aplicación de escritorio oscura con acentos esmeralda/violeta: barra lateral colapsable (logo, pestañas `EJECUCIONES | AGENTES`, navegación, lista de agentes agrupada por proveedor, ejecuciones recientes), barra fija de proveedores con anillos circulares y popover de detalle, mascota chibi pelirroja original en SVG inline reactiva a estados reales (`idle`, `working`, `celebrate`, `worried` + `prefers-reduced-motion`), Telemetría con gráficos SVG de 5 min y Ejecuciones en vivo con SSE `/events` y panel lateral.
+- Verificación: `cargo test -p forja-server panel && ./scripts/check.sh` en verde; cero URLs externas (`http://`, `https://`, `<script src`, `<link href`).
 
 ## Decisiones (Sesión UI)
 - Telemetría, cuotas y ajustes viven como módulos de `forja-server` (no crates nuevos): menos superficie y sin dependencias nuevas.
