@@ -1,3 +1,4 @@
+pub mod quota;
 pub mod telemetry;
 
 use std::collections::HashMap;
