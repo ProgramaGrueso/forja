@@ -77,12 +77,12 @@ Estructura final:
 - [x] T13 forja-server: API REST (50 min)
       axum: POST /tasks, GET /runs, GET /runs/:id, POST /runs/:id/cancel. Estado en memoria compartido con el scheduler.
       Hecho cuando: `cargo test -p forja-server api` pasa usando tower::ServiceExt (sin abrir puertos).
-- [ ] T14 forja-server: panel web (40 min)
+- [x] T14 forja-server: panel web (40 min)
       Un solo HTML embebido (include_str!), sin CDN ni JS externo; lista de ejecuciones, estado con color, botón cancelar.
       Estética sobria oscura con acentos esmeralda y violeta.
       Hecho cuando: `cargo test -p forja-server panel` verifica que GET / devuelve 200 con content-type text/html
       y que el HTML no contiene "http://" ni "https://" externos.
-- [ ] T15 forja-cli (40 min)
+- [x] T15 forja-cli (40 min)
       clap: `forja run --agent mock|agy --privacy open|sensitive "<prompt>"`, `forja list`, `forja serve --port 7777`.
       Hecho cuando: `cargo test -p forja-cli` pasa y `cargo run -p forja-cli -- list` sale 0 con el store vacío.
 

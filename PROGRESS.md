@@ -4,8 +4,8 @@
 
 ## Estado actual
 - Rama de integración: noche/forja
-- Última tarea cerrada: T13 (forja-server: API REST)
-- Tarea en curso: T14 (forja-server: panel web) y T15 (forja-cli) en paralelo
+- Última tarea cerrada: T14 (panel web) y T15 (forja-cli) — Fase 3 completa
+- Tarea en curso: T16 (prueba de extremo a extremo con mock)
 - Inicio: 2026-11-25T23:57:41-05:00
 - Hora límite de trabajo: 2026-11-26T04:57:41-05:00
 
@@ -141,22 +141,33 @@
 - Notas para retomar: `AppState`, `build_router` y `serve` listos. Lanzando T14 y T15 en paralelo.
 
 ### T14 — forja-server: panel web
-- Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 /
-- Quién la hizo: subagente noche/forja-T14
-- Commits:
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 / 2026-11-26T00:25:15-05:00
+- Quién la hizo: subagente noche/forja-T14 (verificado e integrado por agente principal)
+- Commits: 371977c T14: panel web embebido en forja-server
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
-- Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T14.
+  `cargo test -p forja-server panel && ./scripts/check.sh` -> exit 0; `panel`: `1 passed; 0 failed` (status 200, `text/html`, sin `http://`/`https://`); `forja-server`: `6 passed`; workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: panel HTML oscuro esmeralda/violeta embebido con `include_str!`.
 
 ### T15 — forja-cli
+- Estado: terminada
+- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 / 2026-11-26T00:25:46-05:00
+- Quién la hizo: subagente noche/forja-T15 (verificado e integrado por agente principal)
+- Commits: e88409b T15: CLI con clap (run, list, serve) en forja-cli
+- Comando de verificación y resultado real (pegar las últimas líneas de la salida):
+  `cargo test -p forja-cli && cargo run -p forja-cli -- list && ./scripts/check.sh` -> exit 0; `forja-cli`: `6 passed`; `forja list`: `No hay ejecuciones registradas.` (exit 0); workspace en verde.
+- Intentos fallidos (máx. 3): ninguno.
+- Notas para retomar: Fase 3 cerrada. Arranca Fase 4 con T16 (`crates/forja-cli/tests/e2e.rs`).
+
+### T16 — Prueba de extremo a extremo con mock
 - Estado: en curso
-- Hora de inicio / fin: 2026-11-26T00:22:40-05:00 /
-- Quién la hizo: subagente noche/forja-T15
+- Hora de inicio / fin: 2026-11-26T00:26:05-05:00 /
+- Quién la hizo: agente principal
 - Commits:
 - Comando de verificación y resultado real (pegar las últimas líneas de la salida):
 - Intentos fallidos (máx. 3):
-- Notas para retomar: worktree ../forja-wt-T15.
+- Notas para retomar: crear crates/forja-cli/tests/e2e.rs con repo temporal, 3 tareas paralelas con MockAgent, 3 worktrees, 3 ramas, 3 commits y estados Done en JsonlStore.
 
 ## Bloqueos (tarea, causa, qué se intentó)
 - (ninguno)
@@ -185,6 +196,8 @@
 | 00:12 | T11 | noche/forja-T11 | gemini-4-neon-medium | aceptado (4/4 tests forja-sched + concurrencia/cancel/worktree + check.sh en verde) |
 | 00:16 | T12 | noche/forja-T12 | gemini-4-neon-medium | aceptado (3/3 tests policy/retry + 7/7 forja-sched + check.sh en verde) |
 | 00:19 | T13 | noche/forja-T13 | gemini-4-neon-medium | aceptado (5/5 tests api con tower::ServiceExt + check.sh en verde) |
+| 00:23 | T14 | noche/forja-T14 | gemini-4-neon-low | aceptado (panel HTML autocontenido sin URLs externas + check.sh en verde) |
+| 00:23 | T15 | noche/forja-T15 | gemini-4-neon-low | aceptado (6/6 tests forja-cli + forja list exit 0 + check.sh en verde) |
 
 ## Siguiente paso exacto
 Crear la estructura del workspace de T01 y verificar con `./scripts/check.sh` y `cargo build --workspace`.
