@@ -12,6 +12,9 @@ pub enum ForjaError {
     #[error("error de git: {0}")]
     Git(String),
 
+    #[error("conflicto: {0}")]
+    Conflict(String),
+
     #[error("error de agente: {0}")]
     Agent(String),
 

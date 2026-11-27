@@ -80,11 +80,16 @@ alguien que acaba de clonar el repo.
   memoria (máx. 20 conversaciones y 500 mensajes por conversación) y se pierden al
   reiniciar el servidor. Falta guardarlas en `forja-store` y recuperarlas al arrancar,
   sin romper la selección ni los límites actuales.
-- **Cierre del ciclo de revisión en el panel.** Cada tarea termina en su rama `forja/...`
-  y el panel muestra el resultado, pero no hay diff ni forma de fusionar o descartar ese
-  worktree desde la interfaz. Falta exponer el diff, añadir a `forja-git` las operaciones
-  de fusión y borrado de worktree (hoy solo crea, consulta y commitea) y los botones
-  correspondientes en el detalle de la ejecución.
+- ~~**Cierre del ciclo de revisión en el panel.**~~ **Hecho**: `forja-git` añade
+  `diff_worktree` (incluye archivos sin seguimiento sin dejar el índice tocado),
+  `merge_branch` (comprueba rama base y árbol limpio, anula la fusión si hay conflicto) y
+  `remove_worktree`/`delete_branch` idempotentes. El servidor expone
+  `GET /runs/{id}/diff`, `POST /runs/{id}/merge` y `POST /runs/{id}/discard`: validan que
+  la ejecución haya terminado, que la rama sea `forja/<id>` y que el worktree cuelgue de la
+  carpeta de worktrees; fusionar commitea los cambios pendientes, retira el worktree y
+  descartar borra también la rama. El detalle de la ejecución muestra el diff (con
+  `--stat`, truncado a 512 KiB) y tiene botones «Fusionar en la base» y «Descartar y
+  limpiar» con confirmación, errores visibles y reintento.
 - ~~**Reacción del orquestador al terminar las tareas.**~~ **Hecho**: el módulo `reactor`
   escucha el `broadcast` del planificador y, cuando termina una ejecución delegada, da al
   orquestador un turno propio con el resultado resumido (ID, estado, salida y error), sin

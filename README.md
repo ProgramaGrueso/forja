@@ -84,6 +84,7 @@ Prioridad igual que el modelo: **tarea** (`esfuerzo` en `POST /tasks`, `forja ru
 
 El esfuerzo efectivo queda en `RunRecord.effort` y `GET /api/agents` devuelve por agente `effort`, `effort_levels` (lista vacía = no soporta) y `model_editable`.
 - **Terminales**: vista con 1–4 paneles que muestran en vivo la salida de varias ejecuciones a la vez (stderr en rojo, autoscroll que se pausa si subes, cancelar/limpiar/cerrar). Las tareas nuevas se abren solas en un panel libre.
+- **Revisión del worktree**: al abrir una ejecución terminada, el detalle muestra el diff de su rama `forja/...` contra la rama base (`--stat` y parche, incluidos los archivos sin seguimiento). «Fusionar en la base» exige el repositorio base limpio y en su rama, commitea antes cualquier cambio pendiente del worktree, fusiona con commit de fusión, retira el worktree y borra la rama ya fusionada; «Descartar y limpiar» elimina el worktree con sus cambios sin commitear y borra la rama con sus commits. Ambas piden confirmación y muestran el error del servidor (conflicto de merge, árbol sucio, worktree ya cerrado…) sin tocar nada más.
 
 ### Configuración inicial (`forja init`)
 

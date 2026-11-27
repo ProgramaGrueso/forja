@@ -166,6 +166,21 @@ impl Scheduler {
         self.inner.limiter.limit()
     }
 
+    /// Repositorio git configurado para los worktrees (`None` sin `--repo`).
+    pub fn repo_path(&self) -> Option<PathBuf> {
+        self.inner.config.repo_path.clone()
+    }
+
+    /// Rama base sobre la que se crean y fusionan las ramas de tarea.
+    pub fn base_branch(&self) -> String {
+        self.inner.config.base_branch.clone()
+    }
+
+    /// Carpeta donde viven los worktrees de las ejecuciones.
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.inner.config.worktrees_dir.clone()
+    }
+
     pub fn set_max_concurrency(&self, new_limit: usize) -> Result<()> {
         if new_limit == 0 {
             return Err(ForjaError::InvalidInput(

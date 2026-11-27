@@ -261,6 +261,7 @@ dependencies = [
  "axum",
  "forja-agent",
  "forja-core",
+ "forja-git",
  "forja-sched",
  "forja-store",
  "serde",

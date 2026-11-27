@@ -7,6 +7,7 @@ edition.workspace = true
 axum = "0.8"
 forja-agent = { path = "../forja-agent" }
 forja-core = { path = "../forja-core" }
+forja-git = { path = "../forja-git" }
 forja-sched = { path = "../forja-sched" }
 forja-store = { path = "../forja-store" }
 serde = { workspace = true }

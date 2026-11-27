@@ -40,6 +40,17 @@ pub fn create_worktree(
     Ok(destino.to_path_buf())
 }
 
+fn failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("stderr: {stderr}; stdout: {stdout}"),
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => format!("código de salida {:?}", output.status.code()),
+    }
+}
+
 fn run_git_cmd(repo: &Path, args: &[&str], context: &str) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -49,18 +60,281 @@ fn run_git_cmd(repo: &Path, args: &[&str], context: &str) -> Result<String> {
         .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = match (stderr.is_empty(), stdout.is_empty()) {
-            (false, false) => format!("stderr: {stderr}; stdout: {stdout}"),
-            (false, true) => stderr,
-            (true, false) => stdout,
-            (true, true) => format!("código de salida {:?}", output.status.code()),
-        };
-        return Err(ForjaError::Git(format!("{context} falló: {detail}")));
+        return Err(ForjaError::Git(format!(
+            "{context} falló: {}",
+            failure_detail(&output)
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Recorta `text` a `max_bytes` sin partir un carácter UTF-8.
+fn truncate_with(text: String, max_bytes: usize, marker: &str) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_string();
+    out.push('\n');
+    out.push_str(marker);
+    out.push('\n');
+    (out, true)
+}
+
+fn truncate_bytes(text: String, max_bytes: usize) -> (String, bool) {
+    truncate_with(text, max_bytes, "…[diff truncado]")
+}
+
+/// Diff del worktree contra la rama base (incluye cambios sin commitear).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeDiff {
+    /// `git diff --stat` (resumen por archivo).
+    pub stat: String,
+    /// Diff completo sin colores.
+    pub text: String,
+    /// `true` si `text` se recortó a `max_bytes`.
+    pub truncated: bool,
+}
+
+/// Tope del resumen por archivo (bytes UTF-8).
+const MAX_STAT_BYTES: usize = 64 * 1024;
+
+/// Rutas sin seguimiento del worktree (una entrada por archivo o carpeta).
+fn untracked_files(worktree: &Path) -> Result<Vec<String>> {
+    let stdout = run_git_cmd(
+        worktree,
+        &["status", "--porcelain", "-z", "--untracked-files=normal"],
+        "git status --porcelain",
+    )?;
+    Ok(stdout
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("?? ").map(str::to_string))
+        .collect())
+}
+
+/// Marca rutas con `git add -N` para que `git diff` muestre su contenido.
+fn add_intent_to_add(worktree: &Path, paths: &[String]) -> Result<()> {
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(worktree)
+        .args(["add", "-N", "--"])
+        .args(paths);
+    let output = command
+        .output()
+        .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
+    if !output.status.success() {
+        return Err(ForjaError::Git(format!(
+            "git add -N falló: {}",
+            failure_detail(&output)
+        )));
+    }
+    Ok(())
+}
+
+/// Deshace el `add -N` anterior sin tocar el contenido del worktree.
+fn reset_intent_to_add(worktree: &Path, paths: &[String]) {
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(worktree)
+        .args(["reset", "-q", "--"])
+        .args(paths);
+    let _ = command.output();
+}
+
+/// Punto donde la rama del worktree se separó de `base_branch`.
+///
+/// Diffs contra la punta de la base mostrarían como cambios de la tarea los
+/// commits que otros worktrees fusionaron después. Si no hay ancestro común
+/// (historiales sin relación) se usa la propia rama base.
+fn merge_base(worktree: &Path, base_branch: &str) -> String {
+    run_git_cmd(
+        worktree,
+        &["merge-base", base_branch, "HEAD"],
+        "git merge-base",
+    )
+    .ok()
+    .map(|out| out.trim().to_string())
+    .filter(|out| !out.is_empty())
+    .unwrap_or_else(|| base_branch.to_string())
+}
+
+/// Diff del árbol de trabajo de `worktree` contra `base_branch`.
+///
+/// Se compara con el `merge-base` (lo que hizo la tarea) e incluye los archivos
+/// sin seguimiento: se marcan temporalmente con `git add -N` y el índice se
+/// restaura al terminar, de modo que el worktree queda exactamente como estaba.
+/// El resultado se recorta a `max_bytes`.
+pub fn diff_worktree(worktree: &Path, base_branch: &str, max_bytes: usize) -> Result<WorktreeDiff> {
+    let untracked = untracked_files(worktree)?;
+    if !untracked.is_empty() {
+        add_intent_to_add(worktree, &untracked)?;
+    }
+
+    let reference = merge_base(worktree, base_branch);
+    let result: Result<(String, String)> = (|| {
+        let stat = run_git_cmd(
+            worktree,
+            &["diff", "--no-color", "--stat", &reference],
+            "git diff --stat",
+        )?;
+        let full = run_git_cmd(
+            worktree,
+            &["diff", "--no-color", "--find-renames", &reference],
+            "git diff",
+        )?;
+        Ok((stat, full))
+    })();
+
+    if !untracked.is_empty() {
+        reset_intent_to_add(worktree, &untracked);
+    }
+
+    let (stat, full) = result?;
+    let (stat, stat_truncated) = truncate_with(stat, MAX_STAT_BYTES, "…[resumen truncado]");
+    let (text, truncated) = truncate_bytes(full, max_bytes);
+    Ok(WorktreeDiff {
+        stat,
+        text,
+        truncated: truncated || stat_truncated,
+    })
+}
+
+/// Resultado de fusionar una rama de tarea en la rama base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// Hash corto de `HEAD` tras la fusión.
+    pub commit: String,
+    /// `true` si git no tuvo nada que fusionar.
+    pub already_up_to_date: bool,
+}
+
+/// Fusiona `branch` en `base_branch` dentro de `repo` con un commit de fusión.
+///
+/// Exige que el repositorio esté en `base_branch` y sin cambios pendientes. Si
+/// hay conflictos, anula la fusión y devuelve [`ForjaError::Conflict`] dejando
+/// el árbol como estaba.
+pub fn merge_branch(
+    repo: &Path,
+    base_branch: &str,
+    branch: &str,
+    message: &str,
+) -> Result<MergeOutcome> {
+    if branch.trim().is_empty() || branch == base_branch {
+        return Err(ForjaError::InvalidInput(
+            "la rama a fusionar no puede ser la rama base ni estar vacía".to_string(),
+        ));
+    }
+    let current = current_branch(repo)?;
+    if current != base_branch {
+        return Err(ForjaError::InvalidInput(format!(
+            "el repositorio está en la rama '{current}', no en '{base_branch}'; cámbiala antes de fusionar"
+        )));
+    }
+    if !status_clean(repo)? {
+        return Err(ForjaError::InvalidInput(format!(
+            "el repositorio en '{base_branch}' tiene cambios sin commitear; commitéalos o descártalos antes de fusionar"
+        )));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge", "--no-ff", "-m", message, branch])
+        .output()
+        .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
+
+    if !output.status.success() {
+        // No dejar el repo a medio fusionar: el siguiente intento debe partir limpio.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["merge", "--abort"])
+            .output();
+        return Err(ForjaError::Conflict(format!(
+            "git merge falló (se anuló la fusión): {}",
+            failure_detail(&output)
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    let already_up_to_date =
+        stdout.contains("already up to date") || stdout.contains("ya está actualizado");
+    let commit = run_git_cmd(
+        repo,
+        &["rev-parse", "--short", "HEAD"],
+        "git rev-parse --short HEAD",
+    )?;
+    Ok(MergeOutcome {
+        commit: commit.trim().to_string(),
+        already_up_to_date,
+    })
+}
+
+/// `true` si `worktree` figura registrado en `git worktree list` de `repo`.
+pub fn worktree_registered(repo: &Path, worktree: &Path) -> Result<bool> {
+    let stdout = run_git_cmd(
+        repo,
+        &["worktree", "list", "--porcelain"],
+        "git worktree list",
+    )?;
+    Ok(stdout.lines().any(|line| {
+        line.strip_prefix("worktree ").is_some_and(|registered| {
+            let registered = Path::new(registered);
+            registered == worktree
+                || registered
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == worktree)
+        })
+    }))
+}
+
+/// Elimina el worktree en `worktree`. Con `force` descarta cambios sin commitear.
+/// Devuelve `false` si ya no estaba registrado (operación idempotente).
+pub fn remove_worktree(repo: &Path, worktree: &Path, force: bool) -> Result<bool> {
+    if !worktree_registered(repo, worktree)? {
+        // Registro huérfano (carpeta borrada a mano): limpiar metadatos si hace falta.
+        run_git_cmd(repo, &["worktree", "prune"], "git worktree prune")?;
+        return Ok(false);
+    }
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    args.push(&worktree_arg);
+    run_git_cmd(repo, &args, "git worktree remove")?;
+    Ok(true)
+}
+
+/// `true` si existe la rama local `branch` en `repo`.
+pub fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
+    Ok(output.status.success())
+}
+
+/// Borra la rama local `branch`. Con `force` usa `-D` (descarta commits no
+/// fusionados). Devuelve `false` si la rama ya no existía.
+pub fn delete_branch(repo: &Path, branch: &str, force: bool) -> Result<bool> {
+    if !branch_exists(repo, branch)? {
+        return Ok(false);
+    }
+    let flag = if force { "-D" } else { "-d" };
+    run_git_cmd(repo, &["branch", flag, branch], "git branch")?;
+    Ok(true)
 }
 
 /// Comprueba si el repositorio en `repo` no tiene cambios pendientes.
@@ -116,6 +390,22 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn run_git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("ejecutar git en test");
+        assert!(
+            output.status.success(),
+            "git {:?} falló:\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     fn init_temp_repo() -> TempDir {
@@ -245,6 +535,221 @@ mod tests {
             }
             other => panic!("se esperaba ForjaError::Git, se obtuvo: {other:?}"),
         }
+    }
+
+    #[test]
+    fn diff_worktree_shows_committed_and_uncommitted_changes() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-diff");
+        create_worktree(repo_dir.path(), "main", "forja/diff", &destino).expect("crear worktree");
+
+        fs::write(destino.join("nuevo.txt"), "linea nueva\n").expect("escribir archivo");
+        commit_all(&destino, "añadir nuevo.txt").expect("commit en worktree");
+        fs::write(
+            destino.join("README.md"),
+            "# Repo modificado sin commitear\n",
+        )
+        .expect("modificar README");
+
+        let diff = diff_worktree(&destino, "main", 64 * 1024).expect("diff del worktree");
+        assert!(
+            diff.text.contains("nuevo.txt"),
+            "el diff debe incluir el archivo commiteado"
+        );
+        assert!(
+            diff.text.contains("Repo modificado sin commitear"),
+            "el diff debe incluir cambios sin commitear: {}",
+            diff.text
+        );
+        assert!(
+            diff.stat.contains("nuevo.txt"),
+            "el resumen debe listar los archivos: {}",
+            diff.stat
+        );
+        assert!(!diff.truncated, "un diff pequeño no debe truncarse");
+
+        // Los archivos sin seguimiento también se ven y el índice queda intacto.
+        fs::write(destino.join("sin-seguimiento.txt"), "nuevo sin add\n")
+            .expect("crear archivo sin seguimiento");
+        let status_before = run_git_stdout(&destino, &["status", "--porcelain"]);
+        let con_untracked = diff_worktree(&destino, "main", 64 * 1024).expect("diff con untracked");
+        assert!(
+            con_untracked.text.contains("sin-seguimiento.txt")
+                && con_untracked.text.contains("+nuevo sin add"),
+            "el diff debe incluir archivos sin seguimiento: {}",
+            con_untracked.text
+        );
+        assert!(
+            con_untracked.stat.contains("sin-seguimiento.txt"),
+            "el resumen debe listar el archivo sin seguimiento: {}",
+            con_untracked.stat
+        );
+        assert_eq!(
+            status_before,
+            run_git_stdout(&destino, &["status", "--porcelain"]),
+            "revisar el diff no debe dejar cambios en el índice"
+        );
+
+        // La base avanzó (otro worktree ya fusionado): el diff de esta tarea se
+        // calcula desde su merge-base y no debe incluir los commits ajenos.
+        fs::write(repo_dir.path().join("otra-tarea.txt"), "de la base\n")
+            .expect("avanzar la rama base");
+        commit_all(repo_dir.path(), "avance de la base").expect("commit en la base");
+        let tras_avance = diff_worktree(&destino, "main", 64 * 1024).expect("diff tras avanzar");
+        assert!(
+            tras_avance.text.contains("nuevo.txt"),
+            "el diff debe conservar los cambios de la tarea: {}",
+            tras_avance.text
+        );
+        assert!(
+            !tras_avance.text.contains("otra-tarea.txt")
+                && !tras_avance.stat.contains("otra-tarea.txt"),
+            "el diff no debe incluir commits fusionados después en la base: {}",
+            tras_avance.text
+        );
+
+        let short = diff_worktree(&destino, "main", 20).expect("diff truncado");
+        assert!(short.truncated, "debe marcarse como truncado");
+        assert!(
+            short.text.ends_with("…[diff truncado]\n"),
+            "debe avisar del recorte: {}",
+            short.text
+        );
+        assert!(
+            std::str::from_utf8(short.text.as_bytes()).is_ok(),
+            "el recorte debe respetar UTF-8"
+        );
+    }
+
+    #[test]
+    fn merge_branch_moves_changes_to_base_and_reports_up_to_date() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-merge");
+        create_worktree(repo_dir.path(), "main", "forja/merge", &destino).expect("crear worktree");
+        fs::write(destino.join("fusion.txt"), "fusionado\n").expect("escribir archivo");
+        commit_all(&destino, "trabajo de la tarea").expect("commit en worktree");
+
+        let outcome = merge_branch(repo_dir.path(), "main", "forja/merge", "fusionar tarea")
+            .expect("merge debe tener éxito");
+        assert!(!outcome.already_up_to_date);
+        assert!(!outcome.commit.is_empty());
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("fusion.txt")).expect("leer archivo fusionado"),
+            "fusionado\n"
+        );
+        assert!(
+            status_clean(repo_dir.path()).expect("status tras merge"),
+            "el repo base debe quedar limpio"
+        );
+
+        let again = merge_branch(repo_dir.path(), "main", "forja/merge", "fusionar otra vez")
+            .expect("un segundo merge no debe fallar");
+        assert!(
+            again.already_up_to_date,
+            "debe detectar 'Already up to date'"
+        );
+    }
+
+    #[test]
+    fn merge_branch_requires_base_branch_and_clean_tree() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-pre");
+        create_worktree(repo_dir.path(), "main", "forja/pre", &destino).expect("crear worktree");
+        fs::write(destino.join("x.txt"), "x\n").expect("escribir archivo");
+        commit_all(&destino, "x").expect("commit en worktree");
+
+        run_git(repo_dir.path(), &["checkout", "-q", "-b", "otra"]);
+        let err = merge_branch(repo_dir.path(), "main", "forja/pre", "merge")
+            .expect_err("debe fallar fuera de la rama base");
+        assert!(matches!(err, ForjaError::InvalidInput(_)), "{err:?}");
+        run_git(repo_dir.path(), &["checkout", "-q", "main"]);
+
+        fs::write(repo_dir.path().join("sucio.txt"), "sucio\n").expect("ensuciar repo");
+        let err = merge_branch(repo_dir.path(), "main", "forja/pre", "merge")
+            .expect_err("debe fallar con cambios sin commitear");
+        assert!(matches!(err, ForjaError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn merge_branch_aborts_conflict_and_leaves_repo_clean() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-conflicto");
+        create_worktree(repo_dir.path(), "main", "forja/conflicto", &destino)
+            .expect("crear worktree");
+
+        fs::write(destino.join("README.md"), "# Worktree\n").expect("modificar README en wt");
+        commit_all(&destino, "cambio en worktree").expect("commit en worktree");
+        fs::write(repo_dir.path().join("README.md"), "# Base\n").expect("modificar README en base");
+        commit_all(repo_dir.path(), "cambio en base").expect("commit en base");
+
+        let err = merge_branch(repo_dir.path(), "main", "forja/conflicto", "fusionar")
+            .expect_err("debe detectar conflicto");
+        assert!(matches!(err, ForjaError::Conflict(_)), "{err:?}");
+        assert!(
+            status_clean(repo_dir.path()).expect("status tras conflicto"),
+            "el merge abortado debe dejar el repo limpio"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_and_delete_branch_discard_task() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-descartar");
+        create_worktree(repo_dir.path(), "main", "forja/descartar", &destino)
+            .expect("crear worktree");
+        fs::write(destino.join("desecho.txt"), "no fusionar\n").expect("escribir archivo");
+        commit_all(&destino, "trabajo descartable").expect("commit en worktree");
+
+        assert!(worktree_registered(repo_dir.path(), &destino).expect("listar worktrees"));
+        assert!(remove_worktree(repo_dir.path(), &destino, true).expect("quitar worktree"));
+        assert!(
+            !destino.exists(),
+            "la carpeta del worktree debe desaparecer"
+        );
+        assert!(
+            !worktree_registered(repo_dir.path(), &destino).expect("listar tras quitar"),
+            "el worktree no debe seguir registrado"
+        );
+
+        assert!(branch_exists(repo_dir.path(), "forja/descartar").expect("comprobar rama"));
+        assert!(delete_branch(repo_dir.path(), "forja/descartar", true).expect("borrar rama"));
+        assert!(
+            !branch_exists(repo_dir.path(), "forja/descartar").expect("comprobar tras borrar"),
+            "la rama descartada no debe existir"
+        );
+        assert!(
+            !remove_worktree(repo_dir.path(), &destino, true).expect("segunda limpieza"),
+            "quitar un worktree inexistente es idempotente"
+        );
+        assert!(
+            !delete_branch(repo_dir.path(), "forja/descartar", true).expect("segundo borrado"),
+            "borrar una rama inexistente es idempotente"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_requires_force_for_uncommitted_changes() {
+        let repo_dir = init_temp_repo();
+        let wt_parent = TempDir::new().expect("crear padre de worktree");
+        let destino = wt_parent.path().join("wt-sucio");
+        create_worktree(repo_dir.path(), "main", "forja/sucio", &destino).expect("crear worktree");
+        fs::write(destino.join("pendiente.txt"), "sin commitear\n").expect("ensuciar worktree");
+
+        let err = remove_worktree(repo_dir.path(), &destino, false)
+            .expect_err("sin force no debe borrar un worktree sucio");
+        assert!(matches!(err, ForjaError::Git(_)), "{err:?}");
+        assert!(destino.is_dir(), "el worktree debe seguir ahí");
+
+        assert!(
+            remove_worktree(repo_dir.path(), &destino, true).expect("forzar borrado"),
+            "con force sí debe eliminarse"
+        );
+        assert!(!destino.exists(), "la carpeta debe desaparecer");
     }
 
     #[test]
