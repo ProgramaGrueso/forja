@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use forja_core::{default_sensitive_agents, AgentKind};
+
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub max_concurrency: usize,
@@ -10,6 +12,7 @@ pub struct SchedulerConfig {
     pub base_branch: String,
     pub max_retries: u32,
     pub retry_backoff: Duration,
+    pub sensitive_agents: Vec<AgentKind>,
 }
 
 impl SchedulerConfig {
@@ -22,6 +25,7 @@ impl SchedulerConfig {
             base_branch: "main".to_string(),
             max_retries: 2,
             retry_backoff: Duration::from_millis(20),
+            sensitive_agents: default_sensitive_agents(),
         }
     }
 }

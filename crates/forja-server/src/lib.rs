@@ -86,6 +86,7 @@ impl AppState {
         ];
 
         let default_quota = default_manual_path();
+        let sensitive_agents = scheduler.sensitive_agents();
         let settings = Settings {
             max_concurrency: 2,
             store_dir: ".forja/store".to_string(),
@@ -97,6 +98,7 @@ impl AppState {
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
+            sensitive_agents,
         };
 
         let conversations_path = scheduler
@@ -186,6 +188,9 @@ impl AppState {
     pub fn with_settings(self, settings: Settings) -> Self {
         self.quota
             .set_manual_path(PathBuf::from(&settings.quota_path));
+        let _ = self
+            .scheduler
+            .set_sensitive_agents(settings.sensitive_agents.clone());
         self.profile_rules.set_hidden(&settings.hidden_profiles);
         let _ = self.orchestrator.apply_settings(&settings);
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
@@ -200,6 +205,9 @@ impl AppState {
     pub(crate) fn on_settings_changed(&self, next: &Settings) {
         self.quota.set_manual_path(PathBuf::from(&next.quota_path));
         let _ = self.scheduler.set_max_concurrency(next.max_concurrency);
+        let _ = self
+            .scheduler
+            .set_sensitive_agents(next.sensitive_agents.clone());
         self.profile_rules.set_hidden(&next.hidden_profiles);
         let _ = self.orchestrator.apply_settings(next);
     }
@@ -1236,6 +1244,10 @@ mod tests {
             "set-orch-profile",
             "set-hidden-profiles",
             "hidden_profiles",
+            "set-sensitive-box",
+            "set-sensitive-agents",
+            "sensitive_agents",
+            "Agentes permitidos con privacidad sensitive",
             "orchestrator_agent",
             "FORJA_HIDDEN_PROFILES",
             "set-models-rows",

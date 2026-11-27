@@ -218,3 +218,88 @@ async fn retry_exhausted_marks_failed() {
     assert_eq!(stored.attempts, 3);
     assert_eq!(stored.error, finished.error);
 }
+
+#[tokio::test]
+async fn custom_sensitive_agents_local_only_and_hot_update() {
+    let store_dir = TempDir::new().expect("crear store tempdir");
+    let wt_dir = TempDir::new().expect("crear worktrees tempdir");
+    let store = JsonlStore::new(store_dir.path()).expect("crear JsonlStore");
+
+    let mut config = SchedulerConfig::new(wt_dir.path());
+    config.sensitive_agents = vec![AgentKind::Local];
+    let scheduler = Scheduler::new(store, config).expect("crear Scheduler");
+    assert_eq!(scheduler.sensitive_agents(), vec![AgentKind::Local]);
+
+    // Con ["local"], agy y claude se deniegan para sensitive.
+    let agy: Arc<dyn Agent> = Arc::new(AgyAgent::default());
+    let err_agy = scheduler
+        .submit(Task::new("t1", "p", Privacy::Sensitive), agy.clone())
+        .await
+        .expect_err("agy debe ser denegado");
+    assert!(matches!(
+        err_agy,
+        ForjaError::PolicyDenied {
+            privacy: Privacy::Sensitive,
+            agent: AgentKind::Agy
+        }
+    ));
+
+    let claude: Arc<dyn Agent> = Arc::new(forja_agent::ClaudeAgent::default());
+    let err_claude = scheduler
+        .submit(Task::new("t2", "p", Privacy::Sensitive), claude)
+        .await
+        .expect_err("claude debe ser denegado cuando solo local está permitido");
+    assert!(matches!(
+        err_claude,
+        ForjaError::PolicyDenied {
+            privacy: Privacy::Sensitive,
+            agent: AgentKind::Claude
+        }
+    ));
+
+    // local sí se acepta con ["local"].
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener efímero");
+    let port = listener.local_addr().expect("addr").port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../forja-agent/tests/fake_local.sh");
+    let local: Arc<dyn Agent> = Arc::new(
+        forja_agent::LocalAgent::default()
+            .with_program(script.to_string_lossy())
+            .with_port(port),
+    );
+    let submitted = scheduler
+        .submit(Task::new("t3", "p", Privacy::Sensitive), local)
+        .await
+        .expect("local debe ser aceptado");
+    let finished = scheduler.wait_run(&submitted.id).await.expect("wait_run");
+    drop(listener);
+    assert_eq!(finished.status, RunStatus::Done);
+
+    // Cambio en caliente sin reiniciar: ahora permite mock y rechaza listas inválidas.
+    assert!(scheduler.set_sensitive_agents(vec![]).is_err());
+    assert!(scheduler
+        .set_sensitive_agents(vec![AgentKind::Mock, AgentKind::Mock])
+        .is_err());
+
+    let mock: Arc<dyn Agent> = Arc::new(MockAgent::success("ok"));
+    assert!(matches!(
+        scheduler
+            .submit(Task::new("t4", "p", Privacy::Sensitive), mock.clone())
+            .await,
+        Err(ForjaError::PolicyDenied {
+            privacy: Privacy::Sensitive,
+            agent: AgentKind::Mock
+        })
+    ));
+
+    scheduler
+        .set_sensitive_agents(vec![AgentKind::Mock])
+        .expect("actualizar sensitive_agents en caliente");
+    assert_eq!(scheduler.sensitive_agents(), vec![AgentKind::Mock]);
+
+    let submitted = scheduler
+        .submit(Task::new("t5", "p", Privacy::Sensitive), mock)
+        .await
+        .expect("mock debe aceptarse tras cambio en caliente");
+    let finished = scheduler.wait_run(&submitted.id).await.expect("wait_run");
+    assert_eq!(finished.status, RunStatus::Done);
+}
