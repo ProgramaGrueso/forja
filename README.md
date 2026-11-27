@@ -38,7 +38,7 @@ Dónde se guarda cada cosa (respeta `XDG_*` si están definidas):
 | PID de `forja app` | `$XDG_STATE_HOME/forja/app.pid` o `~/.local/state/forja/app.pid` |
 | Log del servidor | `$XDG_STATE_HOME/forja/forja.log` o `~/.local/state/forja/forja.log` |
 | Lanzador e icono | `~/.local/share/applications/forja.desktop`, `~/.local/share/icons/forja.webp` |
-| Ajustes del orquestador / historial | `.forja/store/` dentro del repo (ver `--store-dir`) |
+| Ajustes, historial y conversaciones | `.forja/store/` dentro del repo (`settings.json`, `runs.jsonl`, `conversations.json`; ver `--store-dir`) |
 
 El esfuerzo de razonamiento acepta alias en español (`alto`, `muy alto`, `máx`, `mínimo`...) y se guarda siempre como valor canónico (`high`, `xhigh`, `max`, `minimal`...). En opencode, si el modelo no tiene esa variante, la tarea se reintenta una vez sin ella y el registro queda sin esfuerzo.
 
@@ -48,7 +48,7 @@ El esfuerzo de razonamiento acepta alias en español (`alto`, `muy alto`, `máx`
 - `forja app [--stop|--status]` y `forja desktop install|uninstall`: ver [Ejecutar como app](#ejecutar-como-app).
 - `forja init [--yes] [--desktop]`: asistente de primer arranque, ver [Configuración inicial](#configuración-inicial-forja-init).
 - `forja serve --open`: levanta el panel web local (solo accesible desde tu máquina).
-- `forja run --agent AGENTE --privacy open|sensitive "tu tarea"`: ejecuta una tarea y muestra el resultado.
+- `forja run --agent AGENTE --privacy open|sensitive "tu tarea"`: ejecuta una tarea y muestra el resultado (con `sensitive` respeta `sensitive_agents` de `<store_dir>/settings.json`).
 - `forja list`: historial de ejecuciones.
 
 Cada tarea trabaja en un *worktree* (copia aislada) del repo en su propia rama `forja/...`; tu rama de trabajo no se toca hasta que tú decidas fusionar.
@@ -61,15 +61,15 @@ En el panel, pestaña **Orquestador**: conversas por texto o pulsas el icono de 
 - Con `hermes` mantiene sesión y eliges el perfil: ajuste `orchestrator_profile` > `FORJA_ORCHESTRATOR_PROFILE` > `default`. Los perfiles se **descubren** (`default` + subdirectorios de `$HERMES_HOME/profiles`, o `~/.hermes/profiles`); no hay nombres fijos.
 - Con los demás agentes se hace una llamada one-shot a su CLI (mismo modelo que resuelves por agente en Ajustes) y, como esos CLIs no guardan sesión, Forja reenvía en cada mensaje las instrucciones del orquestador y los últimos 20 intercambios de la conversación.
 - **Delegación sin permisos de shell.** Los orquestadores que no son Hermes (claude, opencode, agy, local) no ejecutan `curl`: terminan su respuesta con líneas de acción y **el servidor** las ejecuta por ellos. Formato exacto, una acción por línea y con el JSON en una sola línea: `[[forja:delegar {"titulo":"...","prompt":"...","agent":"opencode","privacidad":"open","modelo":"...","esfuerzo":"..."}]]` y `[[forja:estado ID]]`. Cada delegación pasa por las mismas validaciones que `POST /tasks` (agente, modelo, esfuerzo, política de privacidad), con un máximo de 5 delegaciones por turno. Esas líneas no se muestran al usuario. Cuando termina una tarea delegada, el servidor **despierta al orquestador con un turno automático** (ID, estado, salida y error resumidos, sin secretos) para que revise el resultado y continúe sin esperar a que el usuario escriba; si está hablando con el usuario espera a que termine, agrupa los resultados que acaben juntos y tras 8 turnos automáticos seguidos los deja como «Tareas delegadas» para el siguiente mensaje. Hermes conserva su `curl`, añadiendo `?conversation_id=` a `/tasks` para recibir el mismo aviso. JSON inválido, acciones rechazadas o el límite generan un aviso en el siguiente turno, nunca un error. Los bloques solo se interpretan en la salida del orquestador, jamás en la de las tareas (que se reinyecta neutralizada).
-- Las tareas que el orquestador delega siguen la política de privacidad de siempre (`open`/`sensitive`); elegir otro agente de orquestador no la modifica.
+- Las tareas que el orquestador delega siguen la política de privacidad configurada (`open`/`sensitive`, con lista `sensitive_agents`); elegir otro agente de orquestador no la modifica.
 - La voz usa el navegador (Web Speech API): funciona en Chrome, Edge y Chromium, necesita internet y permiso de micrófono.
 
 ### Orquestador, modelos y terminales en el panel
 
-- **Conversaciones**: en **Orquestador** hay una lista lateral (máx. 20) con un historial independiente por conversación; varias pueden estar «pensando» a la vez. `+ Nueva` crea otra; ✕ la borra (con confirmación). La seleccionada se recuerda.
+- **Conversaciones**: en **Orquestador** hay una lista lateral (máx. 20, hasta 500 mensajes cada una) con un historial independiente por conversación que **persiste entre reinicios** en `<store_dir>/conversations.json`; varias pueden estar «pensando» a la vez. `+ Nueva` crea otra; ✕ la borra (con confirmación). La seleccionada se recuerda.
 - **Comandos `/`**: al escribir `/` aparece el autocompletado. `/new` (conversación nueva), `/help`, `/rename <título>`, `/agents`, `/stop`; `/model <modelo>` y `/effort <nivel>` cambian el modelo y el esfuerzo del orquestador **en esa conversación** (sin argumento muestran el actual; `reset` vuelve a Ajustes); `/agent` sigue reservado.
 - **Modelo y esfuerzo en el chat**: junto a Enviar hay dos desplegables compactos `[Modelo ▾] [Esfuerzo ▾]` y el icono de micrófono. Son **por conversación** (el servidor los guarda con ella y el panel los envía en el campo `modelo`/`esfuerzo` del chat), sobrescriben los Ajustes solo para ese orquestador y cambiarlos **no reinicia** la conversación. El de modelo lista los de la familia del orquestador (claude: sonnet/opus/haiku; el resto, lo que expone `/api/models`) más «otro…» de texto libre; el de esfuerzo muestra los niveles de esa familia y se oculta si no la soporta (`local`). Cambiar el agente del orquestador descarta estas elecciones.
-- **Elegir orquestador, modelos y esfuerzo** (pestaña **Ajustes**; el selector de agente —y de perfil si es hermes— también está en la cabecera de Orquestador): agente del orquestador y perfil de Hermes (cambiarlos reinicia sus sesiones), perfiles de Hermes ocultos y, por agente, modelo (`claude`, `agy`, `opencode`, `hermes`, `local`; vacío = default; en hermes vacío = el del perfil) y esfuerzo de razonamiento (select con los niveles de cada familia; `local` y `mock` muestran «sin soporte»). En **Nueva tarea**, «Modelo» y «Esfuerzo» (opcionales) los sobrescriben para esa ejecución; el de esfuerzo cambia sus opciones con el agente y se deshabilita para `mock`/`local`.
+- **Elegir orquestador, modelos, esfuerzo y privacidad** (pestaña **Ajustes**; el selector de agente —y de perfil si es hermes— también está en la cabecera de Orquestador): agente del orquestador y perfil de Hermes (cambiarlos reinicia sus sesiones), perfiles de Hermes ocultos, agentes permitidos con privacidad `sensitive` (`sensitive_agents`, por defecto solo `claude`), y, por agente, modelo (`claude`, `agy`, `opencode`, `hermes`, `local`; vacío = default; en hermes vacío = el del perfil) y esfuerzo de razonamiento (select con los niveles de cada familia; `local` y `mock` muestran «sin soporte»). En **Nueva tarea**, «Modelo» y «Esfuerzo» (opcionales) los sobrescriben para esa ejecución; el de esfuerzo cambia sus opciones con el agente y se deshabilita para `mock`/`local`.
 
 ### Esfuerzo de razonamiento
 
@@ -98,7 +98,8 @@ Todo es opcional: sin `settings.json` Forja funciona con defaults y elige el orq
   "orchestrator_profile": null,
   "agent_models": { "claude": "sonnet" },
   "agent_effort": { "claude": "high", "hermes": "medium" },
-  "hidden_profiles": []
+  "hidden_profiles": [],
+  "sensitive_agents": ["claude"]
 }
 ```
 
@@ -223,4 +224,4 @@ cargo run -p forja-cli -- --repo /ruta/al/repo --base-branch main \
 ### Política de privacidad
 
 - `open`: permite todos los agentes: `agy`, `mock`, `claude`, `opencode`, `hermes` y `local` (cada uno requiere su CLI instalado; `forja doctor` te dice cuáles tienes).
-- `sensitive`: solo permite `claude`. Cualquier intento de ejecutar otro agente con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.
+- `sensitive`: por defecto solo permite `claude` (valor estricto). Es configurable mediante `sensitive_agents` en `<store_dir>/settings.json`, `PUT /api/settings` o la pestaña **Ajustes** del panel (por ejemplo, añadiendo `local`); se aplica en caliente en el servidor y `forja run` lo lee al arrancar. Cualquier intento de ejecutar un agente fuera de esa lista con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.
