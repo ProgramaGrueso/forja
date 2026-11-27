@@ -8,10 +8,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::conversation_store::{
+    load_conversations, ConversationPersistence, PersistedConversation,
+};
 use crate::delegation::{self, Delegator, Pending};
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
@@ -636,7 +639,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub rol: String,
     pub texto: String,
@@ -791,6 +794,12 @@ fn clamp_title(title: &str) -> String {
     title.trim().chars().take(MAX_TITLE_CHARS).collect()
 }
 
+fn parse_conv_counter(id: &str) -> Option<u64> {
+    let rest = id.strip_prefix('c')?;
+    let (num, _) = rest.split_once('-')?;
+    num.parse().ok()
+}
+
 /// Libera la marca "en curso" aunque la petición HTTP se aborte a mitad.
 struct InFlightGuard {
     inner: Arc<Mutex<Inner>>,
@@ -824,6 +833,7 @@ pub struct Orchestrator {
     rules: ProfileRules,
     inner: Arc<Mutex<Inner>>,
     reactions: Arc<Mutex<Reactions>>,
+    persistence: Option<Arc<ConversationPersistence>>,
 }
 
 impl Orchestrator {
@@ -841,7 +851,77 @@ impl Orchestrator {
                 idle: Arc::new(Notify::new()),
             })),
             reactions: Arc::new(Mutex::new(Reactions::default())),
+            persistence: None,
         }
+    }
+
+    /// Activa la persistencia en `path` (`<store_dir>/conversations.json`), cargando las
+    /// conversaciones válidas existentes sin impedir el arranque si falta o está corrupto.
+    pub fn with_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let loaded = load_conversations(&path);
+        if !loaded.is_empty() {
+            let mut g = lock(&self.inner);
+            let mut map = HashMap::with_capacity(loaded.len() + 1);
+            let mut max_counter = g.counter;
+            for item in loaded {
+                if let Some(n) = parse_conv_counter(&item.id) {
+                    max_counter = max_counter.max(n);
+                }
+                map.insert(
+                    item.id,
+                    Conversation {
+                        title: item.titulo,
+                        session_id: item.session_id,
+                        messages: item.historial,
+                        created: item.creado,
+                        updated: item.actualizado,
+                        in_flight: None,
+                        model: item.modelo,
+                        effort: item.esfuerzo,
+                        pending: Vec::new(),
+                        auto_turns: 0,
+                    },
+                );
+            }
+            map.entry(PRINCIPAL.to_string())
+                .or_insert_with(|| Conversation::new("Principal"));
+            g.map = map;
+            g.counter = max_counter;
+        }
+        self.persistence = Some(Arc::new(ConversationPersistence::new(path)));
+        self
+    }
+
+    /// Espera a que termine cualquier escritura pendiente en disco (útil en tests y apagado).
+    pub fn flush_persistence(&self) {
+        if let Some(p) = &self.persistence {
+            p.flush();
+        }
+    }
+
+    /// Programa un guardado coalescido fuera del lock de `Inner`.
+    fn persist(&self) {
+        let Some(p) = &self.persistence else {
+            return;
+        };
+        let snapshot: Vec<PersistedConversation> = {
+            let g = lock(&self.inner);
+            g.map
+                .iter()
+                .map(|(id, c)| PersistedConversation {
+                    id: id.clone(),
+                    titulo: c.title.clone(),
+                    session_id: c.session_id.clone(),
+                    historial: c.messages.clone(),
+                    creado: c.created,
+                    actualizado: c.updated,
+                    modelo: c.model.clone(),
+                    esfuerzo: c.effort.clone(),
+                })
+                .collect()
+        };
+        p.schedule(snapshot);
     }
 
     /// Reglas de perfiles (descubrimiento y ocultos) para validar en `apply_profile`.
@@ -948,9 +1028,20 @@ impl Orchestrator {
     }
 
     fn clear_conversation_options(&self) {
-        for c in lock(&self.inner).map.values_mut() {
-            c.model = None;
-            c.effort = None;
+        let mut changed = false;
+        {
+            let mut g = lock(&self.inner);
+            for c in g.map.values_mut() {
+                if c.model.take().is_some() {
+                    changed = true;
+                }
+                if c.effort.take().is_some() {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist();
         }
     }
 
@@ -978,13 +1069,21 @@ impl Orchestrator {
 
     /// Olvida la sesión de Hermes de todas las conversaciones (cambio de perfil o agente).
     fn reset_all_sessions(&self) {
-        let mut g = lock(&self.inner);
-        for c in g.map.values_mut() {
-            if let Some(f) = c.in_flight.take() {
-                f.cancel.notify_one();
+        let mut changed = false;
+        {
+            let mut g = lock(&self.inner);
+            for c in g.map.values_mut() {
+                if let Some(f) = c.in_flight.take() {
+                    f.cancel.notify_one();
+                }
+                if c.session_id.take().is_some() {
+                    changed = true;
+                }
+                c.auto_turns = 0;
             }
-            c.session_id = None;
-            c.auto_turns = 0;
+        }
+        if changed {
+            self.persist();
         }
     }
 
@@ -997,23 +1096,27 @@ impl Orchestrator {
 
     /// Crea una conversación; `title` vacío = se titula con el primer mensaje.
     pub fn create(&self, title: Option<&str>) -> Result<ConversationSummary, CreateError> {
-        let mut g = lock(&self.inner);
-        if g.map.len() >= MAX_CONVERSATIONS {
-            return Err(CreateError::LimitReached);
-        }
-        g.counter += 1;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let mut id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
-        while g.map.contains_key(&id) {
+        let summary = {
+            let mut g = lock(&self.inner);
+            if g.map.len() >= MAX_CONVERSATIONS {
+                return Err(CreateError::LimitReached);
+            }
             g.counter += 1;
-            id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
-        }
-        let conv = Conversation::new(&clamp_title(title.unwrap_or("")));
-        let summary = conv.summary(&id);
-        g.map.insert(id, conv);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let mut id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
+            while g.map.contains_key(&id) {
+                g.counter += 1;
+                id = format!("c{}-{:05x}", g.counter, nanos & 0xfffff);
+            }
+            let conv = Conversation::new(&clamp_title(title.unwrap_or("")));
+            let summary = conv.summary(&id);
+            g.map.insert(id, conv);
+            summary
+        };
+        self.persist();
         Ok(summary)
     }
 
@@ -1064,6 +1167,7 @@ impl Orchestrator {
         };
         if existed {
             self.clear_reactions(id);
+            self.persist();
         }
         existed
     }
@@ -1089,6 +1193,7 @@ impl Orchestrator {
         };
         if existed {
             self.clear_reactions(id);
+            self.persist();
         }
         existed
     }
@@ -1106,15 +1211,21 @@ impl Orchestrator {
     }
 
     pub fn rename(&self, id: &str, title: &str) -> bool {
-        let mut g = lock(&self.inner);
-        match g.map.get_mut(id) {
-            Some(c) => {
-                c.title = clamp_title(title);
-                c.updated = now_ms();
-                true
+        let renamed = {
+            let mut g = lock(&self.inner);
+            match g.map.get_mut(id) {
+                Some(c) => {
+                    c.title = clamp_title(title);
+                    c.updated = now_ms();
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if renamed {
+            self.persist();
         }
+        renamed
     }
 
     /// Cancela la llamada en curso de la conversación. `true` si había algo.
@@ -1225,8 +1336,17 @@ impl Orchestrator {
 
     /// Añade una nota del sistema al historial (errores del turno automático).
     pub fn push_system(&self, conversation: &str, text: &str) {
-        if let Some(c) = lock(&self.inner).map.get_mut(conversation) {
-            c.push("sistema", text);
+        let pushed = {
+            let mut g = lock(&self.inner);
+            if let Some(c) = g.map.get_mut(conversation) {
+                c.push("sistema", text);
+                true
+            } else {
+                false
+            }
+        };
+        if pushed {
+            self.persist();
         }
     }
 
@@ -1264,6 +1384,7 @@ impl Orchestrator {
              quedan pendientes para tu próximo mensaje.",
             runs.len()
         );
+        let mut pushed = false;
         let mut g = lock(&self.inner);
         if let Some(c) = g.map.get_mut(conversation) {
             for (id, titulo) in runs {
@@ -1279,6 +1400,7 @@ impl Orchestrator {
                 }
             }
             c.push("sistema", &notice);
+            pushed = true;
         }
         drop(g);
         let mut r = lock(&self.reactions);
@@ -1287,6 +1409,10 @@ impl Orchestrator {
             if pending.is_empty() {
                 r.finished.remove(conversation);
             }
+        }
+        drop(r);
+        if pushed {
+            self.persist();
         }
     }
 
@@ -1370,13 +1496,26 @@ impl Orchestrator {
                 ))
             }
         };
-        let mut g = lock(&self.inner);
-        let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
-        if let Some(m) = model {
-            conv.model = m;
-        }
-        if let Some(e) = effort {
-            conv.effort = e;
+        let changed = {
+            let mut g = lock(&self.inner);
+            let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
+            let mut changed = false;
+            if let Some(m) = model {
+                if conv.model != m {
+                    conv.model = m;
+                    changed = true;
+                }
+            }
+            if let Some(e) = effort {
+                if conv.effort != e {
+                    conv.effort = e;
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed {
+            self.persist();
         }
         Ok(())
     }
@@ -1620,6 +1759,7 @@ impl Orchestrator {
             }
         };
         drop(g);
+        self.persist();
         // El servidor vigila estas ejecuciones y despierta al orquestador al acabar.
         if let Some(d) = delegator {
             for run_id in delegated_runs {
@@ -3757,6 +3897,303 @@ mod tests {
             )
             .await;
             assert_eq!(st, StatusCode::CONFLICT);
+        }
+    }
+
+    mod persistence_tests {
+        use super::*;
+        use crate::conversation_store::{write_atomic, PersistedConversation, CONVERSATIONS_FILE};
+        use tempfile::TempDir;
+
+        /// Doble que simula `claude` para poder probar `modelo` y `esfuerzo` junto a sesiones.
+        struct ClaudeSessionFake {
+            n: Mutex<u32>,
+            resumes: Mutex<Vec<Option<String>>>,
+        }
+
+        impl ClaudeSessionFake {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    n: Mutex::new(0),
+                    resumes: Mutex::new(Vec::new()),
+                })
+            }
+        }
+
+        impl ChatBackend for ClaudeSessionFake {
+            fn agent_name(&self) -> String {
+                "claude".to_string()
+            }
+
+            fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
+                Box::pin(async move {
+                    self.resumes.lock().unwrap().push(resume.clone());
+                    let sid = resume.unwrap_or_else(|| {
+                        let mut n = self.n.lock().unwrap();
+                        *n += 1;
+                        format!("sess-{}", *n)
+                    });
+                    Ok(ChatReply {
+                        text: format!("resp:{sid}:{}", prompt.lines().last().unwrap_or("")),
+                        session_id: Some(sid),
+                    })
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn persistence_roundtrip_two_conversations_and_messages() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(CONVERSATIONS_FILE);
+
+            let orq = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+            orq.say("hola principal", 7777, None).await.unwrap();
+            orq.update_options(PRINCIPAL, Some("opus"), Some("high"))
+                .unwrap();
+
+            let c2 = orq.create(Some("Proyecto Beta")).unwrap();
+            orq.say_in(&c2.id, "primer mensaje beta", 7777, None)
+                .await
+                .unwrap();
+            orq.say_in(&c2.id, "segundo mensaje beta", 7777, None)
+                .await
+                .unwrap();
+            orq.rename(&c2.id, "Proyecto Beta v2");
+            orq.flush_persistence();
+
+            assert!(path.is_file(), "debe crear conversations.json");
+            let loaded = load_conversations(&path);
+            assert_eq!(loaded.len(), 2);
+
+            let p = loaded.iter().find(|c| c.id == PRINCIPAL).unwrap();
+            assert_eq!(p.titulo, "Principal");
+            assert_eq!(p.session_id.as_deref(), Some("sess-1"));
+            assert_eq!(p.modelo.as_deref(), Some("opus"));
+            assert_eq!(p.esfuerzo.as_deref(), Some("high"));
+            assert_eq!(p.historial.len(), 2);
+            assert_eq!(p.historial[0].rol, "usuario");
+            assert_eq!(p.historial[0].texto, "hola principal");
+            assert_eq!(p.historial[1].rol, "orquestador");
+
+            let b = loaded.iter().find(|c| c.id == c2.id).unwrap();
+            assert_eq!(b.titulo, "Proyecto Beta v2");
+            assert_eq!(b.session_id.as_deref(), Some("sess-2"));
+            assert_eq!(b.historial.len(), 4);
+            assert_eq!(b.historial[0].texto, "primer mensaje beta");
+            assert_eq!(b.historial[2].texto, "segundo mensaje beta");
+            assert!(b.creado > 0 && b.actualizado >= b.creado);
+        }
+
+        #[tokio::test]
+        async fn persistence_reload_in_new_instance_simulates_restart() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(CONVERSATIONS_FILE);
+
+            let second_id = {
+                let orq1 = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+                orq1.say("antes del reinicio", 7777, None).await.unwrap();
+                let c2 = orq1.create(Some("Seguimiento")).unwrap();
+                orq1.update_options(&c2.id, Some("sonnet"), Some("medium"))
+                    .unwrap();
+                orq1.say_in(&c2.id, "nota inicial", 7777, None)
+                    .await
+                    .unwrap();
+                c2.id
+                // Al hacer drop de `orq1`, el hilo de fondo termina de volcar el último cambio.
+            };
+
+            let fake2 = ClaudeSessionFake::new();
+            let orq2 = Orchestrator::new(fake2.clone()).with_persistence(&path);
+
+            let list = orq2.list();
+            assert_eq!(list.len(), 2);
+            let d1 = orq2.get(PRINCIPAL).unwrap();
+            assert_eq!(d1.historial.len(), 2);
+            assert_eq!(d1.historial[0].texto, "antes del reinicio");
+            assert_eq!(orq2.session_of(PRINCIPAL).as_deref(), Some("sess-1"));
+
+            let d2 = orq2.get(&second_id).unwrap();
+            assert_eq!(d2.resumen.titulo, "Seguimiento");
+            assert_eq!(d2.resumen.modelo.as_deref(), Some("sonnet"));
+            assert_eq!(d2.resumen.esfuerzo.as_deref(), Some("medium"));
+            assert_eq!(d2.historial.len(), 2);
+            assert_eq!(orq2.session_of(&second_id).as_deref(), Some("sess-2"));
+
+            // Al seguir hablando tras el reinicio, se reanuda el session_id conservado.
+            orq2.say_in(&second_id, "después del reinicio", 7777, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                fake2.resumes.lock().unwrap().as_slice(),
+                &[Some("sess-2".to_string())]
+            );
+
+            // Crear una nueva conversación tras reiniciar no colisiona con IDs existentes.
+            let c3 = orq2.create(Some("Nueva post-reinicio")).unwrap();
+            assert_ne!(c3.id, second_id);
+            assert_ne!(c3.id, PRINCIPAL);
+        }
+
+        #[tokio::test]
+        async fn persistence_corrupt_file_starts_with_principal_only() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(CONVERSATIONS_FILE);
+            std::fs::write(&path, "{archivo corrupto sin cerrar").unwrap();
+
+            let orq = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+            let list = orq.list();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, PRINCIPAL);
+            assert_eq!(list[0].titulo, "Principal");
+            assert_eq!(list[0].mensajes, 0);
+
+            // El servidor sigue operativo y el siguiente cambio regenera un JSON válido.
+            orq.say("recuperado", 7777, None).await.unwrap();
+            orq.flush_persistence();
+            let loaded = load_conversations(&path);
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, PRINCIPAL);
+            assert_eq!(loaded[0].historial.len(), 2);
+        }
+
+        #[test]
+        fn persistence_enforces_20_conversations_and_500_messages_on_load() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(CONVERSATIONS_FILE);
+
+            let make_msgs = |n: usize| -> Vec<Message> {
+                (0..n)
+                    .map(|i| Message {
+                        rol: "usuario".to_string(),
+                        texto: format!("m-{i}"),
+                        ts: i as u64,
+                    })
+                    .collect()
+            };
+
+            // Escribimos directamente JSON con 25 conversaciones (principal la más vieja) y 600 msgs.
+            let mut entries = vec![json!({
+                "id": PRINCIPAL,
+                "titulo": "Principal",
+                "session_id": "s-principal",
+                "historial": make_msgs(600),
+                "creado": 1,
+                "actualizado": 1,
+            })];
+            for i in 1..=24u64 {
+                entries.push(json!({
+                    "id": format!("c{i}-00001"),
+                    "titulo": format!("Conv {i}"),
+                    "session_id": null,
+                    "historial": make_msgs(520),
+                    "creado": 10,
+                    "actualizado": 100 + i,
+                }));
+            }
+            let payload = json!({ "version": 1, "conversations": entries });
+            std::fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+            let orq = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+            let list = orq.list();
+            assert_eq!(list.len(), MAX_CONVERSATIONS);
+            assert!(
+                orq.get(PRINCIPAL).is_some(),
+                "la principal siempre debe existir"
+            );
+            // c1..=c5 son las 5 más antiguas fuera de principal y deben descartarse.
+            for old in 1..=5 {
+                assert!(
+                    orq.get(&format!("c{old}-00001")).is_none(),
+                    "c{old}-00001 debía descartarse"
+                );
+            }
+            for kept in 6..=24 {
+                let d = orq
+                    .get(&format!("c{kept}-00001"))
+                    .unwrap_or_else(|| panic!("c{kept}-00001 debía conservarse"));
+                assert_eq!(d.historial.len(), MAX_MESSAGES);
+                assert_eq!(d.historial.first().unwrap().texto, "m-20");
+                assert_eq!(d.historial.last().unwrap().texto, "m-519");
+            }
+            let p = orq.get(PRINCIPAL).unwrap();
+            assert_eq!(p.historial.len(), MAX_MESSAGES);
+            assert_eq!(p.historial.first().unwrap().texto, "m-100");
+            assert_eq!(p.historial.last().unwrap().texto, "m-599");
+        }
+
+        #[test]
+        fn persistence_excludes_in_flight_pending_and_auto_turns() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(CONVERSATIONS_FILE);
+
+            let orq1 = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+            // Poblamos estado transitorio en memoria: pending, auto_turns e in_flight.
+            assert!(orq1.begin_auto_turn(PRINCIPAL));
+            assert!(orq1.begin_auto_turn(PRINCIPAL));
+            orq1.defer_reaction(PRINCIPAL, &[("run-1".into(), "Tarea pendiente".into())]);
+            {
+                let mut g = lock(&orq1.inner);
+                let conv = g.map.get_mut(PRINCIPAL).unwrap();
+                conv.in_flight = Some(InFlight {
+                    seq: 99,
+                    cancel: Arc::new(Notify::new()),
+                    auto: false,
+                });
+            }
+            // Forzamos un guardado mientras in_flight/pending/auto_turns están activos.
+            orq1.rename(PRINCIPAL, "Principal activa");
+            orq1.flush_persistence();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("in_flight"));
+            assert!(!raw.contains("pending"));
+            assert!(!raw.contains("auto_turns"));
+
+            // Incluso si el JSON tuviera campos extra, al cargar quedan vacío/0/None.
+            let orq2 = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&path);
+            let g = lock(&orq2.inner);
+            let conv = g.map.get(PRINCIPAL).unwrap();
+            assert!(conv.in_flight.is_none());
+            assert!(conv.pending.is_empty());
+            assert_eq!(conv.auto_turns, 0);
+            assert_eq!(conv.title, "Principal activa");
+            drop(g);
+            // Puede volver a consumir los MAX_AUTO_TURNS completos tras reiniciar.
+            for _ in 0..MAX_AUTO_TURNS {
+                assert!(orq2.begin_auto_turn(PRINCIPAL));
+            }
+            assert!(!orq2.begin_auto_turn(PRINCIPAL));
+        }
+
+        #[tokio::test]
+        async fn persistence_write_failure_does_not_fail_user_turn() {
+            let dir = TempDir::new().unwrap();
+            let bad_path = dir.path().join(CONVERSATIONS_FILE);
+            std::fs::create_dir(&bad_path).unwrap();
+
+            let orq = Orchestrator::new(ClaudeSessionFake::new()).with_persistence(&bad_path);
+            let c = orq.create(Some("Sin error")).unwrap();
+            assert!(orq.rename(&c.id, "Renombrada"));
+            let reply = orq.say_in(&c.id, "hola", 7777, None).await.unwrap();
+            assert!(reply.contains("hola"));
+            orq.flush_persistence();
+            // Confirmamos que write_atomic directo también respeta límites al escribir.
+            let ok_path = dir.path().join("ok.json");
+            write_atomic(
+                &ok_path,
+                &[PersistedConversation {
+                    id: PRINCIPAL.to_string(),
+                    titulo: "Principal".to_string(),
+                    session_id: None,
+                    historial: Vec::new(),
+                    creado: 1,
+                    actualizado: 1,
+                    modelo: None,
+                    esfuerzo: None,
+                }],
+            )
+            .unwrap();
+            assert_eq!(load_conversations(&ok_path).len(), 1);
         }
     }
 }

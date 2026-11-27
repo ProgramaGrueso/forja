@@ -181,6 +181,11 @@ impl Scheduler {
         self.inner.config.worktrees_dir.clone()
     }
 
+    /// Carpeta del store donde viven `runs.jsonl` y los datos persistidos.
+    pub fn store_dir(&self) -> PathBuf {
+        self.inner.store.dir().to_path_buf()
+    }
+
     pub fn set_max_concurrency(&self, new_limit: usize) -> Result<()> {
         if new_limit == 0 {
             return Err(ForjaError::InvalidInput(
