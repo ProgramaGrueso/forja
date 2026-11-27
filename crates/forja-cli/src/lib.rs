@@ -281,15 +281,20 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             effort,
             prompt,
         } => {
-            let (agent_models, agent_effort) = load_agent_settings(&cli.store_dir);
+            let (agent_models, agent_effort, sensitive_agents) = load_run_settings(&cli.store_dir);
             let built = agent.build_agent(
                 model.as_deref(),
                 &agent_models,
                 effort.as_deref(),
                 &agent_effort,
             )?;
-            let scheduler =
-                build_scheduler(&cli.store_dir, &cli.worktrees_dir, cli.repo, base_branch)?;
+            let scheduler = build_scheduler(
+                &cli.store_dir,
+                &cli.worktrees_dir,
+                cli.repo,
+                base_branch,
+                sensitive_agents,
+            )?;
             let titulo = title.unwrap_or_else(|| derive_title(&prompt));
             let task = Task::new(titulo, prompt, privacy.into());
 
@@ -451,6 +456,10 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 .as_ref()
                 .map(|s| s.hidden_profiles.clone())
                 .unwrap_or_default();
+            let sensitive_agents = persisted
+                .as_ref()
+                .map(|s| s.sensitive_agents.clone())
+                .unwrap_or_else(forja_core::default_sensitive_agents);
 
             let store = JsonlStore::new(&cli.store_dir)?;
             let mut sched_cfg = SchedulerConfig::new(&cli.worktrees_dir);
@@ -458,6 +467,7 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             let sched_repo = cli.repo.clone();
             sched_cfg.repo_path = cli.repo;
             sched_cfg.base_branch = base_branch.clone();
+            sched_cfg.sensitive_agents = sensitive_agents.clone();
             let scheduler = Scheduler::new(store, sched_cfg)?;
 
             let settings = forja_server::settings::Settings {
@@ -471,6 +481,7 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
                 orchestrator_profile,
                 orchestrator_agent,
                 hidden_profiles,
+                sensitive_agents,
             };
 
             let mut state = AppState::new(scheduler)
@@ -498,15 +509,25 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
     }
 }
 
-/// Modelos y esfuerzos por agente de `settings.json` (vacíos si no existe o es inválido).
-fn load_agent_settings(
+/// Modelos, esfuerzos y política `sensitive` de `settings.json` (defaults estrictos si no existe o es inválido).
+fn load_run_settings(
     store_dir: &std::path::Path,
-) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+) -> (
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+    Vec<AgentKind>,
+) {
     forja_server::settings::load_settings(&store_dir.join("settings.json"))
         .ok()
         .flatten()
-        .map(|s| (s.agent_models, s.agent_effort))
-        .unwrap_or_default()
+        .map(|s| (s.agent_models, s.agent_effort, s.sensitive_agents))
+        .unwrap_or_else(|| {
+            (
+                BTreeMap::new(),
+                BTreeMap::new(),
+                forja_core::default_sensitive_agents(),
+            )
+        })
 }
 
 fn build_scheduler(
@@ -514,11 +535,13 @@ fn build_scheduler(
     worktrees_dir: &PathBuf,
     repo: Option<PathBuf>,
     base_branch: String,
+    sensitive_agents: Vec<AgentKind>,
 ) -> Result<Scheduler> {
     let store = JsonlStore::new(store_dir)?;
     let mut config = SchedulerConfig::new(worktrees_dir);
     config.repo_path = repo;
     config.base_branch = base_branch;
+    config.sensitive_agents = sensitive_agents;
     Scheduler::new(store, config)
 }
 
@@ -907,5 +930,93 @@ mod tests {
             ),
             "error inesperado: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_sensitive_applies_default_without_settings_and_respects_settings_file() {
+        let store_dir = TempDir::new().expect("crear store tempdir");
+        let wt_dir = TempDir::new().expect("crear worktrees tempdir");
+
+        // Sin settings.json, el default estricto (solo claude) rechaza mock con sensitive.
+        let cli_default = Cli::try_parse_from([
+            "forja",
+            "--store-dir",
+            store_dir.path().to_str().expect("store utf8"),
+            "--worktrees-dir",
+            wt_dir.path().to_str().expect("wt utf8"),
+            "run",
+            "--agent",
+            "mock",
+            "--privacy",
+            "sensitive",
+            "secreto",
+        ])
+        .expect("parsear run");
+        let mut buf = Vec::new();
+        let err = execute_with_writer(cli_default, &mut buf)
+            .await
+            .expect_err("sin settings.json, mock + sensitive debe rechazarse");
+        assert!(matches!(
+            err,
+            ForjaError::PolicyDenied {
+                privacy: Privacy::Sensitive,
+                agent: AgentKind::Mock
+            }
+        ));
+
+        // Con settings.json que permite ["mock"], mock pasa y agy sigue rechazado.
+        let mut settings = forja_server::settings::Settings::with_defaults(
+            store_dir.path().to_str().expect("store utf8"),
+        );
+        settings.sensitive_agents = vec![AgentKind::Mock];
+        forja_server::settings::save_settings(&store_dir.path().join("settings.json"), &settings)
+            .expect("guardar settings");
+
+        let cli_allowed = Cli::try_parse_from([
+            "forja",
+            "--store-dir",
+            store_dir.path().to_str().expect("store utf8"),
+            "--worktrees-dir",
+            wt_dir.path().to_str().expect("wt utf8"),
+            "run",
+            "--agent",
+            "mock",
+            "--privacy",
+            "sensitive",
+            "secreto permitido",
+        ])
+        .expect("parsear run");
+        let mut ok_buf = Vec::new();
+        execute_with_writer(cli_allowed, &mut ok_buf)
+            .await
+            .expect("mock + sensitive debe permitirse con settings.json");
+        let out = String::from_utf8(ok_buf).expect("utf8");
+        assert!(out.contains("estado: done"), "{out}");
+
+        let cli_denied = Cli::try_parse_from([
+            "forja",
+            "--store-dir",
+            store_dir.path().to_str().expect("store utf8"),
+            "--worktrees-dir",
+            wt_dir.path().to_str().expect("wt utf8"),
+            "run",
+            "--agent",
+            "agy",
+            "--privacy",
+            "sensitive",
+            "secreto denegado",
+        ])
+        .expect("parsear run");
+        let mut denied_buf = Vec::new();
+        let err = execute_with_writer(cli_denied, &mut denied_buf)
+            .await
+            .expect_err("agy + sensitive debe seguir denegado");
+        assert!(matches!(
+            err,
+            ForjaError::PolicyDenied {
+                privacy: Privacy::Sensitive,
+                agent: AgentKind::Agy
+            }
+        ));
     }
 }

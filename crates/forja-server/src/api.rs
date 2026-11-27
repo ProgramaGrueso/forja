@@ -4,7 +4,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use forja_core::{allowed_agents, AgentKind, Privacy, RunRecord, RunStatus};
+use forja_core::{allowed_agents_with, AgentKind, Privacy, RunRecord, RunStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -373,10 +373,16 @@ pub async fn stats(State(state): State<AppState>) -> Json<Stats> {
     Json(build_stats(&runs, now_ms()))
 }
 
-pub async fn policy() -> Json<serde_json::Value> {
+pub async fn policy(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let sensitive = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .sensitive_agents
+        .clone();
     Json(json!({
-        "open": allowed_agents(Privacy::Open),
-        "sensitive": allowed_agents(Privacy::Sensitive),
+        "open": allowed_agents_with(Privacy::Open, &sensitive),
+        "sensitive": allowed_agents_with(Privacy::Sensitive, &sensitive),
     }))
 }
 
@@ -1277,5 +1283,80 @@ mod tests {
             .expect("PUT inválido");
         let resp_bad = app.oneshot(req_bad).await.expect("ejecutar PUT inválido");
         assert_eq!(resp_bad.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_sensitive_agents_persists_updates_policy_and_scheduler_live() {
+        let (state, store_dir, _w) = state();
+        let path = store_dir.path().join("settings.json");
+        let app = build_router(state.with_settings_path(path.clone()));
+
+        // Default: solo claude en /api/policy y /api/settings.
+        let (status, policy) = get_json(app.clone(), "/api/policy").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(policy["sensitive"], json!(["claude"]));
+
+        let (_, current) = get_json(app.clone(), "/api/settings").await;
+        assert_eq!(current["sensitive_agents"], json!(["claude"]));
+
+        // Con default, mock + sensitive se rechaza con 403.
+        let (status, _) = post_task(
+            app.clone(),
+            json!({"titulo": "s1", "prompt": "p", "privacidad": "sensitive", "agent": "mock"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // PUT /api/settings con lista normalizada [" MOCK ", "Local"] persiste y aplica en caliente.
+        let mut next = current.clone();
+        next["sensitive_agents"] = json!([" MOCK ", "Local"]);
+        let (status, body) = put_settings_json(app.clone(), next.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["persisted"], true);
+        assert_eq!(body["restart_required"], json!([]));
+        assert_eq!(body["settings"]["sensitive_agents"], json!(["mock", "local"]));
+
+        // Persiste en settings.json.
+        let loaded = crate::settings::load_settings(&path)
+            .expect("leer settings")
+            .expect("existe");
+        assert_eq!(loaded.sensitive_agents, vec![AgentKind::Mock, AgentKind::Local]);
+
+        // GET /api/policy refleja la lista efectiva.
+        let (status, policy) = get_json(app.clone(), "/api/policy").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(policy["sensitive"], json!(["mock", "local"]));
+
+        // Scheduler aplica en caliente sin reiniciar: mock ahora se acepta y agy/claude se deniegan.
+        let (status, _) = post_task(
+            app.clone(),
+            json!({"titulo": "s2", "prompt": "p", "privacidad": "sensitive", "agent": "mock"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = post_task(
+            app.clone(),
+            json!({"titulo": "s3", "prompt": "p", "privacidad": "sensitive", "agent": "claude"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Inválidos (vacía, desconocido, duplicados) => 400 y no sobrescriben lo vigente.
+        for bad_list in [
+            json!([]),
+            json!(["desconocido"]),
+            json!(["mock", "MOCK"]),
+        ] {
+            let mut bad = current.clone();
+            bad["sensitive_agents"] = bad_list.clone();
+            let (status, _) = put_settings_json(app.clone(), bad).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "debía rechazar {bad_list}"
+            );
+        }
+        let (_, policy_after) = get_json(app, "/api/policy").await;
+        assert_eq!(policy_after["sensitive"], json!(["mock", "local"]));
     }
 }

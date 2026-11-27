@@ -4,7 +4,10 @@ pub mod redact;
 pub mod types;
 
 pub use error::{ForjaError, Result};
-pub use policy::{allowed_agents, check_policy, is_agent_allowed};
+pub use policy::{
+    allowed_agents, allowed_agents_with, check_policy, check_policy_with, default_sensitive_agents,
+    is_agent_allowed, is_agent_allowed_with,
+};
 pub use redact::redact_secrets;
 pub use types::{AgentKind, Privacy, RunRecord, RunStatus, Task};
 

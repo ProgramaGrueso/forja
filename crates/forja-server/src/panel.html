@@ -1463,6 +1463,18 @@
                 <div class="card-sub" style="margin-bottom:8px;">Vacío = modelo por defecto del agente (en hermes, el del perfil). El esfuerzo de razonamiento vacío = no se pasa ningún flag. Una tarea puede sobrescribir ambos en Nueva tarea; el chat del orquestador, por conversación.</div>
                 <div id="set-models-rows" style="display:grid;grid-template-columns:90px 1fr 170px auto;gap:6px 8px;align-items:center;"></div>
               </fieldset>
+              <fieldset id="set-sensitive-box" style="border:1px solid var(--border-dim);border-radius:6px;padding:10px 12px;margin-bottom:12px;">
+                <legend class="card-label" style="padding:0 6px;">Agentes permitidos con privacidad sensitive</legend>
+                <div class="card-sub" style="margin-bottom:8px;">Por defecto solo <span class="mono">claude</span>. Ampliar esta lista reduce la protección de las tareas marcadas como <span class="mono">sensitive</span>: los datos confidenciales podrán enviarse a los agentes seleccionados.</div>
+                <div id="set-sensitive-agents" style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:8px 12px;">
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="claude" checked><span class="mono">claude</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="agy"><span class="mono">agy</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="opencode"><span class="mono">opencode</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="hermes"><span class="mono">hermes</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="local"><span class="mono">local</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="mock"><span class="mono">mock</span></label>
+                </div>
+              </fieldset>
               <div class="form-field" style="flex-direction:row;align-items:center;gap:10px;margin-top:6px;">
                 <input id="set-hide-mascot" type="checkbox">
                 <label for="set-hide-mascot" style="margin:0;cursor:pointer;">Ocultar mascota de la barra lateral</label>
@@ -2545,9 +2557,20 @@
         $("set-quota-path").value = state.settings.quota_path;
         $("set-hide-mascot").checked = Boolean(state.settings.hide_mascot);
         $("set-hidden-profiles").value = (state.settings.hidden_profiles || []).join(", ");
+        const allowedSensitive = Array.isArray(state.settings.sensitive_agents) && state.settings.sensitive_agents.length > 0
+          ? state.settings.sensitive_agents
+          : ["claude"];
+        document.querySelectorAll('#set-sensitive-agents input[type="checkbox"]').forEach((cb) => {
+          cb.checked = allowedSensitive.includes(cb.value);
+        });
         renderModelRows();
         renderProfile();
         settingsFilledOnce = true;
+      }
+
+      function collectSensitiveAgents() {
+        return Array.from(document.querySelectorAll('#set-sensitive-agents input[type="checkbox"]:checked'))
+          .map((cb) => cb.value);
       }
 
       /* Modelo y esfuerzo por agente (Ajustes) */
@@ -2756,7 +2779,7 @@
         const banner = $("nt-policy-banner");
         banner.classList.toggle("sensitive", priv === "sensitive");
         const claudeMeta = (state.agents || []).find((a) => a.name === "claude");
-        const claudeNote = priv === "sensitive" && claudeMeta && !claudeMeta.available
+        const claudeNote = priv === "sensitive" && allowed.includes("claude") && claudeMeta && !claudeMeta.available
           ? ` <em>(Aviso: claude aún no está configurado en este servidor).</em>`
           : "";
         banner.innerHTML = priv === "sensitive"
@@ -3113,6 +3136,7 @@
           orchestrator_profile: $("set-orch-profile").value || null,
           orchestrator_agent: $("set-orch-agent").value || null,
           hidden_profiles: $("set-hidden-profiles").value.split(",").map((x) => x.trim()).filter(Boolean),
+          sensitive_agents: collectSensitiveAgents(),
         };
         const profileChanged = (state.settings && (state.settings.orchestrator_profile || "")) !== ($("set-orch-profile").value || "");
         const agentChanged = (state.settings && (state.settings.orchestrator_agent || "")) !== ($("set-orch-agent").value || "");

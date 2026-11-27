@@ -1,7 +1,28 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
-use serde::{Deserialize, Serialize};
+use forja_core::{default_sensitive_agents, AgentKind};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_sensitive_agents<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<AgentKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        let normalized = item.trim().to_ascii_lowercase();
+        let kind = normalized.parse::<AgentKind>().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "sensitive_agents: agente desconocido \"{item}\" (usa claude, agy, opencode, hermes, local o mock)"
+            ))
+        })?;
+        out.push(kind);
+    }
+    Ok(out)
+}
 
 /// Ajustes editables desde el panel. Los cambios de concurrencia, store y puerto
 /// se persisten y se aplican en el siguiente arranque de `forja serve`.
@@ -31,6 +52,12 @@ pub struct Settings {
     /// `FORJA_HIDDEN_PROFILES`). Vacío por defecto.
     #[serde(default)]
     pub hidden_profiles: Vec<String>,
+    /// Agentes permitidos para tareas con privacidad `sensitive`. Por defecto solo `claude`.
+    #[serde(
+        default = "default_sensitive_agents",
+        deserialize_with = "deserialize_sensitive_agents"
+    )]
+    pub sensitive_agents: Vec<AgentKind>,
 }
 
 pub const MAX_CONCURRENCY_LIMIT: usize = 16;
@@ -78,6 +105,7 @@ impl Settings {
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
+            sensitive_agents: default_sensitive_agents(),
         }
     }
 
@@ -132,6 +160,20 @@ impl Settings {
         for hidden in &self.hidden_profiles {
             forja_agent::hermes::validate_profile_format(hidden)
                 .map_err(|e| format!("hidden_profiles: {e}"))?;
+        }
+        if self.sensitive_agents.is_empty() {
+            return Err(
+                "sensitive_agents no puede estar vacío (elige al menos un agente)".to_string(),
+            );
+        }
+        let mut seen = Vec::with_capacity(self.sensitive_agents.len());
+        for &agent in &self.sensitive_agents {
+            if seen.contains(&agent) {
+                return Err(format!(
+                    "sensitive_agents contiene el agente duplicado \"{agent}\""
+                ));
+            }
+            seen.push(agent);
         }
         Ok(())
     }
@@ -358,6 +400,7 @@ mod tests {
             orchestrator_profile: None,
             orchestrator_agent: None,
             hidden_profiles: Vec::new(),
+            sensitive_agents: default_sensitive_agents(),
         }
     }
 
@@ -621,5 +664,43 @@ mod tests {
 
         std::fs::write(&path, "{roto").expect("escribir roto");
         assert!(load_settings(&path).is_err());
+    }
+
+    #[test]
+    fn sensitive_agents_defaults_normalizes_and_validates() {
+        // Default estricto: solo claude (también al cargar JSON viejo sin el campo).
+        let defaults = Settings::with_defaults("/tmp/store");
+        assert_eq!(defaults.sensitive_agents, vec![AgentKind::Claude]);
+        let old =
+            r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json"}"#;
+        let parsed: Settings = serde_json::from_str(old).expect("compat");
+        assert_eq!(parsed.sensitive_agents, vec![AgentKind::Claude]);
+        assert!(parsed.validate().is_ok());
+
+        // Normalización a minúsculas y recorte al deserializar.
+        let upper = r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json","sensitive_agents":[" LOCAL ","Claude"]}"#;
+        let parsed: Settings = serde_json::from_str(upper).expect("normalizar");
+        assert_eq!(
+            parsed.sensitive_agents,
+            vec![AgentKind::Local, AgentKind::Claude]
+        );
+        assert!(parsed.validate().is_ok());
+
+        // Lista vacía se rechaza.
+        let mut s = valid();
+        s.sensitive_agents = vec![];
+        assert!(s.validate().is_err());
+
+        // Duplicados se rechazan (tanto en struct como por mayúsculas en JSON).
+        let mut s = valid();
+        s.sensitive_agents = vec![AgentKind::Claude, AgentKind::Claude];
+        assert!(s.validate().is_err());
+        let dup_json = r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json","sensitive_agents":["claude","CLAUDE"]}"#;
+        let dup: Settings = serde_json::from_str(dup_json).expect("deserializa antes de validar");
+        assert!(dup.validate().is_err());
+
+        // Agente desconocido se rechaza al deserializar.
+        let unknown_json = r#"{"max_concurrency":2,"store_dir":"/tmp/s","port":7777,"quota_path":"/tmp/q.json","sensitive_agents":["gpt"]}"#;
+        assert!(serde_json::from_str::<Settings>(unknown_json).is_err());
     }
 }

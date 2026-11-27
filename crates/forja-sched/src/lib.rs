@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use forja_agent::Agent;
-use forja_core::{ForjaError, Result, RunRecord, RunStatus, Task};
+use forja_core::{AgentKind, ForjaError, Result, RunRecord, RunStatus, Task};
 use forja_store::JsonlStore;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -32,6 +32,7 @@ pub(crate) struct SchedulerInner {
     pub(crate) config: SchedulerConfig,
     pub(crate) store: JsonlStore,
     pub(crate) limiter: Arc<ConcurrencyLimiter>,
+    pub(crate) sensitive_agents: std::sync::RwLock<Vec<AgentKind>>,
     pub(crate) runs: RwLock<HashMap<String, RunRecord>>,
     pub(crate) handles: Mutex<HashMap<String, JoinHandle<()>>>,
     pub(crate) store_lock: Mutex<()>,
@@ -40,6 +41,24 @@ pub(crate) struct SchedulerInner {
     pub(crate) outputs: OutputBuffers,
     out_max_chunks: AtomicUsize,
     out_max_bytes: AtomicUsize,
+}
+
+fn validate_sensitive_agents(agents: &[AgentKind]) -> Result<()> {
+    if agents.is_empty() {
+        return Err(ForjaError::InvalidInput(
+            "sensitive_agents no puede estar vacío".to_string(),
+        ));
+    }
+    let mut seen = Vec::with_capacity(agents.len());
+    for &agent in agents {
+        if seen.contains(&agent) {
+            return Err(ForjaError::InvalidInput(format!(
+                "sensitive_agents contiene agente duplicado: {agent}"
+            )));
+        }
+        seen.push(agent);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -54,6 +73,7 @@ impl Scheduler {
                 "max_concurrency debe ser al menos 1".to_string(),
             ));
         }
+        validate_sensitive_agents(&config.sensitive_agents)?;
 
         let existing_runs = store.list_runs()?;
         let mut runs_map = HashMap::with_capacity(existing_runs.len());
@@ -62,6 +82,7 @@ impl Scheduler {
         }
 
         let limiter = ConcurrencyLimiter::new(config.max_concurrency);
+        let sensitive_agents = std::sync::RwLock::new(config.sensitive_agents.clone());
         let (events, _) = broadcast::channel(128);
 
         Ok(Self {
@@ -69,6 +90,7 @@ impl Scheduler {
                 config,
                 store,
                 limiter,
+                sensitive_agents,
                 runs: RwLock::new(runs_map),
                 handles: Mutex::new(HashMap::new()),
                 store_lock: Mutex::new(()),
@@ -112,6 +134,26 @@ impl Scheduler {
             ));
         }
         self.inner.limiter.set_limit(new_limit);
+        Ok(())
+    }
+
+    /// Lista efectiva de agentes permitidos para privacidad `Sensitive`.
+    pub fn sensitive_agents(&self) -> Vec<AgentKind> {
+        self.inner
+            .sensitive_agents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Actualiza en caliente los agentes permitidos para privacidad `Sensitive`.
+    pub fn set_sensitive_agents(&self, agents: Vec<AgentKind>) -> Result<()> {
+        validate_sensitive_agents(&agents)?;
+        *self
+            .inner
+            .sensitive_agents
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = agents;
         Ok(())
     }
 
@@ -171,7 +213,14 @@ impl Scheduler {
     }
 
     pub async fn submit(&self, task: Task, agent: Arc<dyn Agent>) -> Result<RunRecord> {
-        forja_core::check_policy(task.privacidad, agent.kind())?;
+        {
+            let allowed = self
+                .inner
+                .sensitive_agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            forja_core::check_policy_with(task.privacidad, agent.kind(), &allowed)?;
+        }
 
         let now = now_ms();
         let run_id = Uuid::new_v4().to_string();
