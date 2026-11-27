@@ -704,6 +704,7 @@
           const prev = input.value.trim();
           input.value = prev ? `${prev} ${snippet} ` : `${snippet} `;
           setView("orquestador");
+          input.dispatchEvent(new Event("input"));
           input.focus();
           input.setSelectionRange(input.value.length, input.value.length);
         }

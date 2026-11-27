@@ -364,14 +364,27 @@
             t.className = "muted";
             t.textContent = d;
             b.append(n, t);
-            b.addEventListener("click", () => { input.value = c; suggest.classList.remove("open"); input.focus(); });
+            b.addEventListener("click", () => { input.value = c; autosize(); suggest.classList.remove("open"); input.focus(); });
             suggest.appendChild(b);
           });
           suggest.classList.add("open");
         }
-        input.addEventListener("input", updateSuggest);
+        /* La caja crece con el texto hasta el max-height del CSS. */
+        function autosize() {
+          input.style.height = "";
+          if (!input.value) return;
+          const border = input.offsetHeight - input.clientHeight;
+          input.style.height = `${input.scrollHeight + border}px`;
+        }
+        input.addEventListener("input", () => { autosize(); updateSuggest(); });
         input.addEventListener("keydown", (e) => {
-          if (e.key === "Tab" && suggest.classList.contains("open")) {
+          if (e.key === "Enter" && !e.shiftKey) {
+            // Enter envía; Shift+Enter baja una línea. Mientras un método de entrada
+            // compone un carácter, Enter solo lo confirma.
+            if (e.isComposing || e.keyCode === 229) return;
+            e.preventDefault();
+            $("orq-form").requestSubmit();
+          } else if (e.key === "Tab" && !e.shiftKey && suggest.classList.contains("open")) {
             e.preventDefault();
             const first = suggest.querySelector("button");
             if (first) first.click();
@@ -437,6 +450,7 @@
           e.preventDefault();
           const t = input.value;
           input.value = "";
+          autosize();
           suggest.classList.remove("open");
           send(t);
         });

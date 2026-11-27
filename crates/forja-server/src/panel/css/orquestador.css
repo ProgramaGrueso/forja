@@ -6,7 +6,7 @@
     .orq-msg.bot { align-self: flex-start; background: var(--bg-elevated); border: 1px solid var(--border-mid); }
     .orq-msg.sys { align-self: center; color: var(--text-muted); font-size: 12px; }
     .orq-bar { display: flex; gap: 8px; align-items: center; }
-    .orq-bar input { flex: 1; background: var(--bg-elevated); border: 1px solid var(--border-mid); border-radius: 8px; color: var(--text-main); padding: 10px 12px; font: inherit; }
+    .orq-bar textarea { flex: 1; min-width: 0; resize: none; max-height: 160px; overflow-y: auto; background: var(--bg-elevated); border: 1px solid var(--border-mid); border-radius: 8px; color: var(--text-main); padding: 10px 12px; font: inherit; line-height: 1.4; }
     .orq-call.on { background: var(--emerald-dim); border-color: var(--emerald); color: var(--emerald); box-shadow: 0 0 14px var(--emerald-glow); }
     .orq-status { font-size: 12px; color: var(--text-muted); min-height: 16px; }
     .orq-wrap { height: calc(100vh - var(--topbar-h) - var(--provider-bar-h) - 140px); }
@@ -37,5 +37,7 @@
     .orq-mic svg { width: 18px; height: 18px; fill: currentColor; }
     @media (max-width: 820px) {
       .orq-layout { grid-template-columns: 1fr; }
+      .orq-bar { flex-wrap: wrap; }
+      .orq-bar textarea { flex-basis: 100%; }
       .orq-side { max-height: 150px; }
     }
