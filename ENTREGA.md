@@ -48,7 +48,7 @@
 | No duplica avisos ni pierde fines de tarea | Cumplido (consumo único + reconciliación) |
 | No compite con el usuario ni deja la conversación bloqueada | Cumplido (espera y prioridad del usuario) |
 | No puede encadenar turnos automáticos sin fin | Cumplido (`MAX_AUTO_TURNS`) |
-| Pruebas automatizadas del comportamiento | Cumplido (8 pruebas nuevas) |
+| Pruebas automatizadas del comportamiento | Cumplido (12 pruebas nuevas: 11 del flujo y 1 del reactor) |
 | `./scripts/check.sh` en verde | Cumplido |
 
 ## Verificación
@@ -57,12 +57,12 @@
 $ ./scripts/check.sh
 EXIT=0
 ...
-test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-En el árbol de trabajo había además cambios de otro punto (6), por eso allí el
-mismo comando sumaba 134 pruebas del servidor; el commit limpio del punto 7 se
-verificó por separado y pasa con 128.
+El commit limpio del punto 7 se verificó por separado (worktree desde ese
+commit) y pasa con 129 pruebas del servidor. Con el punto 6, ya integrado
+después, el árbol suma 139.
 
 También se verificó el commit aislado en un worktree limpio (sin los cambios de
 otros puntos que había en el árbol de trabajo) con el mismo `check.sh`.
@@ -77,3 +77,41 @@ otros puntos que había en el árbol de trabajo) con el mismo `check.sh`.
 - Las conversaciones siguen viviendo en memoria (pendiente independiente del
   roadmap): al reiniciar el servidor se pierden, y con ellas los avisos en
   curso.
+
+## Revisión independiente (segunda pasada)
+
+Auditoría del mecanismo ya implementado y dos correcciones:
+
+- `Orchestrator::defer_reaction` ahora retira del lote **solo** los `run_id`
+  diferidos. Antes los dejaba en `Reactions::finished` (si no se habían tomado
+  antes), de modo que el reactor veía el mismo resultado otra vez y se
+  reprogramaba en bucle; a la vez, los resultados que llegaban durante el
+  aplazamiento se conservan para la siguiente pasada.
+- `reactor::run_reaction` llama a `Orchestrator::abort_auto_turn` cuando el
+  turno automático no llega a ejecutarse (`Busy`, `Cancelled` o error). Así un
+  reintento por una carrera con el usuario no consume `MAX_AUTO_TURNS`.
+- El prompt de los orquestadores sin sesión ahora anuncia el aviso automático
+  en vez de prometer el resultado solo «en el siguiente mensaje».
+- Pruebas nuevas:
+  `deferring_without_taking_first_does_not_reschedule_forever` y una aserción
+  extra en `deferring_keeps_results_that_arrive_meanwhile`.
+
+Verificación real en el árbol de trabajo actual (HEAD `104ee5b`, con el punto 6
+ya integrado):
+
+```
+$ ./scripts/check.sh
+...
+test result: ok. 139 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+EXIT=0
+```
+
+Y las pruebas concretas:
+
+```
+$ cargo test -p forja-server deferring_
+test ...deferring_without_taking_first_does_not_reschedule_forever ... ok
+test ...deferring_keeps_results_that_arrive_meanwhile ... ok
+test result: ok. 2 passed; 0 failed
+```
+
