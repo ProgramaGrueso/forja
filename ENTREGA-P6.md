@@ -3,7 +3,8 @@
 ## Qué se hizo
 
 - **`forja-git`**: se añadieron las operaciones que faltaban para cerrar el ciclo.
-  - `diff_worktree`: diff del worktree contra la rama base, con `--stat` y parche.
+  - `diff_worktree`: diff del worktree desde su `merge-base` con la rama base
+    (así no incluye commits que otros worktrees fusionaron después), con `--stat` y parche.
     Incluye archivos sin seguimiento: se marcan temporalmente con `git add -N` y el
     índice se restaura al terminar, así que revisar no deja el worktree modificado.
     El parche se recorta a 512 KiB y el resumen a 64 KiB (cortes seguros en UTF-8).
@@ -17,8 +18,10 @@
 - **Servidor (`review`)**: tres rutas nuevas.
   - `GET /runs/{id}/diff`, `POST /runs/{id}/merge`, `POST /runs/{id}/discard`.
   - Validan: id de ejecución válido, ejecución terminada (no `pending`/`running`),
-    rama registrada exactamente `forja/<id>` y distinta de la base, worktree dentro
-    de la carpeta configurada (tras resolver enlaces, así que un symlink no escapa),
+    rama registrada exactamente `forja/<id>` y distinta de la base, worktree
+    exactamente en `<worktrees>/<id>` y dentro de la carpeta configurada (tras
+    resolver enlaces, así que un symlink no escapa ni puede apuntar al worktree de
+    otra ejecución),
     y servidor con `--repo`.
   - Fusionar exige `done`, commitea antes cualquier cambio pendiente del worktree
     (para que el diff y lo fusionado coincidan), retira el worktree y borra la rama
@@ -50,11 +53,16 @@ Ejecutado sobre el árbol de trabajo con los cambios del punto 6 y el resto de
 puntos ya integrados en `HEAD`:
 
 ```
-$ CARGO_TARGET_DIR=/tmp/forja-p6-target ./scripts/check.sh
+$ CARGO_TARGET_DIR=/tmp/forja-verify-target ./scripts/check.sh
 ...
-test result: ok. ...
+test result: ok. 139 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+...
 EXIT=0
 ```
+
+El árbol verificado fue exactamente el commit `104ee5b` (worktree temporal
+`/tmp/forja-verify`, sin cambios sin commitear). `node --check` sobre el
+JavaScript embebido del panel también pasa.
 
 También se verificó el commit aislado en un worktree temporal
 (`/tmp/forja-p6-verify`) con exactamente los archivos del punto 6: fmt, clippy y
@@ -65,7 +73,8 @@ revisión de worktrees»); esta nota es el único añadido posterior.
 Pruebas destacadas añadidas o actualizadas:
 
 - `forja-git`: diff con cambios commiteados, sin commitear y sin seguimiento sin
-  alterar el índice; fusión con y sin cambios, rama base incorrecta, árbol sucio
+  alterar el índice; el diff no incluye commits que avanzaron la base después de
+  crear el worktree (merge-base); fusión con y sin cambios, rama base incorrecta, árbol sucio
   y conflicto abortado; borrado de worktree/rama idempotente y con `--force`.
 - `forja-server` (HTTP): diff→merge cierra el ciclo; descartar borra worktree,
   rama y cambios; ejecución activa/sin repo/inexistente; árbol base sucio;
