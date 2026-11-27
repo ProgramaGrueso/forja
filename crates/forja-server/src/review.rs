@@ -130,6 +130,88 @@ fn worktree_inside(base: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(canonical_candidate))
 }
 
+/// La ejecución debe pertenecer al repositorio activo: tras cambiar de carpeta,
+/// fusionar o descartar una ejecución de otro repo no puede tocar este (ni
+/// responder que limpió algo que no limpió). Si la carpeta registrada ya no
+/// existe (repo movido o renombrado), vale que git reconozca aquí su worktree o,
+/// sin worktree, su rama.
+fn check_run_repo(
+    run: &RunRecord,
+    repo: &Path,
+    branch: &str,
+    worktree: Option<&Path>,
+) -> Result<()> {
+    let current = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    if let Some(recorded) = run.repo.as_deref() {
+        let recorded_path = PathBuf::from(recorded);
+        let same = recorded_path == current
+            || recorded_path
+                .canonicalize()
+                .is_ok_and(|canonical| canonical == current);
+        if same {
+            return Ok(());
+        }
+        let moved_here = !recorded_path.exists()
+            && match worktree {
+                // Además de figurar en este repo, el enlace del worktree debe
+                // funcionar (tras mover el repo hace falta `worktree repair`).
+                Some(worktree) => {
+                    forja_git::worktree_registered(repo, worktree)?
+                        && forja_git::head_branch(worktree).is_ok()
+                }
+                None => forja_git::branch_exists(repo, branch)?,
+            };
+        if moved_here {
+            return Ok(());
+        }
+        let hint = match worktree {
+            Some(worktree) if !recorded_path.exists() => format!(
+                "si moviste o renombraste ese repositorio, ejecuta \
+                 `git -C {} worktree repair {}` y repite",
+                current.display(),
+                worktree.display()
+            ),
+            _ => "vuelve a esa carpeta para fusionarla o descartarla".to_string(),
+        };
+        return Err(ForjaError::Conflict(format!(
+            "esta ejecución pertenece al repositorio '{recorded}' y la carpeta activa es '{}'; {hint}",
+            current.display()
+        )));
+    }
+    // Registros anteriores sin repo: el worktree, si existe, debe ser de este repo.
+    if let Some(worktree) = worktree {
+        if !forja_git::worktree_registered(repo, worktree)? {
+            return Err(ForjaError::Conflict(format!(
+                "el worktree de esta ejecución no pertenece al repositorio activo '{}'; \
+                 vuelve a la carpeta donde se lanzó para fusionarla o descartarla",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// El worktree debe seguir en la rama de la tarea. Si el agente dejó HEAD suelto
+/// o cambió de rama, sus commits no están en `forja/<id>`: fusionar diría
+/// "nada que fusionar" y borrar el worktree perdería el trabajo.
+fn check_worktree_on_branch(worktree: &Path, branch: &str) -> Result<()> {
+    let wt = worktree.display();
+    match forja_git::head_branch(worktree)? {
+        Some(head) if head == branch => Ok(()),
+        Some(other) => Err(ForjaError::Conflict(format!(
+            "el worktree está en la rama '{other}', no en '{branch}'; su trabajo no se fusionaría. \
+             No se borró nada. Para recuperarlo: `git -C {wt} checkout {branch}` y trae los \
+             commits con `git -C {wt} merge {other}`; luego vuelve a fusionar"
+        ))),
+        None => Err(ForjaError::Conflict(format!(
+            "el worktree tiene HEAD suelto (detached): sus commits no están en la rama '{branch}' \
+             y fusionar los perdería. No se borró nada. Revisa con \
+             `git -C {wt} log --oneline --graph --all` y, si HEAD tiene el trabajo bueno, \
+             `git -C {wt} checkout -B {branch}`; luego vuelve a fusionar"
+        ))),
+    }
+}
+
 async fn resolve(state: &AppState, id: &str) -> Result<ReviewTarget> {
     if !forja_sched::is_valid_run_id(id) {
         return Err(ForjaError::NotFound(id.to_string()));
@@ -157,6 +239,7 @@ async fn resolve(state: &AppState, id: &str) -> Result<ReviewTarget> {
     let worktrees_dir = state.scheduler.worktrees_dir();
     let raw_worktree = task_worktree(id, run.worktree.as_deref(), &worktrees_dir)?;
     let worktree = worktree_inside(&worktrees_dir, &raw_worktree)?;
+    check_run_repo(&run, &repo, &branch, worktree.as_deref())?;
 
     Ok(ReviewTarget {
         run,
@@ -218,6 +301,21 @@ pub(crate) async fn merge(
         worktree.to_path_buf(),
     );
 
+    // Antes de tocar nada: la base debe poder recibir la fusión y el worktree
+    // debe seguir en la rama de la tarea. Así un rechazo no deja commits nuevos.
+    let (repo_arg, base_arg, worktree_arg, branch_arg) =
+        (repo.clone(), base.clone(), worktree.clone(), branch.clone());
+    let scheduler = state.scheduler.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // Repos sin `.forja/` en su .gitignore: ocultar las carpetas internas
+        // (.git/info/exclude) para que no cuenten como cambios de la base.
+        let _ = scheduler.exclude_internal_dirs(&repo_arg);
+        forja_git::ensure_merge_base_ready(&repo_arg, &base_arg)?;
+        check_worktree_on_branch(&worktree_arg, &branch_arg)
+    })
+    .await
+    .map_err(|err| ForjaError::Git(format!("fallo al preparar la fusión: {err}")))??;
+
     // Si alguien tocó el worktree después de la tarea, sus cambios también
     // entran en el diff: se commitean en la rama antes de fusionarla.
     let (worktree_arg, commit_message) = (
@@ -244,6 +342,22 @@ pub(crate) async fn merge(
     })
     .await
     .map_err(|err| ForjaError::Git(format!("fallo al fusionar: {err}")))??;
+
+    // Solo se limpia si TODO lo del worktree quedó en la base.
+    let (repo_arg, worktree_arg, base_arg) = (repo.clone(), worktree.clone(), base.clone());
+    let integrated = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let head = forja_git::rev_parse(&worktree_arg, "HEAD")?;
+        forja_git::is_ancestor(&repo_arg, &head, &base_arg)
+    })
+    .await
+    .map_err(|err| ForjaError::Git(format!("fallo al verificar la fusión: {err}")))??;
+    if !integrated {
+        return Err(ApiError(ForjaError::Conflict(format!(
+            "la fusión no incluyó el último commit del worktree en '{base}'; no se borró nada. \
+             Revisa `git -C {} log --oneline -5`",
+            worktree.display()
+        ))));
+    }
 
     // La fusión ya ocurrió: un fallo de limpieza se informa, no se deshace.
     let (repo_arg, worktree_arg) = (repo.clone(), worktree.clone());
@@ -393,6 +507,60 @@ mod tests {
         let err = validate_branch("main", Some("forja/main"), "forja/main")
             .expect_err("la rama base nunca se revisa");
         assert!(matches!(err, ForjaError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn legacy_run_without_repo_is_checked_by_its_worktree() {
+        let repo = TempDir::new().expect("repo");
+        let other = TempDir::new().expect("otro repo");
+        for dir in [repo.path(), other.path()] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .expect("git init")
+                .success();
+            assert!(ok);
+        }
+        let wt = TempDir::new().expect("worktree suelto");
+        let run = RunRecord {
+            id: "r".to_string(),
+            task: forja_core::Task::new("t", "p", forja_core::Privacy::Open),
+            agent: forja_core::AgentKind::Mock,
+            status: RunStatus::Done,
+            branch: None,
+            worktree: None,
+            attempts: 1,
+            model: None,
+            effort: None,
+            output: None,
+            error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            repo: None,
+            owner: None,
+            prompt_redacted: false,
+        };
+        let err = check_run_repo(&run, other.path(), "forja/r", Some(wt.path()))
+            .expect_err("worktree no registrado en el repo activo");
+        assert!(matches!(err, ForjaError::Conflict(_)), "{err:?}");
+        assert!(check_run_repo(&run, other.path(), "forja/r", None).is_ok());
+
+        let mut with_repo = run.clone();
+        with_repo.repo = Some(repo.path().to_string_lossy().into_owned());
+        assert!(check_run_repo(&with_repo, repo.path(), "forja/r", None).is_ok());
+        assert!(matches!(
+            check_run_repo(&with_repo, other.path(), "forja/r", None),
+            Err(ForjaError::Conflict(_))
+        ));
+
+        // La carpeta registrada ya no existe y aquí no está la rama: sigue siendo ajena.
+        with_repo.repo = Some(wt.path().join("no-existe").to_string_lossy().into_owned());
+        assert!(matches!(
+            check_run_repo(&with_repo, other.path(), "forja/r", None),
+            Err(ForjaError::Conflict(_))
+        ));
     }
 
     #[test]

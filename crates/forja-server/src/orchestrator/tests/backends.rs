@@ -255,3 +255,26 @@ fn argv_has_resume_only_when_given() {
     let b = build_argv("claudia", f, Some("s9"));
     assert_eq!(b[b.len() - 2..], ["--resume", "s9"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn orchestrator_temp_dir_must_be_private_and_ours() {
+    // B5: la carpeta temporal no puede ser un enlace ni tener permisos para otros.
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::TempDir::new().expect("tempdir");
+
+    let fresh = base.path().join("nueva");
+    crate::orchestrator::backends::ensure_private_dir(&fresh).expect("se crea privada");
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    crate::orchestrator::backends::ensure_private_dir(&fresh).expect("reutilizable");
+
+    let open = base.path().join("abierta");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(crate::orchestrator::backends::ensure_private_dir(&open).is_err());
+
+    let link = base.path().join("enlace");
+    std::os::unix::fs::symlink(&fresh, &link).unwrap();
+    assert!(crate::orchestrator::backends::ensure_private_dir(&link).is_err());
+}

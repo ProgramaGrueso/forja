@@ -17,6 +17,7 @@
         initializedRuns: false,
         defaultModels: {},
         review: { runId: null, status: "idle", data: null, error: null, actionError: null, pending: null },
+        retry: { pending: new Set(), errors: new Map() },
       };
       const MODEL_AGENTS = ["claude", "agy", "opencode", "hermes", "local"];
       /* Esfuerzo de razonamiento por familia (el servidor manda los suyos en /api/agents). */

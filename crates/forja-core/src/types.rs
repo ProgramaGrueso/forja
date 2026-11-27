@@ -141,6 +141,18 @@ pub struct RunRecord {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Repositorio git donde se creó el worktree (None sin repo o en registros
+    /// anteriores a este campo). Permite rechazar fusiones tras cambiar de carpeta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Proceso de Forja dueño de la ejecución (`pid:arranque`). Al arrancar, las
+    /// ejecuciones activas cuyo dueño ya no vive se marcan como interrumpidas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// `true` si el título o el prompt se guardaron con secretos redactados: el
+    /// texto guardado no es el original y no se puede relanzar tal cual.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_redacted: bool,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }

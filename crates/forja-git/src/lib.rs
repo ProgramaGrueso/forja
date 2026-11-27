@@ -232,17 +232,7 @@ pub fn merge_branch(
             "la rama a fusionar no puede ser la rama base ni estar vacía".to_string(),
         ));
     }
-    let current = current_branch(repo)?;
-    if current != base_branch {
-        return Err(ForjaError::InvalidInput(format!(
-            "el repositorio está en la rama '{current}', no en '{base_branch}'; cámbiala antes de fusionar"
-        )));
-    }
-    if !status_clean(repo)? {
-        return Err(ForjaError::InvalidInput(format!(
-            "el repositorio en '{base_branch}' tiene cambios sin commitear; commitéalos o descártalos antes de fusionar"
-        )));
-    }
+    ensure_merge_base_ready(repo, base_branch)?;
 
     let output = Command::new("git")
         .arg("-C")
@@ -276,6 +266,23 @@ pub fn merge_branch(
         commit: commit.trim().to_string(),
         already_up_to_date,
     })
+}
+
+/// Comprueba que `repo` está en `base_branch` y sin cambios pendientes, es decir,
+/// listo para recibir una fusión. No modifica nada.
+pub fn ensure_merge_base_ready(repo: &Path, base_branch: &str) -> Result<()> {
+    let current = current_branch(repo)?;
+    if current != base_branch {
+        return Err(ForjaError::InvalidInput(format!(
+            "el repositorio está en la rama '{current}', no en '{base_branch}'; cámbiala antes de fusionar"
+        )));
+    }
+    if !status_clean(repo)? {
+        return Err(ForjaError::InvalidInput(format!(
+            "el repositorio en '{base_branch}' tiene cambios sin commitear; commitéalos o descártalos antes de fusionar"
+        )));
+    }
+    Ok(())
 }
 
 /// `true` si `worktree` figura registrado en `git worktree list` de `repo`.
@@ -354,6 +361,114 @@ pub fn commit_all(repo: &Path, msg: &str) -> Result<String> {
         "git rev-parse --short HEAD",
     )?;
     Ok(hash.trim().to_string())
+}
+
+/// Rama a la que apunta `HEAD` en `worktree` (`refs/heads/...` sin el prefijo).
+/// `None` si `HEAD` está suelto (detached).
+pub fn head_branch(worktree: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
+    match output.status.code() {
+        Some(0) => {
+            let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(Some(
+                full.strip_prefix("refs/heads/")
+                    .unwrap_or(full.as_str())
+                    .to_string(),
+            ))
+        }
+        // Código 1 con -q: HEAD no es una referencia simbólica (suelto).
+        Some(1) => Ok(None),
+        _ => Err(ForjaError::Git(format!(
+            "git symbolic-ref HEAD falló: {}",
+            failure_detail(&output)
+        ))),
+    }
+}
+
+/// Hash completo de `rev` en `repo`.
+pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
+    let out = run_git_cmd(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+        "git rev-parse",
+    )?;
+    Ok(out.trim().to_string())
+}
+
+/// `true` si `ancestor` ya está contenido en `descendant`.
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(|err| ForjaError::Git(format!("no se pudo ejecutar git: {err}")))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ForjaError::Git(format!(
+            "git merge-base --is-ancestor falló: {}",
+            failure_detail(&output)
+        ))),
+    }
+}
+
+/// Añade `pattern` a `.git/info/exclude` de `repo` si no está ya.
+///
+/// Sirve para que las carpetas de datos de Forja dentro del repo (`.forja/`) no
+/// aparezcan como cambios sin seguimiento sin tocar archivos versionados como
+/// `.gitignore`. Funciona también desde un worktree enlazado (usa el
+/// `info/exclude` común). Devuelve `true` si escribió algo.
+pub fn ensure_excluded(repo: &Path, pattern: &str) -> Result<bool> {
+    use std::io::Write as _;
+
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.contains('\n') {
+        return Err(ForjaError::InvalidInput(
+            "patrón de exclusión inválido".to_string(),
+        ));
+    }
+    let common = run_git_cmd(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "git rev-parse --git-common-dir",
+    )?;
+    let info = PathBuf::from(common.trim()).join("info");
+    let exclude = info.join("exclude");
+    let current = match std::fs::read_to_string(&exclude) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+    if current.lines().any(|line| line.trim() == pattern) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&info)?;
+    let separator = if current.is_empty() || current.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    // Solo se añade al final (nunca se reescribe): así no se pierde lo que otro
+    // proceso escriba a la vez ni se trunca el archivo si algo falla a medias.
+    let block =
+        format!("{separator}# Datos locales de Forja (añadido automáticamente)\n{pattern}\n");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?
+        .write_all(block.as_bytes())?;
+    Ok(true)
 }
 
 /// Devuelve el nombre de la rama actual en `repo`.
@@ -765,5 +880,60 @@ mod tests {
             .expect("create_worktree debe tener éxito");
         let wt_branch = current_branch(&wt_path).expect("current_branch en worktree");
         assert_eq!(wt_branch, "forja/nueva-rama");
+    }
+
+    #[test]
+    fn head_branch_detects_detached_and_other_branches() {
+        let repo_dir = init_temp_repo();
+        let repo = repo_dir.path();
+        assert_eq!(head_branch(repo).unwrap().as_deref(), Some("main"));
+        run_git(repo, &["checkout", "-q", "-b", "otra"]);
+        assert_eq!(head_branch(repo).unwrap().as_deref(), Some("otra"));
+        run_git(repo, &["checkout", "-q", "--detach"]);
+        assert_eq!(head_branch(repo).unwrap(), None);
+        let head = rev_parse(repo, "HEAD").unwrap();
+        assert!(is_ancestor(repo, &head, "main").unwrap());
+        fs::write(repo.join("x.txt"), "x").unwrap();
+        run_git(repo, &["add", "x.txt"]);
+        run_git(repo, &["commit", "-qm", "suelto"]);
+        assert!(!is_ancestor(repo, "HEAD", "main").unwrap());
+    }
+
+    #[test]
+    fn ensure_excluded_hides_forja_dir_without_touching_gitignore() {
+        let repo_dir = init_temp_repo();
+        let repo = repo_dir.path();
+        fs::create_dir_all(repo.join(".forja/store")).unwrap();
+        fs::write(repo.join(".forja/store/runs.jsonl"), "{}\n").unwrap();
+        assert!(!status_clean(repo).unwrap());
+        assert!(ensure_excluded(repo, "/.forja/").unwrap());
+        assert!(!ensure_excluded(repo, "/.forja/").unwrap(), "idempotente");
+        assert!(status_clean(repo).unwrap());
+        assert!(!repo.join(".gitignore").exists());
+        // Desde un worktree enlazado escribe en el exclude común.
+        let wt_parent = TempDir::new().unwrap();
+        let wt = wt_parent.path().join("wt");
+        create_worktree(repo, "main", "forja/x", &wt).unwrap();
+        assert!(!ensure_excluded(&wt, "/.forja/").unwrap());
+    }
+
+    #[test]
+    fn ensure_excluded_keeps_every_pattern_under_concurrency() {
+        let repo_dir = init_temp_repo();
+        let repo = repo_dir.path();
+        let exclude = repo.join(".git/info/exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, "propio-del-usuario").unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..12 {
+                scope.spawn(move || ensure_excluded(repo, &format!("/dir-{i}/")).unwrap());
+            }
+        });
+        let text = fs::read_to_string(&exclude).unwrap();
+        let has = |line: &str| text.lines().any(|l| l == line);
+        assert!(has("propio-del-usuario"), "{text}");
+        for i in 0..12 {
+            assert!(has(&format!("/dir-{i}/")), "falta /dir-{i}/:\n{text}");
+        }
     }
 }

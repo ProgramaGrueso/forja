@@ -140,7 +140,12 @@ impl AppState {
             // El aviso ya trae el resultado; evita repetirlo en «Tareas delegadas».
             self.orchestrator.forget_pending_tasks(&conversation, &ids);
             let runs = self.runs_for(&ids).await;
-            let notice = delegation::completion_notice(&runs);
+            // Datos sensibles solo para orquestadores en sensitive_agents (A5).
+            let reveal = delegation::orchestrator_sees_sensitive(
+                &self.orchestrator.agent(),
+                &self.scheduler.sensitive_agents(),
+            );
+            let notice = delegation::completion_notice(&runs, reveal);
             let port = self.settings.read().unwrap_or_else(|e| e.into_inner()).port;
             let result = self
                 .orchestrator

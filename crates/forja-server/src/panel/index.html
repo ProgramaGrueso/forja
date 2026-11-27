@@ -396,6 +396,7 @@
         <section id="view-ajustes" class="view-pane" aria-label="Vista Ajustes">
           <div class="card card-gothic" style="max-width:640px;">
             <div class="card-label" style="margin-bottom:12px;">Configuración de Forja</div>
+            <div id="settings-warning" class="toast-banner err" role="alert" style="margin:0 0 12px;"></div>
             <form id="settings-form">
               <div class="form-field">
                 <label for="set-concurrency">Concurrencia máxima (1 – 16)</label>
@@ -512,11 +513,16 @@
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
           <button id="drawer-term-btn" class="btn" type="button">Ver en terminal</button>
+          <button id="drawer-retry-btn" class="btn" type="button" style="display:none;">Reintentar</button>
           <button id="drawer-cancel-btn" class="btn btn-danger">Cancelar</button>
           <button id="drawer-close-btn" class="icon-btn" aria-label="Cerrar panel">✕</button>
         </div>
       </div>
       <div class="drawer-body">
+        <div id="drawer-retry-box" style="display:none;">
+          <div id="drawer-retry-error" class="card-sub" style="color:#fca5a5;margin-bottom:8px;" role="alert"></div>
+          <button id="drawer-retry-recreate" class="btn" type="button" style="display:none;">Crear tarea de nuevo</button>
+        </div>
         <div id="drawer-meta" class="kv-grid"></div>
         <div>
           <div class="card-label">Prompt</div>

@@ -98,12 +98,19 @@ async fn files_tree_read_write_and_search() {
     assert_eq!(file.language, "rust");
     assert!(!file.read_only);
 
+    let workspace = file.workspace.clone();
+    assert_eq!(workspace, tree.root);
+
     // 3. Write archivo existente y nuevo (también > 256 KiB para verificar body limit de 1 MiB)
     let large_content = "a".repeat(300 * 1024);
     let res = put_json(
         &app,
         "/api/files/write",
-        serde_json::json!({ "path": "src/big.txt", "content": large_content }),
+        serde_json::json!({
+            "path": "src/big.txt",
+            "content": large_content,
+            "workspace": workspace,
+        }),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -157,12 +164,18 @@ async fn files_security_rejects_traversal_symlinks_git_and_binary() {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
     }
 
-    // Path traversal y .git en write
+    // Path traversal y .git en write (con workspace válido: se rechaza por la ruta)
+    let workspace = repo
+        .path()
+        .canonicalize()
+        .expect("canon repo")
+        .to_string_lossy()
+        .into_owned();
     for bad_path in ["../fuera.txt", "/tmp/fuera.txt", ".git/config"] {
         let res = put_json(
             &app,
             "/api/files/write",
-            serde_json::json!({ "path": bad_path, "content": "x" }),
+            serde_json::json!({ "path": bad_path, "content": "x", "workspace": workspace }),
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST, "path: {bad_path}");
@@ -180,7 +193,11 @@ async fn files_security_rejects_traversal_symlinks_git_and_binary() {
         let res = put_json(
             &app,
             "/api/files/write",
-            serde_json::json!({ "path": "escape_link.txt", "content": "hack" }),
+            serde_json::json!({
+                "path": "escape_link.txt",
+                "content": "hack",
+                "workspace": workspace,
+            }),
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);

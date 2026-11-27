@@ -42,6 +42,7 @@
         let treeCache = new Map();
         let expandedDirs = new Set();
         let searchResults = null;
+        let searchTruncated = false;
         let searchTimer = null;
 
         let tabs = [];
@@ -77,6 +78,10 @@
             paths: baseTabs,
             active: (activeTab() && !activeTab().runId) ? activeTab().path : (baseTabs[0] || null),
           }));
+        }
+
+        function isDirty(tab) {
+          return tab.content !== tab.savedContent;
         }
 
         function activeTab() {
@@ -242,6 +247,13 @@
             return;
           }
           showWsError("");
+          const lost = tabs.filter((t) => isDirty(t) && t.workspace !== target);
+          if (lost.length) {
+            const names = lost.map((t) => `«${baseName(t.path)}»`).join(", ");
+            if (!window.confirm(`Hay cambios sin guardar en ${names}. Si cambias de carpeta se perderán. ¿Cambiar de todos modos?`)) {
+              return;
+            }
+          }
           try {
             const r = await apiFetch("/api/workspaces/select", {
               method: "POST",
@@ -269,8 +281,10 @@
             searchResults = null;
             treeCache.clear();
             expandedDirs.clear();
-            tabs = [];
-            activeTabKey = null;
+            // Sobreviven los cambios pendientes de la propia carpeta a la que se vuelve.
+            const openedPath = activeWorkspace && activeWorkspace.path;
+            tabs = tabs.filter((t) => isDirty(t) && t.workspace === openedPath);
+            activeTabKey = tabs.length ? tabs[0].key : null;
             setSaveStatus("", "");
             renderTabs();
             renderEditor();
@@ -309,7 +323,8 @@
             const r = await apiFetch(`/api/files/tree${qs}`);
             if (!r.ok) {
               if (!dirPath) {
-                treeEl.innerHTML = `<div class="ide-tree-empty">No se pudo cargar el árbol (HTTP ${r.status}).</div>`;
+                const d = await r.json().catch(() => ({}));
+                treeEl.innerHTML = `<div class="ide-tree-empty">${esc(d.error || `No se pudo cargar el árbol (HTTP ${r.status}).`)}</div>`;
               }
               return;
             }
@@ -339,6 +354,7 @@
             const data = await r.json();
             if (searchInput.value.trim() !== q) return;
             searchResults = Array.isArray(data.matches) ? data.matches : [];
+            searchTruncated = Boolean(data.truncated);
             renderTree();
           } catch (_) {}
         }
@@ -399,7 +415,9 @@
             if (!searchResults.length) {
               const d = document.createElement("div");
               d.className = "ide-tree-empty";
-              d.textContent = "Sin coincidencias.";
+              d.textContent = searchTruncated
+                ? "Sin coincidencias en lo recorrido: la búsqueda llegó a su límite y está incompleta."
+                : "Sin coincidencias.";
               treeEl.appendChild(d);
               return;
             }
@@ -427,6 +445,12 @@
               });
               frag.appendChild(btn);
             });
+            if (searchTruncated) {
+              const note = document.createElement("div");
+              note.className = "ide-tree-empty";
+              note.textContent = "Resultados truncados: puede haber más coincidencias. Afina el filtro.";
+              frag.appendChild(note);
+            }
             treeEl.appendChild(frag);
             return;
           }
@@ -498,6 +522,7 @@
               savedContent: content,
               language: data.language || "",
               readOnly: Boolean(data.read_only || runId),
+              workspace: data.workspace || "",
             };
             tabs.push(tab);
             activeTabKey = key;
@@ -634,20 +659,21 @@
             return;
           }
           saving = true;
+          const sent = tab.content;
           updateToolbarState(tab);
           setSaveStatus("Guardando…", "");
           try {
             const r = await apiFetch("/api/files/write", {
               method: "PUT",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ path: tab.path, content: tab.content }),
+              body: JSON.stringify({ path: tab.path, content: sent, workspace: tab.workspace }),
             });
             if (!r.ok) {
               const d = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
               setSaveStatus(d.error || `Error al guardar (HTTP ${r.status})`, "err");
               return;
             }
-            tab.savedContent = tab.content;
+            tab.savedContent = sent;
             setSaveStatus("Guardado", "ok");
             renderTabs();
           } catch (_) {
@@ -791,6 +817,12 @@
             updateToolbarState(tab);
             renderTabs();
           }
+        });
+
+        window.addEventListener("beforeunload", (e) => {
+          if (!tabs.some(isDirty)) return;
+          e.preventDefault();
+          e.returnValue = "";
         });
 
         document.addEventListener("keydown", (e) => {

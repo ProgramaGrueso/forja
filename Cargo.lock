@@ -201,6 +201,7 @@ name = "forja-agent"
 version = "0.1.0"
 dependencies = [
  "forja-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

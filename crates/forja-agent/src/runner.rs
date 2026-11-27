@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::env_guard::scrub_env;
 use forja_core::{ForjaError, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -72,6 +73,24 @@ async fn pump<R: AsyncRead + Unpin>(
     Ok(String::from_utf8_lossy(&all).into_owned())
 }
 
+/// Mata el grupo de procesos del agente al soltarse: cubre cancelación (el
+/// futuro se suelta), tiempo agotado y fin normal (nietos que siguieran vivos).
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn kill(&self) {
+        if let Some(pgid) = self.0 {
+            crate::process::kill_process_group(pgid);
+        }
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 pub struct Runner;
 
 impl Runner {
@@ -116,12 +135,18 @@ impl Runner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Grupo de procesos propio (pgid = pid del hijo): permite matar a los
+        // nietos y no recibe el Ctrl+C de la terminal (lo gestiona Forja).
+        #[cfg(unix)]
+        cmd.process_group(0);
+        scrub_env(cmd.as_std_mut());
 
         for (key, value) in env {
             cmd.env(key, value);
         }
 
         let mut child = cmd.spawn()?;
+        let group = ProcessGroup(child.id());
         let stdout_pipe = child
             .stdout
             .take()
@@ -135,7 +160,13 @@ impl Runner {
             let (out, err, status) = tokio::join!(
                 pump(stdout_pipe, OutputStream::Stdout, sink.clone()),
                 pump(stderr_pipe, OutputStream::Stderr, sink.clone()),
-                child.wait()
+                async {
+                    let status = child.wait().await;
+                    // El agente terminó: nada de su grupo debe seguir escribiendo
+                    // (ni mantener abiertas las tuberías de salida).
+                    group.kill();
+                    status
+                }
             );
             Ok::<_, std::io::Error>((out?, err?, status?))
         };
@@ -243,6 +274,61 @@ mod tests {
             .expect_err("fake_agy con sleep 3s y timeout 1s debe expirar");
 
         assert!(matches!(err, ForjaError::Timeout { seconds: 1 }));
+    }
+
+    fn grandchild_script(dir: &Path, marker: &Path, pidfile: &Path, sleep_main: u32) -> String {
+        let script = dir.join("padre.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(sleep 1; echo tarde > '{}') </dev/null >/dev/null 2>&1 &\necho $! > '{}'\nsleep {sleep_main}\necho fin\n",
+                marker.display(),
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    fn alive(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+            .map(|s| s.rsplit(')').next().unwrap_or("").split_whitespace().next() != Some("Z"))
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runner_kills_grandchildren_on_cancel_timeout_and_exit() {
+        let dir = tempdir().expect("tempdir");
+        for case in ["cancel", "timeout", "exit"] {
+            let marker = dir.path().join(format!("{case}.tarde"));
+            let pidfile = dir.path().join(format!("{case}.pid"));
+            let sleep_main = if case == "exit" { 0 } else { 30 };
+            // Vía `sh`: ejecutar un archivo recién escrito puede dar "Text file busy"
+            // si otro test hace fork mientras sigue abierto para escritura.
+            let script = grandchild_script(dir.path(), &marker, &pidfile, sleep_main);
+            let argv = vec!["/bin/sh".to_string(), script];
+            match case {
+                "cancel" => {
+                    let fut = Runner::run_argv(&argv, dir.path(), 60);
+                    let res = tokio::time::timeout(Duration::from_millis(800), fut).await;
+                    assert!(res.is_err(), "debía seguir en marcha: {res:?}");
+                }
+                "timeout" => {
+                    let err = Runner::run_argv(&argv, dir.path(), 1).await.unwrap_err();
+                    assert!(matches!(err, ForjaError::Timeout { .. }), "{err:?}");
+                }
+                _ => {
+                    let res = Runner::run_argv(&argv, dir.path(), 10).await.unwrap();
+                    assert_eq!(res.stdout, "fin\n");
+                }
+            }
+            let pid = std::fs::read_to_string(&pidfile).expect("pid del nieto");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!alive(&pid), "{case}: el nieto {pid} sigue vivo");
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(!marker.exists(), "{case}: el nieto escribió tras terminar");
+        }
     }
 
     #[tokio::test]

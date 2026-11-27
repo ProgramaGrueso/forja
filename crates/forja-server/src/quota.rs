@@ -62,7 +62,9 @@ pub struct HermesCli;
 
 impl UsageCommand for HermesCli {
     fn usage_json(&self, provider: &str) -> Result<String, String> {
-        let mut child = Command::new("hermes")
+        let mut command = Command::new("hermes");
+        forja_agent::env_guard::scrub_env(&mut command);
+        let mut child = command
             .args(["usage", "--provider", provider, "--json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -177,7 +179,76 @@ pub fn load_manual(path: &Path) -> Result<ManualQuotaFile, String> {
         .map_err(|err| format!("JSON inválido en {}: {err}", path.display()))
 }
 
+/// Tope razonable de un documento de cuota existente.
+const MAX_QUOTA_FILE_BYTES: u64 = 1024 * 1024;
+
+/// `Ok` solo si escribir en `path` no destruye nada: no existe, está vacío o ya
+/// es un documento de cuota válido (sin claves ajenas).
+fn check_overwritable(path: &Path) -> Result<(), String> {
+    let refuse = |reason: String| {
+        Err(format!(
+            "no se sobrescribe {}: {reason}. Corrige quota_path en Ajustes",
+            path.display()
+        ))
+    };
+    if crate::guard::inside_git_dir(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf())) {
+        return refuse("está dentro de un directorio git".to_string());
+    }
+    // `metadata` sigue symlinks: se juzga el archivo que se va a escribir.
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return refuse(format!("no se puede inspeccionar ({err})")),
+    };
+    if !meta.is_file() {
+        return refuse("no es un archivo regular".to_string());
+    }
+    if meta.len() > MAX_QUOTA_FILE_BYTES {
+        return refuse("es demasiado grande para ser un documento de cuota".to_string());
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => return refuse(format!("no se puede leer como texto ({err})")),
+    };
+    if content.trim().is_empty() || is_quota_document(&content) {
+        return Ok(());
+    }
+    refuse("ya existe y no es un documento de cuota válido".to_string())
+}
+
+fn is_quota_document(content: &str) -> bool {
+    const ENTRY_KEYS: [&str; 5] = [
+        "percent_remaining",
+        "balance",
+        "currency",
+        "resets_at",
+        "updated_at",
+    ];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    if root.keys().any(|k| k != "providers") {
+        return false;
+    }
+    let known_entries = root.get("providers").is_none_or(|providers| {
+        providers.as_object().is_some_and(|map| {
+            map.values().all(|entry| {
+                entry
+                    .as_object()
+                    .is_some_and(|e| e.keys().all(|k| ENTRY_KEYS.contains(&k.as_str())))
+            })
+        })
+    });
+    known_entries
+        && serde_json::from_str::<ManualQuotaFile>(content)
+            .is_ok_and(|file| validate_manual(&file).is_ok())
+}
+
 pub fn save_manual(path: &Path, file: &ManualQuotaFile) -> Result<(), String> {
+    check_overwritable(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)

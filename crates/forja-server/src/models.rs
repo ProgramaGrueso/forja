@@ -49,7 +49,9 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<String, String> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        forja_agent::env_guard::scrub_env(&mut command);
+        let mut child = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

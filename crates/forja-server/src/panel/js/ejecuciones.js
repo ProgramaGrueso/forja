@@ -56,6 +56,7 @@
           termApi.open(r.id, true);
           setView("terminales");
         };
+        renderDrawerRetry(r);
 
         $("drawer-meta").innerHTML = `
           <span class="muted">Estado:</span><span><span class="badge ${esc(r.status)}">${esc(r.status)}</span></span>
@@ -78,6 +79,84 @@
         }
         renderDrawerReview();
         ensureReview(r);
+      }
+
+      /* Reintento: relanza una ejecución cerrada con los mismos datos. */
+      function renderDrawerRetry(r) {
+        const btn = $("drawer-retry-btn");
+        const retryable = ["done", "failed", "cancelled"].includes(r.status);
+        const pending = state.retry.pending.has(r.id);
+        btn.style.display = retryable ? "inline-flex" : "none";
+        btn.disabled = pending;
+        btn.textContent = pending ? "Reintentando…" : "Reintentar";
+        btn.onclick = () => retryRun(r.id);
+        const failure = retryable ? state.retry.errors.get(r.id) : null;
+        const recreate = $("drawer-retry-recreate");
+        $("drawer-retry-box").style.display = failure ? "block" : "none";
+        $("drawer-retry-error").textContent = failure ? failure.message : "";
+        recreate.style.display = failure && failure.recreate ? "inline-flex" : "none";
+        recreate.onclick = () => openTaskFromRun(r);
+      }
+
+      async function retryRun(runId) {
+        if (state.retry.pending.has(runId)) return;
+        state.retry.pending.add(runId);
+        state.retry.errors.delete(runId);
+        renderDrawer();
+        let created = null;
+        try {
+          const resp = await apiFetch(`/runs/${encodeURIComponent(runId)}/retry`, { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (resp.status === 201 && data.id) {
+            created = data;
+          } else {
+            const run = state.runs.find((x) => x.id === runId);
+            const recreate = resp.status === 409 && Boolean(run && run.prompt_redacted);
+            const reason = data.error || `HTTP ${resp.status}`;
+            state.retry.errors.set(runId, {
+              recreate,
+              message: recreate
+                ? `El prompt se guardó con secretos redactados y no se puede relanzar tal cual: crea la tarea de nuevo y escribe el prompt completo. (${reason})`
+                : `No se pudo reintentar: ${reason}`,
+            });
+          }
+        } catch (_) {
+          state.retry.errors.set(runId, {
+            recreate: false,
+            message: "No se pudo contactar con el servidor. Revisa la lista antes de volver a intentarlo.",
+          });
+        } finally {
+          state.retry.pending.delete(runId);
+        }
+        if (created) {
+          state.selectedRunId = created.id;
+          // El evento en vivo puede haber llegado antes con un estado más nuevo.
+          if (state.runs.some((x) => x.id === created.id)) renderDrawer();
+          else upsertRun(created);
+        } else {
+          renderDrawer();
+        }
+        await refreshCore();
+      }
+
+      /* Abre «Nueva tarea» con los datos de una ejecución, sin su prompt redactado. */
+      function openTaskFromRun(r) {
+        $("nt-title").value = r.task.titulo || "";
+        $("nt-prompt").value = "";
+        $("nt-privacy").value = r.task.privacidad;
+        $("nt-agent").value = r.agent;
+        openModal();
+        if ($("nt-agent").value === r.agent) {
+          if (!$("nt-model").disabled) $("nt-model").value = r.model || "";
+          const effort = $("nt-effort");
+          effort.value = Array.from(effort.options).some((o) => o.value === r.effort) ? r.effort : "";
+        } else {
+          $("nt-model").value = "";
+          $("nt-effort").value = "";
+          $("nt-error").textContent = `El agente ${r.agent} no está permitido para esta privacidad; revisa agente, modelo y esfuerzo.`;
+          $("nt-error").classList.add("show");
+        }
+        $("nt-prompt").focus();
       }
 
       /* Revisión del worktree: diff, fusión y descarte desde el detalle. */

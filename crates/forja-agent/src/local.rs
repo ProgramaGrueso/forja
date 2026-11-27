@@ -2,7 +2,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use forja_core::{AgentKind, ForjaError, Result};
+use forja_core::{AgentKind, ForjaError, Privacy, Result};
 
 use crate::runner::{CommandResult, Runner};
 use crate::{Agent, AgentFuture, AgentOutput, RunContext};
@@ -44,6 +44,22 @@ pub fn model_target(model: &str) -> String {
     }
 }
 
+/// `true` si el modelo se sirve en esta máquina (proveedor `llm-local`).
+///
+/// `local` pasa el modelo tal cual a `opencode -m`: un valor cualificado como
+/// `openrouter/vendor/modelo` saldría a la nube. Solo `llm-local/...` y los
+/// alias sin proveedor (que se resuelven a `llm-local/...`) son locales.
+pub fn is_local_model(model: &str) -> bool {
+    model_target(model.trim()).starts_with(&format!("{PROVIDER}/"))
+}
+
+/// Mensaje de rechazo para tareas `sensitive` con un modelo no local.
+pub fn non_local_model_message(model: &str) -> String {
+    format!(
+        "privacidad sensitive: el agente local solo admite modelos locales ({PROVIDER}/... o los alias {MOE_ALIAS}/{FLASH_ALIAS}); \"{model}\" es de un proveedor externo"
+    )
+}
+
 /// Opciones puras para construir la invocación de `opencode run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalCommandOptions {
@@ -72,7 +88,7 @@ pub fn build_command(opts: &LocalCommandOptions) -> Vec<String> {
         "-m".to_string(),
         model_target(&opts.model),
         "--auto".to_string(),
-        opts.prompt.clone(),
+        crate::positional_prompt(&opts.prompt),
     ]
 }
 
@@ -182,8 +198,18 @@ impl Agent for LocalAgent {
         Some(Arc::new(copy))
     }
 
+    fn privacy_violation(&self, privacy: Privacy) -> Option<String> {
+        (privacy == Privacy::Sensitive && !is_local_model(&self.model))
+            .then(|| non_local_model_message(&self.model))
+    }
+
     fn run<'a>(&'a self, ctx: &'a RunContext) -> AgentFuture<'a> {
         Box::pin(async move {
+            // Defensa en profundidad: aunque se salte la validación al encolar,
+            // un prompt sensitive nunca sale hacia un proveedor externo.
+            if let Some(reason) = self.privacy_violation(ctx.task.privacidad) {
+                return Err(ForjaError::InvalidInput(reason));
+            }
             // Regla dura: la GPU tiene 16 GB y no debe colapsar. Si el modelo local
             // no está escuchando, se falla sin arrancar nada ni invocar a `llm`.
             if !port_is_open(self.port) {
@@ -347,6 +373,58 @@ mod tests {
         assert!(lines.contains(&"llm-local/flashnext-64k"));
         assert!(lines.contains(&"--auto"));
         assert_eq!(lines.last().copied(), Some("hola mundo"));
+    }
+
+    #[test]
+    fn only_llm_local_models_count_as_local() {
+        for local in ["moe", "flash", "qwen3", "llm-local/qwen3", " llm-local/x "] {
+            assert!(is_local_model(local), "{local}");
+        }
+        for cloud in [
+            "openrouter/vendor/modelo-nube",
+            "anthropic/claude",
+            "llm-local-fake/x",
+            "x/llm-local/y",
+        ] {
+            assert!(!is_local_model(cloud), "{cloud}");
+        }
+        let agent = LocalAgent::new("openrouter/vendor/modelo-nube");
+        assert!(agent.privacy_violation(Privacy::Sensitive).is_some());
+        assert!(agent.privacy_violation(Privacy::Open).is_none());
+        assert!(LocalAgent::default()
+            .privacy_violation(Privacy::Sensitive)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sensitive_task_never_reaches_a_cloud_model() {
+        let (_listener, port) = live_port();
+        let dir = tempdir().expect("tempdir");
+        let agent = LocalAgent::new("openrouter/vendor/modelo-nube")
+            .with_program(fake("fake_local_echo_args.sh"))
+            .with_port(port);
+        let mut context = ctx(dir.path(), "datos privados", 5);
+        context.task.privacidad = Privacy::Sensitive;
+        let err = agent.run(&context).await.expect_err("debe rechazarse");
+        assert!(err.to_string().contains("proveedor externo"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prompt_starting_with_dash_is_not_an_option() {
+        let (_listener, port) = live_port();
+        let dir = tempdir().expect("tempdir");
+        let agent = LocalAgent::new("flash")
+            .with_program(fake("fake_local_echo_args.sh"))
+            .with_port(port);
+        let out = agent
+            .run(&ctx(dir.path(), "--version", 5))
+            .await
+            .expect("respuesta del script falso");
+        assert_eq!(out.text.lines().last(), Some(" --version"));
+        assert_eq!(
+            build_command(&LocalCommandOptions::new("-h", "moe"))[5],
+            " -h"
+        );
     }
 
     #[tokio::test]

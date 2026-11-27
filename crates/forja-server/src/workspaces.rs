@@ -6,7 +6,7 @@ use axum::Json;
 use forja_core::{ForjaError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiError, AppState};
+use crate::{guard, ApiError, AppState};
 
 const MAX_RECENT: usize = 15;
 
@@ -56,6 +56,8 @@ pub struct WorkspaceService {
     active_root: Arc<RwLock<PathBuf>>,
     recent_path: PathBuf,
     recent: Arc<RwLock<Vec<String>>>,
+    /// Repo con el que arrancó el servidor: elección explícita, siempre permitido.
+    startup_repo: Option<PathBuf>,
 }
 
 pub fn default_workspaces_path() -> PathBuf {
@@ -85,7 +87,44 @@ impl WorkspaceService {
             active_root: Arc::new(RwLock::new(active)),
             recent_path,
             recent: Arc::new(RwLock::new(loaded)),
+            startup_repo: None,
         }
+    }
+
+    pub fn with_startup_repo(mut self, repo: Option<PathBuf>) -> Self {
+        self.startup_repo = repo.map(|r| r.canonicalize().unwrap_or(r));
+        self
+    }
+
+    pub fn startup_repo(&self) -> Option<PathBuf> {
+        self.startup_repo.clone()
+    }
+
+    /// Si la carpeta canónica se puede abrir (el repo de arranque siempre).
+    pub(crate) fn check_allowed(&self, canon: &Path) -> Result<()> {
+        if self.startup_repo.as_deref() == Some(canon) {
+            return Ok(());
+        }
+        guard::check_workspace_dir(canon, guard::home_dir().as_deref())
+    }
+
+    /// Ejecuta `f` sin que la carpeta activa pueda cambiar mientras corre.
+    pub(crate) fn with_active_root<T>(&self, f: impl FnOnce(&Path) -> T) -> T {
+        let root = self.active_root.read().unwrap_or_else(|e| e.into_inner());
+        f(&root)
+    }
+
+    /// Info de los recientes que todavía se pueden abrir.
+    fn selectable_info(&self, paths: &[String]) -> Vec<WorkspaceInfo> {
+        paths
+            .iter()
+            .map(Path::new)
+            .filter(|p| {
+                let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                self.check_allowed(&canon).is_ok()
+            })
+            .map(workspace_info)
+            .collect()
     }
 
     pub fn active_root(&self) -> PathBuf {
@@ -171,14 +210,11 @@ pub(crate) async fn get_workspaces(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<WorkspacesResponse>, ApiError> {
     let active_root = state.workspaces.active_root();
-    let recent_paths = state.workspaces.recent_paths();
+    let workspaces = state.workspaces.clone();
 
     let resp = tokio::task::spawn_blocking(move || {
         let active = workspace_info(&active_root);
-        let recent = recent_paths
-            .iter()
-            .map(|p| workspace_info(Path::new(p)))
-            .collect();
+        let recent = workspaces.selectable_info(&workspaces.recent_paths());
         WorkspacesResponse { active, recent }
     })
     .await
@@ -199,6 +235,7 @@ pub(crate) async fn select_workspace(
         )));
     }
 
+    let workspaces = state.workspaces.clone();
     let (canon, info) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, WorkspaceInfo)> {
         let path = PathBuf::from(&raw);
         if !path.exists() {
@@ -214,6 +251,7 @@ pub(crate) async fn select_workspace(
         let canon = path.canonicalize().map_err(|err| {
             ForjaError::InvalidInput(format!("no se pudo resolver la ruta '{raw}': {err}"))
         })?;
+        workspaces.check_allowed(&canon)?;
         let info = workspace_info(&canon);
         Ok((canon, info))
     })
@@ -232,14 +270,10 @@ pub(crate) async fn select_workspace(
     }
 
     let recent_paths = state.workspaces.set_active_and_record(canon)?;
-    let recent = tokio::task::spawn_blocking(move || {
-        recent_paths
-            .iter()
-            .map(|p| workspace_info(Path::new(p)))
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|err| ForjaError::InvalidInput(format!("fallo al leer recientes: {err}")))?;
+    let workspaces = state.workspaces.clone();
+    let recent = tokio::task::spawn_blocking(move || workspaces.selectable_info(&recent_paths))
+        .await
+        .map_err(|err| ForjaError::InvalidInput(format!("fallo al leer recientes: {err}")))?;
 
     Ok(Json(WorkspacesResponse {
         active: info,

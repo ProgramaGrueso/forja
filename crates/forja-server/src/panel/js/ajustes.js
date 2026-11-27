@@ -1,6 +1,15 @@
       /* Vista Ajustes */
       let settingsFilledOnce = false;
+      /* Aviso del servidor (p. ej. settings.json corrupto al arrancar). */
+      function renderSettingsWarning() {
+        const box = $("settings-warning");
+        const text = (state.settings && state.settings.warning) || "";
+        box.textContent = text;
+        box.classList.toggle("show", Boolean(text));
+      }
+
       function fillSettingsForm(force) {
+        renderSettingsWarning();
         if (!state.settings || (settingsFilledOnce && !force)) return;
         $("set-concurrency").value = state.settings.max_concurrency;
         $("set-store-dir").value = state.settings.store_dir;
@@ -190,7 +199,7 @@
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        state.settings = data.settings;
+        state.settings = Object.assign({}, data.settings, cur.warning ? { warning: cur.warning } : {});
         return data;
       }
 

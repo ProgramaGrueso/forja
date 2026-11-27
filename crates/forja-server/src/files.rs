@@ -1,17 +1,23 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::Json;
 use forja_core::{ForjaError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::guard::{check_write_target, ForjaData};
 use crate::{ApiError, AppState};
 
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_SEARCH_DEPTH: usize = 8;
 const MAX_SEARCH_RESULTS: usize = 60;
+/// Tope de entradas (archivos y carpetas) que recorre una búsqueda.
+const MAX_SEARCH_ENTRIES: usize = 50_000;
+/// Tope de tiempo de una búsqueda.
+const MAX_SEARCH_TIME: Duration = Duration::from_secs(2);
 const IGNORED_NAMES: &[&str] = &[".git", "target", "node_modules", ".forja"];
 
 #[derive(Debug, Deserialize)]
@@ -52,12 +58,17 @@ pub struct FileReadResponse {
     pub size: usize,
     pub read_only: bool,
     pub language: String,
+    /// Identificador de la carpeta de la que se leyó; guardar exige devolverlo.
+    pub workspace: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WriteFileRequest {
     pub path: String,
     pub content: String,
+    /// El `workspace` que devolvió la lectura. Obligatorio.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +96,8 @@ pub struct FileSearchMatch {
 pub struct FileSearchResponse {
     pub query: String,
     pub matches: Vec<FileSearchMatch>,
+    /// La búsqueda paró por un límite: puede haber más coincidencias.
+    pub truncated: bool,
 }
 
 async fn resolve_root(state: &AppState, run_id: Option<&str>) -> Result<(PathBuf, bool)> {
@@ -95,6 +108,7 @@ async fn resolve_root(state: &AppState, run_id: Option<&str>) -> Result<(PathBuf
             let canon = root.canonicalize().map_err(|err| {
                 ForjaError::InvalidInput(format!("workspace activo inaccesible: {err}"))
             })?;
+            state.workspaces.check_allowed(&canon)?;
             Ok((canon, false))
         }
         Some(id) => {
@@ -172,7 +186,7 @@ fn resolve_safe_existing(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(canon)
 }
 
-fn resolve_safe_write(root: &Path, rel: &str) -> Result<PathBuf> {
+fn resolve_safe_write(root: &Path, rel: &str, data: &ForjaData) -> Result<PathBuf> {
     let trimmed = rel.trim();
     if trimmed.is_empty() {
         return Err(ForjaError::InvalidInput(
@@ -185,16 +199,14 @@ fn resolve_safe_write(root: &Path, rel: &str) -> Result<PathBuf> {
             "la ruta del archivo no puede estar vacía".to_string(),
         ));
     }
-    if clean
-        .components()
-        .any(|c| matches!(c, Component::Normal(s) if s == ".git"))
-    {
-        return Err(ForjaError::InvalidInput(
-            "no se permite escribir dentro de .git".to_string(),
-        ));
-    }
+    let target = canonical_write_target(root, &clean)?;
+    // Sobre el destino final: un symlink no cambia lo que está protegido.
+    check_write_target(root, &target, data)?;
+    Ok(target)
+}
 
-    let candidate = root.join(&clean);
+fn canonical_write_target(root: &Path, clean: &Path) -> Result<PathBuf> {
+    let candidate = root.join(clean);
     if let Ok(meta) = fs::symlink_metadata(&candidate) {
         let canon = candidate.canonicalize().map_err(|_| {
             ForjaError::InvalidInput("no se puede resolver el destino del archivo".to_string())
@@ -227,6 +239,52 @@ fn resolve_safe_write(root: &Path, rel: &str) -> Result<PathBuf> {
         ));
     }
     Ok(parent_canon.join(file_name))
+}
+
+/// Sustituye `target` de forma atómica conservando sus permisos. El temporal
+/// nunca es más permisivo que el destino.
+fn replace_file(target: &Path, content: &[u8]) -> Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| ForjaError::InvalidInput("directorio padre inválido".to_string()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".forja-write-{}-{nanos}.tmp", std::process::id()));
+    let original = match fs::metadata(target) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(perms) = &original {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(perms.mode() & 0o600);
+    }
+    let mut tmp = options.open(&tmp_path)?;
+
+    let written = (|| -> std::io::Result<()> {
+        tmp.write_all(content)?;
+        if let Some(perms) = original {
+            #[cfg(unix)]
+            let perms = {
+                use std::os::unix::fs::PermissionsExt;
+                fs::Permissions::from_mode(perms.mode() & 0o777)
+            };
+            tmp.set_permissions(perms)?;
+        }
+        drop(tmp);
+        fs::rename(&tmp_path, target)
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
 }
 
 fn to_rel_string(root: &Path, path: &Path) -> String {
@@ -388,6 +446,7 @@ pub(crate) async fn read_file(
             size,
             read_only,
             language,
+            workspace: root.to_string_lossy().into_owned(),
         })
     })
     .await
@@ -413,35 +472,43 @@ pub(crate) async fn write_file(
         )));
     }
 
-    let (root, _) = resolve_root(&state, None).await?;
+    let expected = req.workspace.filter(|w| !w.is_empty()).ok_or_else(|| {
+        ForjaError::InvalidInput(
+            "falta el campo 'workspace': envía el que devuelve GET /api/files/read \
+                 (recarga la página si guardas desde el panel)"
+                .to_string(),
+        )
+    })?;
+    let workspaces = state.workspaces.clone();
+    let data = ForjaData {
+        store_dir: state.scheduler.store_dir(),
+        settings_path: state.settings_path.clone(),
+    };
     let rel = req.path;
     let content = req.content;
 
     let resp = tokio::task::spawn_blocking(move || -> Result<FileWriteResponse> {
-        let target = resolve_safe_write(&root, &rel)?;
-        let parent = target
-            .parent()
-            .ok_or_else(|| ForjaError::InvalidInput("directorio padre inválido".to_string()))?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_name = format!(".forja-write-{}-{nanos}.tmp", std::process::id());
-        let tmp_path = parent.join(tmp_name);
+        // La carpeta activa no puede cambiar entre la comprobación y el guardado.
+        workspaces.with_active_root(|active| {
+            let root = active.canonicalize().map_err(|err| {
+                ForjaError::InvalidInput(format!("workspace activo inaccesible: {err}"))
+            })?;
+            if root.to_string_lossy() != expected.as_str() {
+                return Err(ForjaError::Conflict(format!(
+                    "la carpeta activa cambió: el archivo se abrió en '{expected}' y ahora está \
+                     activa '{}'. Vuelve a la carpeta original para guardarlo",
+                    root.display()
+                )));
+            }
+            workspaces.check_allowed(&root)?;
+            let target = resolve_safe_write(&root, &rel, &data)?;
+            replace_file(&target, content.as_bytes())?;
 
-        if let Err(err) = fs::write(&tmp_path, content.as_bytes()) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err.into());
-        }
-        if let Err(err) = fs::rename(&tmp_path, &target) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err.into());
-        }
-
-        Ok(FileWriteResponse {
-            ok: true,
-            path: to_rel_string(&root, &target),
-            size: content.len(),
+            Ok(FileWriteResponse {
+                ok: true,
+                path: to_rel_string(&root, &target),
+                size: content.len(),
+            })
         })
     })
     .await
@@ -463,13 +530,14 @@ pub(crate) async fn search_files(
         return Ok(Json(FileSearchResponse {
             query: raw_query,
             matches: Vec::new(),
+            truncated: false,
         }));
     }
 
-    let matches = tokio::task::spawn_blocking(move || {
-        let mut results = Vec::new();
-        walk_search(&root, &root, 0, &needle, &mut results);
-        results
+    let (matches, truncated) = tokio::task::spawn_blocking(move || {
+        let mut search = Search::new(&root, &needle, MAX_SEARCH_ENTRIES, MAX_SEARCH_TIME);
+        search.walk(&root, 0);
+        (search.matches, search.truncated)
     })
     .await
     .map_err(|err| ForjaError::InvalidInput(format!("fallo al buscar archivos: {err}")))?;
@@ -477,54 +545,150 @@ pub(crate) async fn search_files(
     Ok(Json(FileSearchResponse {
         query: raw_query,
         matches,
+        truncated,
     }))
 }
 
-fn walk_search(
-    root: &Path,
-    dir: &Path,
-    depth: usize,
-    needle: &str,
-    out: &mut Vec<FileSearchMatch>,
-) {
-    if depth > MAX_SEARCH_DEPTH || out.len() >= MAX_SEARCH_RESULTS {
-        return;
-    }
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut items: Vec<_> = read_dir.flatten().collect();
-    items.sort_by_key(|e| e.file_name());
+/// Recorrido de una búsqueda con límite de resultados, entradas y tiempo.
+struct Search<'a> {
+    root: &'a Path,
+    needle: &'a str,
+    entries_left: usize,
+    deadline: Instant,
+    matches: Vec<FileSearchMatch>,
+    truncated: bool,
+}
 
-    for entry in items {
-        if out.len() >= MAX_SEARCH_RESULTS {
+impl<'a> Search<'a> {
+    fn new(root: &'a Path, needle: &'a str, max_entries: usize, max_time: Duration) -> Self {
+        Self {
+            root,
+            needle,
+            entries_left: max_entries,
+            deadline: Instant::now() + max_time,
+            matches: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn out_of_time(&mut self) -> bool {
+        let late = Instant::now() >= self.deadline;
+        self.truncated |= late;
+        late
+    }
+
+    fn walk(&mut self, dir: &Path, depth: usize) {
+        if self.matches.len() >= MAX_SEARCH_RESULTS || self.out_of_time() {
             return;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if is_ignored(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
+        let Ok(read_dir) = fs::read_dir(dir) else {
+            return;
         };
-        if meta.file_type().is_symlink() {
-            continue;
+        // El límite se aplica ya al listar: una sola carpeta puede ser enorme.
+        let mut items = Vec::new();
+        for entry in read_dir.flatten() {
+            if self.entries_left == 0 {
+                self.truncated = true;
+                break;
+            }
+            if self.out_of_time() {
+                break;
+            }
+            self.entries_left -= 1;
+            items.push(entry);
         }
-        let is_dir = meta.is_dir();
-        let rel = to_rel_string(root, &path);
-        if rel.to_lowercase().contains(needle) {
-            out.push(FileSearchMatch {
-                name,
-                path: rel,
-                is_dir,
-            });
-            if out.len() >= MAX_SEARCH_RESULTS {
+        items.sort_by_key(|e| e.file_name());
+
+        for entry in items {
+            if self.matches.len() >= MAX_SEARCH_RESULTS {
+                self.truncated = true;
                 return;
             }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_ignored(&name) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            let rel = to_rel_string(self.root, &path);
+            if rel.to_lowercase().contains(self.needle) {
+                self.matches.push(FileSearchMatch {
+                    name,
+                    path: rel,
+                    is_dir,
+                });
+            }
+            if is_dir && depth < MAX_SEARCH_DEPTH {
+                self.walk(&path, depth + 1);
+            }
         }
-        if is_dir && depth < MAX_SEARCH_DEPTH {
-            walk_search(root, &path, depth + 1, needle, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tmp");
+        for dir in 0..4 {
+            let sub = tmp.path().join(format!("d{dir}"));
+            fs::create_dir(&sub).expect("dir");
+            for file in 0..30 {
+                fs::write(sub.join(format!("f{file}.txt")), "x").expect("file");
+            }
         }
+        tmp
+    }
+
+    #[test]
+    fn search_stops_at_entry_limit_and_time_limit() {
+        let tmp = tree();
+        let long = Duration::from_secs(60);
+
+        let mut full = Search::new(tmp.path(), "f1.txt", 10_000, long);
+        full.walk(tmp.path(), 0);
+        assert_eq!(full.matches.len(), 4);
+        assert!(!full.truncated);
+
+        let mut few = Search::new(tmp.path(), "f1.txt", 10, long);
+        few.walk(tmp.path(), 0);
+        assert!(few.truncated);
+        assert_eq!(few.entries_left, 0);
+        assert!(few.matches.len() <= 1);
+
+        let mut late = Search::new(tmp.path(), "f1.txt", 10_000, Duration::ZERO);
+        late.walk(tmp.path(), 0);
+        assert!(late.truncated);
+        assert!(late.matches.is_empty());
+
+        let mut many = Search::new(tmp.path(), "txt", 10_000, long);
+        many.walk(tmp.path(), 0);
+        assert_eq!(many.matches.len(), MAX_SEARCH_RESULTS);
+        assert!(many.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_file_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tmp");
+        for mode in [0o600, 0o755, 0o640, 0o400, 0o664] {
+            let file = tmp.path().join(format!("m{mode:o}"));
+            fs::write(&file, "antes").expect("write");
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).expect("chmod");
+            replace_file(&file, b"despues").expect("replace");
+            let got = fs::metadata(&file).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(got, mode, "modo {mode:o}");
+            assert_eq!(fs::read(&file).expect("read"), b"despues");
+        }
+        let left = fs::read_dir(tmp.path()).expect("dir").count();
+        assert_eq!(left, 5, "no quedan temporales");
     }
 }

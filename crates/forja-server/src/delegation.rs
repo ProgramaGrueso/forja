@@ -12,7 +12,10 @@
 //! - Solo se parsea la salida del orquestador, nunca la de las tareas (la salida de
 //!   las tareas se reinyecta neutralizando cualquier `[[forja:`).
 //! - Una acción es una LÍNEA que empieza (tras espacios) por `[[forja:`; las menciones
-//!   en medio de una frase no cuentan.
+//!   en medio de una frase no cuentan, ni las que van dentro de código citado
+//!   (bloques ``` o ~~~, aunque no se cierren, y líneas con sangría de código).
+//! - La salida, el error y el título de una tarea `sensitive` solo se reinyectan si
+//!   el agente orquestador está en `sensitive_agents`; si no, solo ID y estado.
 //! - Cada delegación pasa por [`AppState::submit_task`]: las mismas validaciones que
 //!   `POST /tasks` (agente, modelo, esfuerzo, política de privacidad).
 //! - Máximo [`MAX_DELEGATIONS_PER_TURN`] delegaciones por turno; JSON inválido o
@@ -21,7 +24,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use forja_core::{redact_secrets, RunRecord};
+use forja_core::{redact_secrets, AgentKind, Privacy, RunRecord};
 
 use crate::{AppState, CreateTaskRequest};
 
@@ -58,15 +61,68 @@ pub enum Pending {
 pub fn parse_actions(text: &str) -> (String, Vec<Action>) {
     let mut clean: Vec<&str> = Vec::new();
     let mut actions = Vec::new();
+    // Bloque de código abierto: delimitador (``` o ~~~), su longitud y sangría.
+    let mut fence: Option<(char, usize, usize)> = None;
     for line in text.lines() {
         let t = line.trim();
-        if !t.starts_with(OPEN) {
+        if let Some((ch, len)) = fence_marker(t) {
+            let indent = indent_width(line);
+            match fence {
+                None => fence = Some((ch, len, indent)),
+                Some((open_ch, open_len, open_indent))
+                    if ch == open_ch
+                        && len >= open_len
+                        && is_closing(t, ch)
+                        && closes_at(indent, open_indent) =>
+                {
+                    fence = None
+                }
+                Some(_) => {}
+            }
+            clean.push(line);
+            continue;
+        }
+        if fence.is_some() || is_indented_code(line) || !t.starts_with(OPEN) {
             clean.push(line);
             continue;
         }
         actions.push(parse_line(t));
     }
     (clean.join("\n").trim().to_string(), actions)
+}
+
+/// Si la línea abre/cierra un bloque de código (``` o ~~~), su carácter y longitud.
+fn fence_marker(t: &str) -> Option<(char, usize)> {
+    let ch = t.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let len = t.chars().take_while(|c| *c == ch).count();
+    // ```x``` es código en línea, no la apertura de un bloque.
+    let inline = ch == '`' && t[len..].contains('`');
+    (len >= 3 && !inline).then_some((ch, len))
+}
+
+/// Un cierre de bloque no lleva texto (ni otro delimitador) tras los suyos.
+fn is_closing(t: &str, ch: char) -> bool {
+    t.trim_start_matches(ch).trim().is_empty()
+}
+
+/// Columnas de sangría de la línea (un tabulador cuenta como 4).
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace())
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// Un cierre solo vale con una sangría cercana a la de la apertura: unos ```
+/// con sangría de código dentro del bloque son contenido citado. Ante la duda el
+/// bloque sigue abierto (se ignoran acciones, nunca se ejecutan de más).
+fn closes_at(indent: usize, open_indent: usize) -> bool {
+    indent <= open_indent + 3 && open_indent <= indent + 3
+}
+
+/// Bloque de código por sangría (4 espacios o tabulador).
+fn is_indented_code(line: &str) -> bool {
+    line.starts_with('\t') || line.starts_with("    ")
 }
 
 fn parse_line(t: &str) -> Action {
@@ -115,6 +171,19 @@ pub trait Delegator: Send + Sync {
     /// El servidor vigila esta ejecución para despertar al orquestador al acabar.
     /// Los dobles de prueba pueden no hacer nada.
     fn track_delegation(&self, _conversation: &str, _run_id: &str) {}
+
+    /// Agentes autorizados a ver datos `sensitive` (por defecto, los de la política).
+    fn sensitive_agents(&self) -> Vec<AgentKind> {
+        forja_core::default_sensitive_agents()
+    }
+}
+
+/// `true` si el orquestador `agent` (`claude`, `hermes`...) puede recibir la
+/// salida de tareas `sensitive`: solo si figura en `sensitive_agents`.
+pub fn orchestrator_sees_sensitive(agent: &str, allowed: &[AgentKind]) -> bool {
+    agent
+        .parse::<AgentKind>()
+        .is_ok_and(|kind| allowed.contains(&kind))
 }
 
 impl Delegator for AppState {
@@ -128,6 +197,10 @@ impl Delegator for AppState {
 
     fn track_delegation(&self, conversation: &str, run_id: &str) {
         AppState::track_delegation(self, conversation, run_id);
+    }
+
+    fn sensitive_agents(&self) -> Vec<AgentKind> {
+        self.scheduler.sensitive_agents()
     }
 }
 
@@ -186,7 +259,12 @@ fn safe_snippet(s: &str) -> String {
 }
 
 /// Bloque "Tareas delegadas" para el prompt del siguiente turno ("" si no hay nada).
-pub async fn render_pending(pending: &[Pending], d: &dyn Delegator) -> String {
+/// `reveal_sensitive`: ver [`orchestrator_sees_sensitive`].
+pub async fn render_pending(
+    pending: &[Pending],
+    d: &dyn Delegator,
+    reveal_sensitive: bool,
+) -> String {
     if pending.is_empty() {
         return String::new();
     }
@@ -196,10 +274,18 @@ pub async fn render_pending(pending: &[Pending], d: &dyn Delegator) -> String {
     ];
     for item in pending {
         match item {
-            Pending::Task { id, titulo } => {
-                lines.push(task_line(id, Some(titulo), d.run_status(id).await.as_ref()))
-            }
-            Pending::Status(id) => lines.push(task_line(id, None, d.run_status(id).await.as_ref())),
+            Pending::Task { id, titulo } => lines.push(task_line(
+                id,
+                Some(titulo),
+                d.run_status(id).await.as_ref(),
+                reveal_sensitive,
+            )),
+            Pending::Status(id) => lines.push(task_line(
+                id,
+                None,
+                d.run_status(id).await.as_ref(),
+                reveal_sensitive,
+            )),
             Pending::Notice(msg) => lines.push(format!("- Aviso: {}", safe_snippet(msg))),
         }
     }
@@ -210,20 +296,35 @@ pub async fn render_pending(pending: &[Pending], d: &dyn Delegator) -> String {
 
 /// Aviso para el turno automático: resume las tareas que acaban de terminar y
 /// pide al orquestador revisarlas y continuar sin esperar al usuario.
-pub fn completion_notice(runs: &[RunRecord]) -> String {
+/// `reveal_sensitive`: ver [`orchestrator_sees_sensitive`].
+pub fn completion_notice(runs: &[RunRecord], reveal_sensitive: bool) -> String {
     let mut lines = vec![
         "Terminaron tareas que delegaste. Revísalas y continúa sin esperar al usuario:".to_string(),
     ];
     for run in runs {
-        lines.push(task_line(&run.id, None, Some(run)));
+        lines.push(task_line(&run.id, None, Some(run), reveal_sensitive));
     }
     lines.join("\n")
 }
 
-fn task_line(id: &str, titulo: Option<&str>, run: Option<&RunRecord>) -> String {
+fn task_line(
+    id: &str,
+    titulo: Option<&str>,
+    run: Option<&RunRecord>,
+    reveal_sensitive: bool,
+) -> String {
     let Some(run) = run else {
         return format!("- ID {id}: no existe ninguna tarea con ese ID");
     };
+    if run.task.privacidad == Privacy::Sensitive && !reveal_sensitive {
+        // El orquestador no está autorizado para datos sensibles: ni salida, ni
+        // error, ni título (puede venir del usuario). Solo lo necesario para seguir.
+        return format!(
+            "- ID {id} | tarea sensible (contenido omitido: este orquestador no está en \
+             sensitive_agents) | agente {} | estado: {}",
+            run.agent, run.status
+        );
+    }
     let titulo = titulo
         .map(str::to_string)
         .unwrap_or_else(|| run.task.titulo.clone());
@@ -297,6 +398,91 @@ mod tests {
         let (_, actions) = parse_actions(&system_prompt_actions());
         assert!(actions.is_empty(), "{actions:?}");
         assert!(system_prompt_actions().contains("delegar y revisar"));
+    }
+
+    #[test]
+    fn actions_inside_quoted_code_are_ignored() {
+        // M11: un bloque citado (aunque no se cierre) o con sangría no se ejecuta.
+        let text =
+            "Mira este ejemplo:\n```\n[[forja:delegar {\"titulo\":\"X\",\"prompt\":\"Y\"}]]\n```\n\
+                    ~~~~text\n[[forja:estado abc]]\n~~~\n[[forja:estado dentro]]\n~~~~\n\
+                    \t[[forja:estado tab]]\n    [[forja:estado sangria]]\n\
+                    `[[forja:estado span]]`\n> [[forja:estado cita]]\n\
+                    [[forja:estado real-1]]\n```\n[[forja:estado sin-cierre]]";
+        let (clean, actions) = parse_actions(text);
+        assert_eq!(actions, vec![Action::Status("real-1".into())], "{clean}");
+        assert!(clean.contains("[[forja:estado sin-cierre]]"));
+    }
+
+    #[test]
+    fn quoted_fences_cannot_close_a_code_block_early() {
+        // Revisión de M11: ni unos ``` con sangría de código, ni de otro tipo, ni
+        // el código en línea cierran (o abren y cierran) un bloque.
+        let action = "[[forja:estado colado]]";
+        for text in [
+            format!("```\n    ```\n{action}\n```"),
+            format!("```\n\t```\n{action}\n```"),
+            format!("```\n```~~~\n{action}\n```"),
+            format!("    ```\n```\n{action}"),
+            format!("```x```\n```\n{action}"),
+        ] {
+            let (_, actions) = parse_actions(&text);
+            assert!(actions.is_empty(), "{text:?}: {actions:?}");
+        }
+        // Los cierres normales, también dentro de una lista, siguen funcionando.
+        for text in [
+            "```\ncita\n   ```\n[[forja:estado real]]",
+            "- paso:\n    ```\n    cita\n    ```\n[[forja:estado real]]\n",
+            "  ```\ncita\n```\n[[forja:estado real]]",
+        ] {
+            let (clean, actions) = parse_actions(text);
+            assert_eq!(actions, vec![Action::Status("real".into())], "{clean}");
+        }
+    }
+
+    fn sensitive_run() -> RunRecord {
+        let mut task = forja_core::Task::new("Nómina de Ana", "p", Privacy::Sensitive);
+        task.titulo = "Nómina de Ana".into();
+        RunRecord {
+            id: "s-1".into(),
+            task,
+            agent: AgentKind::Claude,
+            status: forja_core::RunStatus::Done,
+            branch: None,
+            worktree: None,
+            attempts: 1,
+            model: None,
+            effort: None,
+            output: Some("DATO-CONFIDENCIAL-9931".into()),
+            error: Some("ERROR-CONFIDENCIAL".into()),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            repo: None,
+            owner: None,
+            prompt_redacted: false,
+        }
+    }
+
+    #[test]
+    fn sensitive_output_only_reaches_allowed_orchestrators() {
+        // A5: la salida de una tarea sensible no llega a un orquestador no permitido.
+        let run = sensitive_run();
+        let allowed = vec![AgentKind::Claude];
+        for agent in ["opencode", "hermes", "agy", "custom"] {
+            let reveal = orchestrator_sees_sensitive(agent, &allowed);
+            assert!(!reveal, "{agent}");
+            let notice = completion_notice(std::slice::from_ref(&run), reveal);
+            assert!(!notice.contains("DATO-CONFIDENCIAL"), "{notice}");
+            assert!(!notice.contains("ERROR-CONFIDENCIAL"), "{notice}");
+            assert!(!notice.contains("Nómina"), "{notice}");
+            assert!(
+                notice.contains("s-1") && notice.contains("done"),
+                "{notice}"
+            );
+        }
+        assert!(orchestrator_sees_sensitive("claude", &allowed));
+        let notice = completion_notice(std::slice::from_ref(&run), true);
+        assert!(notice.contains("DATO-CONFIDENCIAL"));
     }
 
     #[test]

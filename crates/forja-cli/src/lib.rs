@@ -267,6 +267,10 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
         if cli.base_branch.is_none() {
             cli.base_branch = cli.repo.as_deref().and_then(friendly::current_branch);
         }
+        // Las rutas relativas son del repo, no del cwd: `serve --repo X` desde
+        // otra carpeta debe usar X/.forja/... (M5).
+        cli.store_dir = resolve_data_dir(&cli.store_dir, cli.repo.as_deref());
+        cli.worktrees_dir = resolve_data_dir(&cli.worktrees_dir, cli.repo.as_deref());
     }
     let base_branch = cli
         .base_branch
@@ -299,7 +303,20 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             let task = Task::new(titulo, prompt, privacy.into());
 
             let submitted = scheduler.submit(task, built).await?;
-            let finished = scheduler.wait_run(&submitted.id).await?;
+            // El agente corre en su propio grupo de procesos y no recibe el Ctrl+C
+            // de la terminal: al recibir la señal se cancela y se mata su grupo.
+            let finished = tokio::select! {
+                finished = scheduler.wait_run(&submitted.id) => finished?,
+                sig = forja_server::shutdown_signal() => {
+                    scheduler
+                        .shutdown(&format!("forja run interrumpido ({sig})"))
+                        .await;
+                    scheduler
+                        .get_run(&submitted.id)
+                        .await
+                        .ok_or_else(|| ForjaError::NotFound(submitted.id.clone()))?
+                }
+            };
 
             writeln!(out, "id: {}", finished.id)?;
             writeln!(out, "estado: {}", finished.status)?;
@@ -422,9 +439,11 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
             open,
         } => {
             let settings_path = cli.store_dir.join("settings.json");
-            let persisted = forja_server::settings::load_settings(&settings_path)
-                .ok()
-                .flatten();
+            let (persisted, settings_warning) =
+                forja_server::settings::load_settings_or_warn(&settings_path);
+            if let Some(warning) = &settings_warning {
+                eprintln!("aviso: {warning}");
+            }
 
             let max_concurrency = persisted.as_ref().map(|s| s.max_concurrency).unwrap_or(2);
 
@@ -486,7 +505,8 @@ pub async fn execute_with_writer<W: Write>(mut cli: Cli, out: &mut W) -> Result<
 
             let mut state = AppState::new(scheduler)
                 .with_settings(settings)
-                .with_settings_path(settings_path);
+                .with_settings_path(settings_path)
+                .with_settings_warning(settings_warning);
             if let Some(token) = auth_token {
                 state = state.with_auth_token(token);
             }
@@ -517,9 +537,12 @@ fn load_run_settings(
     BTreeMap<String, String>,
     Vec<AgentKind>,
 ) {
-    forja_server::settings::load_settings(&store_dir.join("settings.json"))
-        .ok()
-        .flatten()
+    let (settings, warning) =
+        forja_server::settings::load_settings_or_warn(&store_dir.join("settings.json"));
+    if let Some(warning) = warning {
+        eprintln!("aviso: {warning}");
+    }
+    settings
         .map(|s| (s.agent_models, s.agent_effort, s.sensitive_agents))
         .unwrap_or_else(|| {
             (
@@ -528,6 +551,37 @@ fn load_run_settings(
                 forja_core::default_sensitive_agents(),
             )
         })
+}
+
+/// Resuelve una carpeta de datos relativa contra el repo (o el cwd sin repo).
+///
+/// Compatibilidad: si la ruta relativa ya existe en el cwd y no en el repo
+/// (datos creados antes de este cambio), se sigue usando la del cwd con un aviso;
+/// nunca se mueven datos.
+fn resolve_data_dir(dir: &std::path::Path, repo: Option<&std::path::Path>) -> PathBuf {
+    if dir.is_absolute() {
+        return dir.to_path_buf();
+    }
+    let from_cwd = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(repo) = repo else {
+        return from_cwd;
+    };
+    let repo = std::path::absolute(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let from_repo = repo.join(dir);
+    let same = from_cwd == from_repo
+        || matches!(
+            (from_cwd.canonicalize(), from_repo.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if !same && from_cwd.exists() && !from_repo.exists() {
+        eprintln!(
+            "forja: aviso: uso {} (datos existentes en la carpeta actual) en lugar de {}",
+            from_cwd.display(),
+            from_repo.display()
+        );
+        return from_cwd;
+    }
+    from_repo
 }
 
 fn build_scheduler(
@@ -1017,5 +1071,30 @@ mod tests {
                 agent: AgentKind::Agy
             }
         ));
+    }
+
+    #[test]
+    fn relative_data_dirs_resolve_against_the_repo_not_the_cwd() {
+        // M5: `serve --repo X` desde otra carpeta usa X/.forja/...
+        let repo = TempDir::new().expect("repo");
+        let rel = std::path::Path::new(".forja-prueba-m5/store");
+        let resolved = crate::resolve_data_dir(rel, Some(repo.path()));
+        assert_eq!(resolved, repo.path().join(rel));
+        // Absolutas se respetan; sin repo, se resuelven contra el cwd.
+        let abs = repo.path().join("otra");
+        assert_eq!(crate::resolve_data_dir(&abs, Some(repo.path())), abs);
+        let no_repo = crate::resolve_data_dir(rel, None);
+        assert!(no_repo.is_absolute() && no_repo.ends_with(rel));
+    }
+
+    #[test]
+    fn legacy_data_in_cwd_is_kept_without_moving_it() {
+        let repo = TempDir::new().expect("repo");
+        let cwd = std::env::current_dir().expect("cwd");
+        let rel = std::path::Path::new("target/forja-m5-legado-prueba");
+        std::fs::create_dir_all(cwd.join(rel)).expect("crear legado");
+        let resolved = crate::resolve_data_dir(rel, Some(repo.path()));
+        let _ = std::fs::remove_dir(cwd.join(rel));
+        assert_eq!(resolved, cwd.join(rel));
     }
 }

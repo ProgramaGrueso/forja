@@ -42,7 +42,7 @@ pub fn build_command(opts: &ClaudeCommandOptions) -> Vec<String> {
     let mut argv = vec![
         DEFAULT_PROGRAM.to_string(),
         "-p".to_string(),
-        opts.prompt.clone(),
+        crate::positional_prompt(&opts.prompt),
         "--model".to_string(),
         opts.model.clone(),
         "--output-format".to_string(),

@@ -1,7 +1,10 @@
+mod adversarial;
 mod auth_security;
 mod files_workspaces;
 mod panel_mascot;
+mod retry_redact;
 mod review;
+mod review_safety;
 mod stream_output;
 mod tasks_runs;
 

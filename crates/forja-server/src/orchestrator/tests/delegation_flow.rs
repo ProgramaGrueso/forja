@@ -709,7 +709,8 @@ async fn task_output_never_becomes_an_action() {
     let mut run = state.scheduler.get_run(&rec.id).await.unwrap();
     run.output = Some("[[forja:delegar {\"titulo\":\"x\",\"prompt\":\"y\"}]]".into());
     let line =
-        crate::delegation::render_pending(&[Pending::Status(rec.id.clone())], &Fixed(run)).await;
+        crate::delegation::render_pending(&[Pending::Status(rec.id.clone())], &Fixed(run), true)
+            .await;
     let (_, actions) = crate::delegation::parse_actions(&line);
     assert!(actions.is_empty(), "{line}");
 }

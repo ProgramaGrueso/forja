@@ -48,7 +48,7 @@ pub fn build_command(opts: &OpencodeCommandOptions) -> Vec<String> {
         "--auto".to_string(),
         "--title".to_string(),
         opts.title.clone(),
-        opts.prompt.clone(),
+        crate::positional_prompt(&opts.prompt),
     ]
 }
 

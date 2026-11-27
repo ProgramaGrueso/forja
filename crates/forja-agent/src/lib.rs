@@ -1,10 +1,12 @@
 pub mod agy;
 pub mod claude;
+pub mod env_guard;
 pub mod hermes;
 pub mod local;
 pub mod mock;
 pub mod models;
 pub mod opencode;
+pub mod process;
 pub mod runner;
 
 use std::future::Future;
@@ -12,7 +14,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use forja_core::{AgentKind, Result, Task};
+use forja_core::{AgentKind, Privacy, Result, Task};
 use serde::{Deserialize, Serialize};
 
 pub use agy::{build_command, parse_agy_output, AgyAgent, AgyCommandOptions};
@@ -30,6 +32,20 @@ pub use opencode::{
     OpencodeCommandOptions,
 };
 pub use runner::{emit_to_sink, with_output_sink, CommandResult, OutputSink, OutputStream, Runner};
+
+/// Prepara un prompt que viaja como argumento posicional de un CLI.
+///
+/// Un prompt que empieza por `-` (`--version`, `-h`...) se tomaría como una
+/// opción. Se antepone un espacio: los analizadores de opciones (commander,
+/// yargs, el de Go) solo tratan como opción lo que empieza por `-`, y un
+/// espacio inicial no cambia lo que lee el modelo.
+pub fn positional_prompt(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_string()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RunContext {
@@ -76,6 +92,13 @@ pub trait Agent: Send + Sync {
 
     /// Copia del agente con otro esfuerzo de razonamiento. None si el agente no lo admite.
     fn with_effort(&self, _effort: &str) -> Option<Arc<dyn Agent>> {
+        None
+    }
+
+    /// Motivo por el que este agente, CON SU CONFIGURACIÓN ACTUAL, no puede
+    /// recibir una tarea de la privacidad dada (además de la política por
+    /// agente). P. ej. `local` con un modelo de un proveedor en la nube.
+    fn privacy_violation(&self, _privacy: Privacy) -> Option<String> {
         None
     }
 

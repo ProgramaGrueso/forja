@@ -13,7 +13,7 @@ use serde::Serialize;
 pub use mascot::mascot_bytes;
 pub(crate) use mascot::mascot_handler;
 pub(crate) use panel::panel_handler;
-pub(crate) use runs::{cancel_run, get_run, list_runs};
+pub(crate) use runs::{cancel_run, get_run, list_runs, retry_run};
 pub(crate) use stream::{events_handler, run_output, run_stream};
 pub(crate) use tasks::create_task;
 pub use tasks::CreateTaskRequest;

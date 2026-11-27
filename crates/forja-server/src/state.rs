@@ -37,6 +37,9 @@ pub struct AppState {
     pub profile_rules: ProfileRules,
     /// Serializa diff/fusión/descarte para no operar dos veces sobre el mismo repo.
     pub(crate) review_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializa los guardados de ajustes.
+    pub(crate) settings_lock: Arc<tokio::sync::Mutex<()>>,
+    settings_warning: Arc<RwLock<Option<String>>>,
     /// Evita arrancar más de un vigilante de ejecuciones por estado.
     pub(crate) watcher_started: Arc<AtomicBool>,
 }
@@ -84,13 +87,15 @@ impl AppState {
             .store_dir()
             .join(conversation_store::CONVERSATIONS_FILE);
 
-        let initial_workspace = scheduler
-            .repo_path()
+        let startup_repo = scheduler.repo_path();
+        let initial_workspace = startup_repo
+            .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let workspaces = workspaces::WorkspaceService::new(
             initial_workspace,
             workspaces::default_workspaces_path(),
-        );
+        )
+        .with_startup_repo(startup_repo);
 
         Self {
             scheduler,
@@ -107,6 +112,8 @@ impl AppState {
                 .with_persistence(conversations_path),
             profile_rules,
             review_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_warning: Arc::new(RwLock::new(None)),
             watcher_started: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -128,8 +135,32 @@ impl AppState {
         self
     }
 
+    /// Aviso sobre `settings.json` que expone `GET /api/settings`.
+    pub fn with_settings_warning(self, warning: Option<String>) -> Self {
+        if let Some(warning) = warning {
+            self.set_settings_warning(warning);
+        }
+        self
+    }
+
+    pub(crate) fn set_settings_warning(&self, warning: String) {
+        *self
+            .settings_warning
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(warning);
+    }
+
+    pub(crate) fn settings_warning(&self) -> Option<String> {
+        self.settings_warning
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         let t = token.into();
+        // El token no debe heredarse en el entorno de los agentes.
+        forja_agent::env_guard::hide_secret(&t);
         self.auth_token = if t.trim().is_empty() { None } else { Some(t) };
         self
     }
@@ -192,7 +223,9 @@ impl AppState {
 
     pub fn with_workspaces_path(mut self, path: PathBuf) -> Self {
         let root = self.workspaces.active_root();
-        self.workspaces = workspaces::WorkspaceService::new(root, path);
+        let startup_repo = self.workspaces.startup_repo();
+        self.workspaces =
+            workspaces::WorkspaceService::new(root, path).with_startup_repo(startup_repo);
         self
     }
 

@@ -1,4 +1,5 @@
 pub mod error;
+pub mod limits;
 pub mod policy;
 pub mod redact;
 pub mod types;
@@ -108,12 +109,28 @@ mod tests {
             effort: None,
             output: Some("ok".to_string()),
             error: None,
+            repo: None,
+            owner: None,
+            prompt_redacted: false,
             created_at_ms: 1000,
             updated_at_ms: 2000,
         };
         let json = serde_json::to_string(&record).expect("serialize run record");
         let parsed: RunRecord = serde_json::from_str(&json).expect("deserialize run record");
         assert_eq!(record, parsed);
+    }
+
+    #[test]
+    fn run_record_without_new_fields_still_parses() {
+        // Línea de un runs.jsonl anterior a repo/owner/prompt_redacted.
+        let old = r#"{"id":"r","task":{"id":"t","titulo":"a","prompt":"b","privacidad":"sensitive"},"agent":"claude","status":"running","created_at_ms":1,"updated_at_ms":2}"#;
+        let parsed: RunRecord = serde_json::from_str(old).expect("registro antiguo");
+        assert_eq!(parsed.repo, None);
+        assert_eq!(parsed.owner, None);
+        assert!(!parsed.prompt_redacted);
+        assert_eq!(parsed.task.privacidad, Privacy::Sensitive);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("prompt_redacted"), "{json}");
     }
 
     #[test]

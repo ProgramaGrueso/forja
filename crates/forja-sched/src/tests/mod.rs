@@ -1,5 +1,6 @@
 mod concurrency;
 mod execution;
+mod hardening;
 mod streaming;
 
 use std::fs;

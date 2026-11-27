@@ -2,13 +2,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forja_agent::{with_output_sink, Agent, OutputSink, OutputStream, RunContext};
+use forja_core::limits::{MAX_STORED_ERROR_BYTES, MAX_STORED_OUTPUT_BYTES};
 use forja_core::{Result, RunStatus, Task};
 
 use crate::buffers::push_lines;
 use crate::worktree::{commit_worktree_changes, prepare_worktree};
-use crate::{now_ms, SchedulerInner};
+use crate::{now_ms, sanitize_text, SchedulerInner};
 
-pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: Arc<dyn Agent>) {
+/// Ejecuta `task` (la original, con el prompt completo: el registro guardado
+/// puede llevarlo redactado) y va actualizando el registro `run_id`.
+pub(crate) async fn run_task(
+    inner: Arc<SchedulerInner>,
+    run_id: String,
+    task: Task,
+    agent: Arc<dyn Agent>,
+) {
     let _permit = inner.limiter.acquire().await;
 
     let wt_path = inner.config.worktrees_dir.join(&run_id);
@@ -24,7 +32,7 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
         .clone();
     let branch = repo_path.as_ref().map(|_| format!("forja/{run_id}"));
 
-    let task = {
+    {
         let _store_guard = inner.store_lock.lock().await;
         let maybe_record = {
             let mut runs = inner.runs.write().await;
@@ -38,13 +46,16 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
             record.attempts = 1;
             record.branch = branch.clone();
             record.worktree = Some(wt_path.to_string_lossy().into_owned());
+            record.repo = repo_path
+                .as_ref()
+                .map(|repo| repo.canonicalize().unwrap_or_else(|_| repo.clone()))
+                .map(|repo| repo.to_string_lossy().into_owned());
             record.updated_at_ms = now_ms();
             record.clone()
         };
         let _ = inner.store.append_run(&maybe_record);
-        let _ = inner.events.send(maybe_record.clone());
-        maybe_record.task
-    };
+        let _ = inner.events.send(maybe_record);
+    }
 
     let execution_result = execute_with_retries(
         &inner,
@@ -71,12 +82,12 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
             match execution_result {
                 Ok(output) => {
                     record.status = RunStatus::Done;
-                    record.output = Some(output);
+                    record.output = Some(sanitize_text(&output, MAX_STORED_OUTPUT_BYTES));
                     record.error = None;
                 }
                 Err(err) => {
                     record.status = RunStatus::Failed;
-                    record.error = Some(err.to_string());
+                    record.error = Some(sanitize_text(&err.to_string(), MAX_STORED_ERROR_BYTES));
                 }
             }
             record.updated_at_ms = now_ms();
@@ -108,6 +119,7 @@ async fn execute_with_retries(
     prepare_worktree(
         repo_path,
         &inner.config.worktrees_dir,
+        inner.store.dir(),
         base_branch,
         &inner.git_lock,
         wt_path,
@@ -191,7 +203,8 @@ async fn execute_with_retries(
                             return Err(err);
                         }
                         record.attempts = attempt;
-                        record.error = Some(err.to_string());
+                        record.error =
+                            Some(sanitize_text(&err.to_string(), MAX_STORED_ERROR_BYTES));
                         record.updated_at_ms = now_ms();
                         record.clone()
                     };

@@ -115,6 +115,8 @@
       gap: 10px;
     }
 
+    .drawer-header > div:last-child { flex-wrap: wrap; justify-content: flex-end; }
+
     .drawer-body {
       flex: 1;
       overflow-y: auto;

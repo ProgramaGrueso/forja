@@ -1,0 +1,8 @@
+{
+  "herramienta": "Playwright, 1440x900, instancia aislada en :7793 levantada con panel.py",
+  "payloads": "<img src=x onerror=...> en título, prompt, modelo, chat, respuesta del orquestador, nombre y contenido de archivo, nombre de carpeta; variante con comillas en la moneda de cuota",
+  "pasos_sin_ejecucion": ["resumen","orquestador","archivos","ejecuciones","terminales","agentes","telemetria","cuotas","ajustes","drawer","archivo","modal","carpetaPadre","volverRepo","unsaved"],
+  "resultado_en_cada_paso": {"xss": null, "img_inyectadas": 0, "texto_hostil_visible_como_texto": true},
+  "cambios_sin_guardar": {"antes": "CAMBIO SIN GUARDAR", "editor_visible_tras_cambiar_de_carpeta": false, "contenido_al_volver": "original\n", "dialogos": []},
+  "errores_de_pagina": []
+}

@@ -84,6 +84,7 @@ Prioridad igual que el modelo: **tarea** (`esfuerzo` en `POST /tasks`, `forja ru
 
 El esfuerzo efectivo queda en `RunRecord.effort` y `GET /api/agents` devuelve por agente `effort`, `effort_levels` (lista vacía = no soporta) y `model_editable`.
 - **Terminales**: vista con 1–4 paneles que muestran en vivo la salida de varias ejecuciones a la vez (stderr en rojo, autoscroll que se pausa si subes, cancelar/limpiar/cerrar). Las tareas nuevas se abren solas en un panel libre.
+- **Reintentar**: el detalle de una ejecución terminada, fallida o cancelada tiene el botón «Reintentar», que lanza una nueva con el mismo título, prompt, privacidad, agente, modelo y esfuerzo (se vuelve a validar la política). Si el prompt se guardó con secretos redactados no se puede relanzar: el panel ofrece abrir «Nueva tarea» con el resto de campos rellenos.
 - **Revisión del worktree**: al abrir una ejecución terminada, el detalle muestra el diff de su rama `forja/...` contra la rama base (`--stat` y parche, incluidos los archivos sin seguimiento). «Fusionar en la base» exige el repositorio base limpio y en su rama, commitea antes cualquier cambio pendiente del worktree, fusiona con commit de fusión, retira el worktree y borra la rama ya fusionada; «Descartar y limpiar» elimina el worktree con sus cambios sin commitear y borra la rama con sus commits. Ambas piden confirmación y muestran el error del servidor (conflicto de merge, árbol sucio, worktree ya cerrado…) sin tocar nada más.
 
 ### Configuración inicial (`forja init`)
@@ -225,3 +226,13 @@ cargo run -p forja-cli -- --repo /ruta/al/repo --base-branch main \
 
 - `open`: permite todos los agentes: `agy`, `mock`, `claude`, `opencode`, `hermes` y `local` (cada uno requiere su CLI instalado; `forja doctor` te dice cuáles tienes).
 - `sensitive`: por defecto solo permite `claude` (valor estricto). Es configurable mediante `sensitive_agents` en `<store_dir>/settings.json`, `PUT /api/settings` o la pestaña **Ajustes** del panel (por ejemplo, añadiendo `local`); se aplica en caliente en el servidor y `forja run` lo lee al arrancar. Cualquier intento de ejecutar un agente fuera de esa lista con privacidad `sensitive` se rechaza con `ForjaError::PolicyDenied` antes de crear worktrees o iniciar procesos.
+
+### Carpetas, archivos y ajustes protegidos
+
+- **No se pueden abrir como carpeta de trabajo** (se evalúa la ruta real, con los symlinks resueltos): `/`, tu `$HOME` y cualquier carpeta que lo contenga, las carpetas ocultas dentro de `$HOME` (`.ssh`, `.config`…), `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/root`, `/run` (incluye discos montados en `/run/media`), cualquier directorio git (`.git` o el real de un worktree o `--separate-git-dir`) y las carpetas `.forja`. La excepción es el repositorio con el que arrancó el servidor (`--repo`). Si el servidor arranca sin repositorio en una de esas carpetas, el editor no la sirve hasta que elijas otra.
+- **El editor no escribe** en directorios git ni en `.forja`, el store (`--store-dir`) o `settings.json`. `PUT /api/files/write` exige el campo `workspace` que devuelve la lectura y responde `409` si la carpeta activa cambió; los permisos del archivo se conservan.
+- **Ajustes con ejecuciones activas**: mientras haya alguna ejecución pendiente o en curso no se pueden cambiar `sensitive_agents`, `quota_path` ni `orchestrator_agent` (`409`); guardar sin modificarlos sigue permitido. Es una protección parcial: un agente corre con tu usuario y puede editar archivos directamente o llamar a la API cuando no quede nada activo.
+- `PUT /api/settings` conserva los campos que omitas. Si `settings.json` está corrupto, Forja arranca con los valores por defecto (sin perfiles ocultos salvo `FORJA_HIDDEN_PROFILES`), lo avisa en el log y en Ajustes, y guarda una copia `settings.json.corrupt` antes de sobrescribirlo.
+- `PUT /api/quota` no sobrescribe un archivo existente que no sea un documento de cuota.
+- La búsqueda de archivos se corta a los 2 s, 50.000 entradas o 60 resultados y lo indica como resultado truncado.
+

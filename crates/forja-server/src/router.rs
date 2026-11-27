@@ -9,7 +9,7 @@ use crate::api;
 use crate::files;
 use crate::handlers::{
     cancel_run, create_task, events_handler, get_run, list_runs, mascot_handler, panel_handler,
-    run_output, run_stream, ErrorBody,
+    retry_run, run_output, run_stream, ErrorBody,
 };
 use crate::orchestrator;
 use crate::review;
@@ -31,6 +31,7 @@ pub(crate) fn build_router_for_port(state: AppState, port: u16) -> Router {
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/runs/{id}/retry", post(retry_run))
         .route("/runs/{id}/output", get(run_output))
         .route("/runs/{id}/stream", get(run_stream))
         .route("/runs/{id}/diff", get(review::get_diff))

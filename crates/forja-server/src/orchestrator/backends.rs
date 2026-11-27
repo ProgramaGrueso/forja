@@ -228,14 +228,18 @@ impl ChatBackend for HermesBackend {
             };
             let wanted = self.profile().unwrap_or_default();
             let profile = self.rules.validate(&wanted).map_err(|e| e.to_string())?;
-            let dir = std::env::temp_dir();
+            let dir = private_orchestrator_dir()?;
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let file = dir.join(format!("forja-orq-{}-{nanos}.txt", std::process::id()));
-            std::fs::write(&file, &prompt)
-                .map_err(|e| format!("no se pudo escribir la consulta: {e}"))?;
+            // 0600 y create_new: la consulta (mensajes del usuario) no la lee nadie más.
+            if let Err(e) = forja_agent::hermes::write_private_file(&file, prompt.as_bytes()).await
+            {
+                let _ = std::fs::remove_file(&file);
+                return Err(format!("no se pudo escribir la consulta: {e}"));
+            }
             let mut argv = build_argv_with(
                 &profile,
                 &file,
@@ -397,9 +401,7 @@ impl ChatBackend for CliBackend {
         Box::pin(async move {
             let agent = self.make_agent_with(&opts)?;
             // Directorio propio: el agente trabaja ahí, no en el repo ni en /tmp suelto.
-            let dir = std::env::temp_dir().join("forja-orquestador");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("no se pudo crear {}: {e}", dir.display()))?;
+            let dir = private_orchestrator_dir()?;
             let ctx = RunContext {
                 task: Task::new("orquestador", prompt, Privacy::Open),
                 worktree: dir,
@@ -530,4 +532,56 @@ impl BackendFactory {
             None => b,
         })
     }
+}
+
+/// Carpeta temporal propia del orquestador: `TMPDIR/forja-orquestador-<uid>`,
+/// creada con permisos 0700. Si ya existe debe ser un directorio real (no un
+/// enlace), de este usuario y sin permisos para grupo ni otros; si no, error:
+/// otro usuario podría haberla preparado para leer o cambiar lo que se escribe.
+pub(crate) fn private_orchestrator_dir() -> Result<std::path::PathBuf, String> {
+    let name = match forja_agent::process::current_uid() {
+        Some(uid) => format!("forja-orquestador-{uid}"),
+        None => "forja-orquestador".to_string(),
+    };
+    let dir = std::env::temp_dir().join(name);
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let shown = dir.display();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("no se pudo crear {shown}: {e}")),
+    }
+    let meta =
+        std::fs::symlink_metadata(dir).map_err(|e| format!("no se pudo comprobar {shown}: {e}"))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "{shown} existe y no es un directorio propio (¿enlace?); bórralo o revisa TMPDIR"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if Some(meta.uid()) != forja_agent::process::current_uid() {
+            return Err(format!(
+                "{shown} pertenece a otro usuario; no se usa. Revisa TMPDIR"
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{shown} tiene permisos para otros usuarios ({:o}); ejecuta `chmod 700 {shown}`",
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    Ok(())
 }

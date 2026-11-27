@@ -38,7 +38,7 @@ pub fn build_command(opts: &AgyCommandOptions) -> Vec<String> {
     let mut argv = vec![
         "agy".to_string(),
         "-p".to_string(),
-        opts.prompt.clone(),
+        crate::positional_prompt(&opts.prompt),
         "--model".to_string(),
         opts.model.clone(),
         "--mode".to_string(),

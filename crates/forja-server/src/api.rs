@@ -390,22 +390,88 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "version": VERSION }))
 }
 
-pub async fn get_settings(State(state): State<AppState>) -> Json<Settings> {
+#[derive(Debug, Serialize)]
+pub struct SettingsView {
+    #[serde(flatten)]
+    pub settings: Settings,
+    /// Aviso sobre un `settings.json` que no se pudo cargar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+pub async fn get_settings(State(state): State<AppState>) -> Json<SettingsView> {
     let settings = state
         .settings
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(settings)
+    let warning = state.settings_warning();
+    Json(SettingsView { settings, warning })
+}
+
+/// Los campos presentes en `patch` sustituyen a los actuales; el resto se
+/// conserva (un `null` explícito vacía un campo opcional).
+fn merge_settings(
+    current: &Settings,
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Result<Settings> {
+    let mut merged = serde_json::to_value(current)?;
+    if let Some(object) = merged.as_object_mut() {
+        object.extend(patch);
+    }
+    serde_json::from_value(merged)
+}
+
+/// Campos que amplían lo que puede hacer un agente y que `next` cambia.
+fn guarded_changes(
+    live_sensitive: &[AgentKind],
+    current: &Settings,
+    next: &Settings,
+) -> Vec<&'static str> {
+    let same = |a: &[AgentKind], b: &[AgentKind]| {
+        a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+    };
+    let mut changed = Vec::new();
+    if !same(&current.sensitive_agents, &next.sensitive_agents)
+        || !same(live_sensitive, &next.sensitive_agents)
+    {
+        changed.push("sensitive_agents");
+    }
+    if current.quota_path != next.quota_path {
+        changed.push("quota_path");
+    }
+    if current.orchestrator_agent != next.orchestrator_agent {
+        changed.push("orchestrator_agent");
+    }
+    changed
 }
 
 pub async fn put_settings(
     State(state): State<AppState>,
-    body: Result<Json<Settings>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(mut next) = match body {
-        Ok(json) => json,
+    let patch = match body {
+        Ok(Json(serde_json::Value::Object(patch))) => patch,
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "se esperaba un objeto JSON con los ajustes",
+            )
+        }
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.body_text()),
+    };
+    // Un guardado cada vez: leer, fusionar y aplicar sin pisarse.
+    let _saving = state.settings_lock.lock().await;
+    let previous = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut next = match merge_settings(&previous, patch) {
+        Ok(next) => next,
+        Err(err) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("ajustes inválidos: {err}"))
+        }
     };
     next.normalize();
     if let Err(msg) = next.validate() {
@@ -415,11 +481,27 @@ pub async fn put_settings(
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
 
-    let previous = state
-        .settings
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let mut current = previous.clone();
+    current.normalize();
+    let guarded = guarded_changes(&state.scheduler.sensitive_agents(), &current, &next);
+    // El guard impide altas de ejecuciones hasta que el cambio quede aplicado.
+    let _idle = if guarded.is_empty() {
+        None
+    } else {
+        match state.scheduler.idle_guard().await {
+            Some(guard) => Some(guard),
+            None => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "hay ejecuciones activas: no se puede cambiar {} hasta que terminen \
+                         o las canceles",
+                        guarded.join(", ")
+                    ),
+                )
+            }
+        }
+    };
     let restart_required = next.restart_required(&previous);
 
     let persisted = match &state.settings_path {
@@ -427,7 +509,15 @@ pub async fn put_settings(
             let path = path.clone();
             let to_save = next.clone();
             match tokio::task::spawn_blocking(move || save_settings(&path, &to_save)).await {
-                Ok(Ok(())) => true,
+                Ok(Ok(backup)) => {
+                    if let Some(copy) = backup {
+                        state.set_settings_warning(format!(
+                            "settings.json estaba corrupto: se copió a {} antes de sobrescribirlo",
+                            copy.display()
+                        ));
+                    }
+                    true
+                }
                 Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, msg),
                 Err(err) => {
                     return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -574,6 +664,9 @@ mod tests {
             error: (status == RunStatus::Failed).then(|| "fallo".to_string()),
             created_at_ms: created,
             updated_at_ms: updated,
+            repo: None,
+            owner: None,
+            prompt_redacted: false,
         }
     }
 

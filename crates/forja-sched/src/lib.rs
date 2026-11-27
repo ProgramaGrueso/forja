@@ -15,7 +15,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use forja_agent::Agent;
-use forja_core::{AgentKind, ForjaError, Result, RunRecord, RunStatus, Task};
+use forja_core::limits::{
+    clip_middle, MAX_PROMPT_BYTES, MAX_STORED_ERROR_BYTES, MAX_STORED_OUTPUT_BYTES,
+};
+use forja_core::{redact_secrets, AgentKind, ForjaError, Result, RunRecord, RunStatus, Task};
 use forja_store::JsonlStore;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -43,6 +46,49 @@ pub(crate) struct SchedulerInner {
     pub(crate) outputs: OutputBuffers,
     out_max_chunks: AtomicUsize,
     out_max_bytes: AtomicUsize,
+    /// Identidad (`pid:arranque`) de este proceso: dueño de las ejecuciones que lanza.
+    pub(crate) identity: String,
+}
+
+/// Error guardado en las ejecuciones que quedaron a medias porque el proceso de
+/// Forja que las lanzó ya no existe (cierre abrupto, SIGKILL, apagón).
+pub const INTERRUPTED_ERROR: &str =
+    "interrumpida: el proceso de Forja que la ejecutaba terminó antes de que acabara";
+
+/// Redacta secretos y recorta una salida antes de guardarla o mostrarla.
+pub(crate) fn sanitize_text(text: &str, max_bytes: usize) -> String {
+    clip_middle(&redact_secrets(text), max_bytes)
+}
+
+/// Deja un registro listo para memoria/disco: título y prompt sin secretos
+/// (marcando `prompt_redacted` si cambió algo) y salida/error redactados y acotados.
+pub(crate) fn sanitize_record(record: &mut RunRecord) {
+    let titulo = redact_secrets(&record.task.titulo);
+    let prompt = redact_secrets(&record.task.prompt);
+    if titulo != record.task.titulo || prompt != record.task.prompt {
+        record.prompt_redacted = true;
+        record.task.titulo = titulo;
+        record.task.prompt = prompt;
+    }
+    if let Some(out) = record.output.as_mut() {
+        *out = sanitize_text(out, MAX_STORED_OUTPUT_BYTES);
+    }
+    if let Some(err) = record.error.as_mut() {
+        *err = sanitize_text(err, MAX_STORED_ERROR_BYTES);
+    }
+}
+
+fn is_active(status: RunStatus) -> bool {
+    matches!(status, RunStatus::Pending | RunStatus::Running)
+}
+
+/// `true` si el run activo pertenece a otro proceso de Forja que sigue vivo
+/// (p. ej. un `forja run` que comparte el store con el servidor).
+fn owned_by_live_foreign(record: &RunRecord, me: &str) -> bool {
+    record
+        .owner
+        .as_deref()
+        .is_some_and(|owner| owner != me && forja_agent::process::identity_alive(owner))
 }
 
 fn validate_sensitive_agents(agents: &[AgentKind]) -> Result<()> {
@@ -63,13 +109,18 @@ fn validate_sensitive_agents(agents: &[AgentKind]) -> Result<()> {
     Ok(())
 }
 
+/// Mientras viva no entran ejecuciones nuevas (ver [`Scheduler::idle_guard`]).
+pub struct IdleGuard<'a> {
+    _runs: tokio::sync::RwLockReadGuard<'a, HashMap<String, RunRecord>>,
+}
+
 #[derive(Clone)]
 pub struct Scheduler {
     inner: Arc<SchedulerInner>,
 }
 
 impl Scheduler {
-    pub fn new(store: JsonlStore, config: SchedulerConfig) -> Result<Self> {
+    pub fn new(store: JsonlStore, mut config: SchedulerConfig) -> Result<Self> {
         if config.max_concurrency == 0 {
             return Err(ForjaError::InvalidInput(
                 "max_concurrency debe ser al menos 1".to_string(),
@@ -77,9 +128,24 @@ impl Scheduler {
         }
         validate_sensitive_agents(&config.sensitive_agents)?;
 
+        // Rutas absolutas: el cwd del proceso no debe cambiar dónde viven los worktrees.
+        if config.worktrees_dir.is_relative() {
+            config.worktrees_dir = std::path::absolute(&config.worktrees_dir)?;
+        }
+
+        let identity = forja_agent::process::current_process_identity();
         let existing_runs = store.list_runs()?;
         let mut runs_map = HashMap::with_capacity(existing_runs.len());
-        for record in existing_runs {
+        for mut record in existing_runs {
+            // Registros antiguos pudieron guardarse con secretos: no exponerlos.
+            sanitize_record(&mut record);
+            // Reconciliación: un run activo cuyo dueño ya no vive no avanzará nunca.
+            if is_active(record.status) && !owned_by_live_foreign(&record, &identity) {
+                record.status = RunStatus::Failed;
+                record.error = Some(INTERRUPTED_ERROR.to_string());
+                record.updated_at_ms = now_ms();
+                store.append_run(&record)?;
+            }
             runs_map.insert(record.id.clone(), record);
         }
 
@@ -105,6 +171,7 @@ impl Scheduler {
                 outputs: OutputBuffers::default(),
                 out_max_chunks: AtomicUsize::new(MAX_CHUNKS),
                 out_max_bytes: AtomicUsize::new(MAX_BYTES),
+                identity,
             }),
         })
     }
@@ -133,9 +200,28 @@ impl Scheduler {
 
     /// Indica si existe alguna ejecución pendiente o en curso.
     pub async fn has_active_runs(&self) -> bool {
+        self.idle_guard().await.is_none()
+    }
+
+    /// Si no hay ejecuciones activas (propias o de otro proceso vivo sobre el
+    /// mismo store), devuelve un guard que impide dar de alta nuevas mientras
+    /// exista. Sirve para cambios que no deben ocurrir con agentes en marcha.
+    pub async fn idle_guard(&self) -> Option<IdleGuard<'_>> {
+        self.refresh_foreign_runs().await;
+        let external = {
+            let _store_guard = self.inner.store_lock.lock().await;
+            self.inner
+                .store
+                .list_runs()
+                .unwrap_or_default()
+                .iter()
+                .any(|r| is_active(r.status) && owned_by_live_foreign(r, &self.inner.identity))
+        };
         let runs = self.inner.runs.read().await;
-        runs.values()
-            .any(|r| matches!(r.status, RunStatus::Pending | RunStatus::Running))
+        if external || runs.values().any(|r| is_active(r.status)) {
+            return None;
+        }
+        Some(IdleGuard { _runs: runs })
     }
 
     /// Actualiza el repositorio git y la rama base activos si no hay ejecuciones activas.
@@ -144,15 +230,11 @@ impl Scheduler {
         repo_path: Option<PathBuf>,
         base_branch: String,
     ) -> Result<()> {
-        let runs = self.inner.runs.read().await;
-        if runs
-            .values()
-            .any(|r| matches!(r.status, RunStatus::Pending | RunStatus::Running))
-        {
+        let Some(_idle) = self.idle_guard().await else {
             return Err(ForjaError::InvalidInput(
                 "no se puede cambiar de carpeta mientras hay ejecuciones activas".to_string(),
             ));
-        }
+        };
         *self
             .inner
             .repo_path
@@ -262,6 +344,17 @@ impl Scheduler {
     }
 
     pub async fn submit(&self, task: Task, agent: Arc<dyn Agent>) -> Result<RunRecord> {
+        if task.prompt.len() > MAX_PROMPT_BYTES {
+            return Err(ForjaError::InvalidInput(format!(
+                "el prompt ocupa {} KiB y el máximo es {} KiB; resúmelo o pásale al agente \
+                 un archivo del repo con el detalle",
+                task.prompt.len().div_ceil(1024),
+                MAX_PROMPT_BYTES / 1024
+            )));
+        }
+        if let Some(reason) = agent.privacy_violation(task.privacidad) {
+            return Err(ForjaError::InvalidInput(reason));
+        }
         {
             let allowed = self
                 .inner
@@ -273,9 +366,9 @@ impl Scheduler {
 
         let now = now_ms();
         let run_id = Uuid::new_v4().to_string();
-        let record = RunRecord {
+        let mut record = RunRecord {
             id: run_id.clone(),
-            task,
+            task: task.clone(),
             agent: agent.kind(),
             status: RunStatus::Pending,
             branch: None,
@@ -287,12 +380,19 @@ impl Scheduler {
             error: None,
             created_at_ms: now,
             updated_at_ms: now,
+            repo: None,
+            owner: Some(self.inner.identity.clone()),
+            prompt_redacted: false,
         };
+        // Lo que se guarda y se muestra va sin secretos; el agente recibe la tarea original.
+        sanitize_record(&mut record);
 
         {
             let _store_guard = self.inner.store_lock.lock().await;
-            self.inner.store.append_run(&record)?;
             let mut runs = self.inner.runs.write().await;
+            // La política pudo cambiar mientras se esperaba el lock.
+            forja_core::check_policy_with(task.privacidad, agent.kind(), &self.sensitive_agents())?;
+            self.inner.store.append_run(&record)?;
             runs.insert(run_id.clone(), record.clone());
             self.inner.outputs.register(
                 &run_id,
@@ -309,7 +409,7 @@ impl Scheduler {
 
         let mut handles = self.inner.handles.lock().await;
         let handle = tokio::spawn(async move {
-            run_task(inner, task_run_id, agent).await;
+            run_task(inner, task_run_id, task, agent).await;
         });
         handles.insert(run_id, handle);
 
@@ -350,6 +450,7 @@ impl Scheduler {
     }
 
     pub async fn list_runs(&self) -> Vec<RunRecord> {
+        self.refresh_foreign_runs().await;
         let runs = self.inner.runs.read().await;
         let mut list: Vec<RunRecord> = runs.values().cloned().collect();
         list.sort_by(|a, b| {
@@ -361,6 +462,7 @@ impl Scheduler {
     }
 
     pub async fn get_run(&self, run_id: &str) -> Option<RunRecord> {
+        self.refresh_foreign_runs().await;
         let runs = self.inner.runs.read().await;
         runs.get(run_id).cloned()
     }
@@ -399,6 +501,98 @@ impl Scheduler {
         } else {
             Err(ForjaError::NotFound(run_id.to_string()))
         }
+    }
+
+    /// Apagado ordenado: aborta las ejecuciones de este proceso (al soltarse, el
+    /// runner mata el grupo de procesos de cada agente) y las marca `cancelled`
+    /// con `reason` en el error. No toca runs de otros procesos vivos.
+    pub async fn shutdown(&self, reason: &str) {
+        let pending: Vec<JoinHandle<()>> = {
+            let mut handles = self.inner.handles.lock().await;
+            handles.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in &pending {
+            handle.abort();
+        }
+        for handle in pending {
+            let _ = handle.await;
+        }
+
+        let _store_guard = self.inner.store_lock.lock().await;
+        let mut runs = self.inner.runs.write().await;
+        for record in runs.values_mut() {
+            if !is_active(record.status) || owned_by_live_foreign(record, &self.inner.identity) {
+                continue;
+            }
+            record.status = RunStatus::Cancelled;
+            record.error = Some(reason.to_string());
+            record.updated_at_ms = now_ms();
+            let _ = self.inner.store.append_run(record);
+            let _ = self.inner.events.send(record.clone());
+            if let Some(out) = self.inner.outputs.get(&record.id) {
+                out.finish();
+            }
+        }
+    }
+
+    /// Runs activos de otro proceso (visto al arrancar): si ese proceso terminó,
+    /// toma el estado final del store; si lo dejó a medias, lo marca fallido.
+    async fn refresh_foreign_runs(&self) {
+        let me = &self.inner.identity;
+        let stale: Vec<String> = {
+            let runs = self.inner.runs.read().await;
+            runs.values()
+                .filter(|r| {
+                    is_active(r.status)
+                        && r.owner.as_deref().is_some_and(|o| o != me)
+                        && !owned_by_live_foreign(r, me)
+                })
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let _store_guard = self.inner.store_lock.lock().await;
+        let latest: HashMap<String, RunRecord> = self
+            .inner
+            .store
+            .list_runs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| stale.contains(&r.id))
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        let mut runs = self.inner.runs.write().await;
+        for id in stale {
+            let Some(record) = runs.get_mut(&id) else {
+                continue;
+            };
+            if let Some(mut stored) = latest.get(&id).cloned() {
+                sanitize_record(&mut stored);
+                *record = stored;
+            }
+            if is_active(record.status) {
+                record.status = RunStatus::Failed;
+                record.error = Some(INTERRUPTED_ERROR.to_string());
+                record.updated_at_ms = now_ms();
+                let _ = self.inner.store.append_run(record);
+            }
+            let _ = self.inner.events.send(record.clone());
+        }
+    }
+
+    /// Oculta a git las carpetas internas de Forja que vivan dentro de `repo`
+    /// (worktrees y store) añadiéndolas a `.git/info/exclude`, sin tocar archivos
+    /// versionados. Sirve para repos sin `.forja/` en su `.gitignore`.
+    pub fn exclude_internal_dirs(&self, repo: &std::path::Path) -> Result<()> {
+        worktree::exclude_internal_dirs(
+            repo,
+            &[
+                self.inner.config.worktrees_dir.as_path(),
+                self.inner.store.dir(),
+            ],
+        )
     }
 }
 

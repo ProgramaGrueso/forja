@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use forja_core::{default_sensitive_agents, AgentKind};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -242,15 +243,76 @@ pub fn load_settings(path: &Path) -> Result<Option<Settings>, String> {
     Ok(Some(settings))
 }
 
-pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), String> {
+/// Como [`load_settings`], pero un archivo ilegible o inválido no pasa en
+/// silencio: guarda una copia y devuelve el aviso (se usan los defaults).
+pub fn load_settings_or_warn(path: &Path) -> (Option<Settings>, Option<String>) {
+    match load_settings(path) {
+        Ok(settings) => (settings, None),
+        Err(err) => {
+            let copy = match backup_corrupt(path) {
+                Ok(copy) => format!("copia del original en {}", copy.display()),
+                Err(why) => format!("no se pudo copiar el original: {why}"),
+            };
+            let warning = format!(
+                "no se pudieron cargar los ajustes de settings.json ({err}). Se usan los \
+                 valores por defecto (revisa perfiles ocultos y agentes sensibles); {copy}"
+            );
+            (None, Some(warning))
+        }
+    }
+}
+
+/// Copia un `settings.json` corrupto a `<nombre>.corrupt[.N]` sin pisar copias
+/// distintas. Si ya hay una copia idéntica, la reutiliza.
+fn backup_corrupt(path: &Path) -> Result<PathBuf, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let permissions = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    let name = path
+        .file_name()
+        .ok_or_else(|| "ruta sin nombre de archivo".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    for n in 0..1000 {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!(".{n}")
+        };
+        let copy = path.with_file_name(format!("{name}.corrupt{suffix}"));
+        match fs::read(&copy) {
+            Ok(existing) if existing == bytes => return Ok(copy),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::copy(path, &copy).map_err(|e| e.to_string())?;
+                fs::set_permissions(&copy, permissions).map_err(|e| e.to_string())?;
+                return Ok(copy);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("demasiadas copias .corrupt".to_string())
+}
+
+/// Guarda los ajustes. Si lo que había era un archivo corrupto, antes lo copia
+/// y devuelve la ruta de la copia.
+pub fn save_settings(path: &Path, settings: &Settings) -> Result<Option<PathBuf>, String> {
+    let backup =
+        if path.is_file() && load_settings(path).is_err() {
+            Some(backup_corrupt(path).map_err(|e| {
+                format!("no se sobrescribe un settings.json corrupto sin copia: {e}")
+            })?)
+        } else {
+            None
+        };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .map_err(|err| format!("no se pudo crear {}: {err}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(settings)
         .map_err(|err| format!("no se pudo serializar ajustes: {err}"))?;
     std::fs::write(path, json)
-        .map_err(|err| format!("no se pudo escribir {}: {err}", path.display()))
+        .map_err(|err| format!("no se pudo escribir {}: {err}", path.display()))?;
+    Ok(backup)
 }
 
 /// Cambios que `forja init` aplica sobre `settings.json` sin tocar el resto.
@@ -372,7 +434,7 @@ pub fn apply_patch(
         }
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .map_err(|err| format!("no se pudo crear {}: {err}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(&root)

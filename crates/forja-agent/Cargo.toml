@@ -10,5 +10,8 @@ serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "fs", "io-util"] }
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

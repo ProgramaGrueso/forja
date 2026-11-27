@@ -1,0 +1,176 @@
+# 2026-11-26T23:54:30-05:00 · python3 ataques.py (binario corregido, HEAD 9665946 + cambios sin commit)
+binario: /home/juang/projects/Forja/target/debug/forja
+
+== t01_defensas_http
+  Host evil (rebinding): HTTP 403
+  Origin evil: HTTP 403
+  Origin null: HTTP 403
+  Sec-Fetch-Site cross-site: HTTP 403
+  POST text/plain: HTTP 415
+  traversal ..: HTTP 400
+  traversal %2e%2e: HTTP 400
+  ruta absoluta: HTTP 400
+  symlink a /etc: HTTP 400
+  run_id traversal: HTTP 404
+  cuerpo 300 KiB: HTTP 413
+  prompt 200 KiB (aceptado por el límite): HTTP 400 estado=None error=entrada inválida: el prompt ocupa 196 KiB y el máximo es 100 KiB; resúmelo o pásale al agente un archivo del repo con el detalle
+  con token, sin credencial /api/settings: HTTP 401
+  con token, sin credencial /runs: HTTP 401
+  con token, sin credencial /api/files/tree: HTTP 401
+  con token, /api/health: HTTP 200
+
+== t02_escape_workspace
+  select fuera del repo ($HOME): 400
+  leer .ssh/id_rsa: [404, {"error": "recurso no encontrado: ruta no encontrada: .ssh/id_rsa"}]
+  escribir .bashrc: [200, {"ok": true, "path": ".bashrc", "size": 18}]
+  .bashrc en disco: # original
+
+  la escritura quedó dentro del repo: true
+  select '/': 400
+  leer por ruta desde '/': [404, {"error": "recurso no encontrado: ruta no encontrada: tmp/tmp.Br1UMBmkpF/forja-adv-iic4iz9r/t02/home/.ssh/id_rsa"}]
+
+== t03_escritura_en_git
+  directo .git/config (control): [400, {"error": "entrada inválida: no se permite escribir dentro de .git (ni en el directorio git real del repositorio)"}]
+  vía symlink g -> .git: [400, {"error": "entrada inválida: no se permite escribir dentro de .git (ni en el directorio git real del repositorio)"}]
+  tras `git status`, comando del atacante ejecutado: false
+  select <repo>/.git: 400
+  escribir 'config' con workspace=.git: [200, {"ok": true, "path": "config", "size": 222}]
+  .git/config intacto: true
+  'config' quedó en la raíz del repo (workspace sin cambiar): true
+
+== t04_permisos_al_guardar
+  secreto.env: antes 0o600 -> después 0o600
+  script.sh: antes 0o755 -> después 0o755
+
+== t05_privacidad_local_nube
+  sensitive_agents += local (lo sugiere el README): 200
+  tarea sensitive con agente local: HTTP 400 estado=None
+  argv ejecutado: []
+
+== t06_agente_cambia_politica
+  opencode sensitive antes: 403
+  tarea open (agy) que llama a la API: failed
+  política después: ["claude"]
+  opencode sensitive después: 403
+
+== t07_fuga_sensitive_al_orquestador
+  orquestador=opencode (NO permitido para sensitive): 200
+  chat: 200
+  opencode recibió la salida sensitive: false
+
+== t08_accion_dentro_de_bloque_citado
+  tareas creadas: []
+
+== t09_prompt_como_flag
+  opencode: prompt '--version' aceptado: HTTP 201 argv=['run', '--model', 'opencode-go/deepseek-v4.1-flash', '--auto', '--title', 'forja', ' --version']
+  claude: prompt '--version' aceptado: HTTP 201 argv=['-p', ' --version', '--model', 'sonnet', '--output-format', 'json', '--permission-mode', 'acceptEdits']
+  opencode REAL con el mismo argv: exit=0 stdout='opencode v2.4.2' stderr=''
+  claude REAL con el mismo argv: exit=0 stdout='2.1.332 (Claude Code)' stderr=''
+
+== t10_repo_distinto_del_cwd
+  serve --repo desde otra carpeta, tarea: estado=done error=None
+  worktrees registrados por git: $LAB/t10/repo                                                       7363c2c [main]
+$LAB/t10/repo/.forja/worktrees/0b69dee4-d01a-4ba8-aec9-062e91300b42 7761554 [forja/0b69dee4-d01a-4ba8-aec9-062e91300b42]
+
+== t11_repo_sin_gitignore
+  tarea: done
+  git status del repo del usuario: 
+  fusionar desde el panel: [200, {"branch": "forja/869c6143-a40a-412f-bed4-8fd237552c5d", "base": "main", "merged": true, "commit": "1c41c37", "already_up_to_date": false, "worktree_removed": true, "branch_deleted": true}]
+
+== t12_head_suelto_pierde_trabajo
+  tarea: done
+  diff mostrado al usuario (stat):  trabajo_importante.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+  fusionar: [409, {"error": "conflicto: el worktree tiene HEAD suelto (detached): sus commits no están en la rama 'forja/df03d14a-2ff4-473e-85fc-05fbb1f6f3ae' y fusionar los perdería. No se borró nada. Revisa con `git -C $LAB/t12/repo/.forja/worktrees/df03d14a-2ff4-473e-85fc-05fbb1f6f3ae log --oneline --graph --all` y, si HEAD tiene el trabajo bueno, `git -C /tmp/tmp.Br1UMBmkpF/forja-adv-iic4iz9
+  ¿archivo en main?: false
+  ramas: forja/df03d14a-2ff4-473e-85fc-05fbb1f6f3ae
+* main
+  commits huérfanos: 
+
+== t13_cambio_de_workspace_y_revision
+  cambiar a repo B: 200
+  merge de la tarea del repo A: [409, {"error": "conflicto: esta ejecución pertenece al repositorio '$LAB/t13/repo' y la carpeta activa es '$LAB/t13/repoB'; vuelve a esa carpeta para fusionarla o descartarla"}]
+  discard de la tarea del repo A: [409, {"error": "conflicto: esta ejecución pertenece al repositorio '$LAB/t13/repo' y la carpeta activa es '$LAB/t13/repoB'; vuelve a esa carpeta para fusionarla o descartarla"}]
+  worktree de A sigue: true
+  rama en A sigue: + forja/627a18d6-2a97-45af-bb33-8a1db5eeac45
+
+== t14_editor_escribe_en_otro_workspace
+  cliente 1 abre README.md de A: lab
+
+  cliente 1 guarda (otra pestaña cambió a B): 409
+  README de B ahora: README de B
+
+
+== t15_cancelar_deja_nietos
+  cancelar: cancelled
+  proceso nieto siguió vivo y escribió tras cancelar: false
+  archivo tardío en el worktree: false
+
+== t16_apagado_y_reinicio
+  SIGTERM al servidor: agente huérfano sigue vivo: false
+  tras reiniciar, estado: cancelled
+  cambiar de workspace: [200, {"active": {"path": "$LAB/t16-SIGTERM/otra", "name": "otra", "is_git": false, "branch": null}, "recent": [{"path": "$LAB/t16-SIGTERM/otra", "name": "otra", "is_git": false, "branch": null}]}]
+  merge: 400
+  discard: 400
+  SIGINT al servidor: agente huérfano sigue vivo: false
+  tras reiniciar, estado: cancelled
+  cambiar de workspace: [200, {"active": {"path": "$LAB/t16-SIGINT/otra", "name": "otra", "is_git": false, "branch": null}, "recent": [{"path": "$LAB/t16-SIGINT/otra", "name": "otra", "is_git": false, "branch": null}]}]
+  merge: 400
+  discard: 400
+
+== t17_store_corrupto
+  línea truncada + tarea nueva + reinicio -> tareas: ["t", "posterior"]
+  un byte no UTF-8 en runs.jsonl: ¿arranca?: true
+
+== t18_escritura_concurrente_store
+  60 `forja run` simultáneos: procesos fallidos=0 líneas=219 corruptas=0
+
+== t19_ajustes
+  PUT parcial: hidden_profiles queda: ["privado"]
+  quota_path -> ~/.claude/settings.json: 200
+  PUT /api/quota: 400
+  archivo de la víctima ahora: {"permissions":{"deny":["Bash(rm:*)"]},"model":"mio"}
+  settings.json corrupto: ¿arranca?: true
+  hidden_profiles efectivos: []
+  aviso en log: ["aviso: no se pudieron cargar los ajustes de settings.json (ajustes inválidos en $LAB/t19/repo/.forja/store/settings.json: EOF while parsing a value at line 1 column 62). Se usan los valores por defecto (revisa perfiles ocultos y agentes sensibles); copia del original en $LAB/t19/repo/.forja/store/settings.json.corrupt"]
+
+== t20_secretos_y_salida_grande
+  GET /runs/{id}.output: clave: ***
+  GET /runs/{id}/output: ["{\"result\": \"clave: ***\"}\n"]
+  en runs.jsonl sin redactar: false
+  agente imprime 20 MB: tamaño de GET /runs: 0.3 MB
+  tamaño runs.jsonl: 0.3 MB
+
+== t21_tmp
+  archivo de consulta de Hermes: $LAB/t21/forja-orquestador-1000/forja-orq-593337-1795755295841176754.txt mode=0o600
+  cwd del orquestador one-shot: $LAB/t21/forja-orquestador-1000
+
+== t03b_rce_disparado_por_forja
+  escritura vía API: 400
+  antes del merge: false
+  merge vía API: 200
+  comando del atacante ejecutado por el servidor: false
+
+== t16b_cancelar_zombi
+  cancelar run zombi: failed
+  proceso original sigue vivo tras 'cancelar': true
+
+== t22_fuzz
+  peticiones / códigos: 1500 {'404': 239, '200': 234, '400': 741, '415': 146, '422': 100, 'UnicodeEncodeError': 3, '201': 37}
+  panics en el log: 0
+  sigue vivo: true
+
+== t23_skills_symlink
+  install --force sobre symlink: exit=0 de -> $LAB/t23/home/.claude/skills
+  spike                    omitir (es un enlace simbólico, no se toca)
+0 skills instaladas.
+  destino ajeno intacto: ajeno
+
+
+== t24_busqueda_sin_limite
+  respuesta: HTTP 200 en 0.0s
+  CPU del servidor en los 10 s POSTERIORES al abandono: 0.0 s de CPU
+
+laboratorio eliminado; servidores propios vivos: 0
+exit=0

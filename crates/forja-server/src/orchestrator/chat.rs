@@ -191,7 +191,13 @@ impl Orchestrator {
             }
         };
         let pending_block = match delegator {
-            Some(d) if delegating => delegation::render_pending(&pending, d).await,
+            Some(d) if delegating => {
+                let reveal = delegation::orchestrator_sees_sensitive(
+                    &backend.agent_name(),
+                    &d.sensitive_agents(),
+                );
+                delegation::render_pending(&pending, d, reveal).await
+            }
             _ => String::new(),
         };
         let _guard = InFlightGuard {

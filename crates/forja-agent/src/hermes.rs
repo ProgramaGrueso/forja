@@ -395,6 +395,19 @@ impl HermesAgent {
     }
 }
 
+/// Crea `path` (nuevo, nunca sigue un enlace existente) con permisos 0600 y
+/// escribe `bytes`: el prompt puede ser privado y `TMPDIR` suele ser compartido.
+pub async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(path).await?;
+    file.write_all(bytes).await?;
+    file.flush().await
+}
+
 /// Borra el archivo del prompt al soltar el guard. Se crea ANTES de escribir
 /// el archivo y cubre cualquier cancelación del futuro a mitad de la
 /// ejecución (`Scheduler::cancel_run`), incluida la propia escritura, en la
@@ -447,7 +460,8 @@ impl Agent for HermesAgent {
             // temporal al soltar el futuro, incluso a mitad de la escritura.
             let _guard = PromptFileGuard(prompt_path.clone());
 
-            if let Err(write_err) = tokio::fs::write(&prompt_path, ctx.task.prompt.as_bytes()).await
+            if let Err(write_err) =
+                write_private_file(&prompt_path, ctx.task.prompt.as_bytes()).await
             {
                 // El archivo puede haber quedado creado a medias: limpieza best-effort.
                 let _ = tokio::fs::remove_file(&prompt_path).await;

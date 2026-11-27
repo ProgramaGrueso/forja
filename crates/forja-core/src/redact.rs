@@ -23,8 +23,21 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
+/// UUID canónico (8-4-4-4-12 hexadecimales): ids de ejecución, no secretos.
+fn is_uuid(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
 fn looks_secret(tok: &str) -> bool {
     let len = tok.len();
+    if is_uuid(tok) {
+        return false;
+    }
     if len >= 8 && KEY_PREFIXES.iter().any(|p| tok.starts_with(p)) {
         return true;
     }
@@ -112,5 +125,7 @@ mod tests {
         let sha = "0d23bc8".to_string() + &"a".repeat(33);
         assert_eq!(redact_secrets(&sha), sha);
         assert_eq!(redact_secrets("línea ñ con acentos"), "línea ñ con acentos");
+        let run = "estado de 3f2a9c1e-7b4d-4e2a-9f10-0c1d2e3f4a5b listo";
+        assert_eq!(redact_secrets(run), run);
     }
 }
