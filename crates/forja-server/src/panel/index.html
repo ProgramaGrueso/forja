@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forja — Centro de Mando</title>
+  <style>
+{{CSS}}
+  </style>
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <!-- 1) BARRA LATERAL IZQUIERDA (colapsable) -->
+    <aside id="sidebar" class="sidebar" aria-label="Barra lateral de Forja">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="brand-crest" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L20 7V17L12 22L4 17V7L12 2Z" stroke="#8b5cf6" stroke-width="1.7"/>
+              <path d="M12 6L16.5 12L12 18L7.5 12L12 6Z" fill="#10b981"/>
+            </svg>
+          </div>
+          <span class="brand-title">Forja</span>
+        </div>
+        <button id="btn-collapse-sidebar" class="icon-btn desktop-collapse-btn" title="Colapsar o expandir barra lateral" aria-label="Colapsar barra lateral">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M15 18l-6-6 6-6"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="sidebar-tabs" role="tablist" aria-label="Modo de lista lateral">
+        <button id="side-tab-runs" class="sidebar-tab active" role="tab" aria-selected="true" data-side-tab="runs">EJECUCIONES</button>
+        <button id="side-tab-agents" class="sidebar-tab" role="tab" aria-selected="false" data-side-tab="agents">AGENTES</button>
+      </div>
+
+      <nav class="nav-list" aria-label="Vistas principales">
+        <button class="nav-item active" data-view="resumen">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>
+          <span class="nav-label">Resumen</span>
+        </button>
+        <button class="nav-item" data-view="orquestador">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+          <span class="nav-label">Orquestador</span>
+        </button>
+        <button class="nav-item" data-view="ejecuciones">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          <span class="nav-label">Ejecuciones</span>
+          <span id="nav-badge-runs" class="nav-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="terminales">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>
+          <span class="nav-label">Terminales</span>
+        </button>
+        <button class="nav-item" data-view="agentes">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 2l4 4-4 4-4-4 4-4zM4 14l4-4 4 4-4 4-4-4zm12 0l4-4 4 4-4 4-4-4z"/></svg>
+          <span class="nav-label">Agentes</span>
+        </button>
+        <button class="nav-item" data-view="telemetria">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+          <span class="nav-label">Telemetría</span>
+        </button>
+        <button class="nav-item" data-view="cuotas">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+          <span class="nav-label">Cuotas</span>
+        </button>
+        <button class="nav-item" data-view="ajustes">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          <span class="nav-label">Ajustes</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-lists">
+        <section id="side-agents-section">
+          <div class="side-section-header">
+            <span>AGENTES</span>
+            <span id="side-agents-count" class="mono">6</span>
+          </div>
+          <div id="sidebar-agents-list">
+            <div class="provider-group-label">Anthropic</div>
+            <div class="side-agent-row"><span class="dot unconfigured"></span><div class="side-row-main"><div class="side-row-title">claude</div><div class="side-row-sub">sin configurar</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">Gemini</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">agy</div><div class="side-row-sub">gemini-4-neon-medium</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">Hermes</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">hermes</div><div class="side-row-sub">default</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">Local</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">local</div><div class="side-row-sub">moe</div></div><span class="side-counter">0</span></div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">mock</div><div class="side-row-sub">mock</div></div><span class="side-counter">0</span></div>
+            <div class="provider-group-label">OpenCode</div>
+            <div class="side-agent-row"><span class="dot idle"></span><div class="side-row-main"><div class="side-row-title">opencode</div><div class="side-row-sub">opencode-go/deepseek-v4.1-flash</div></div><span class="side-counter">0</span></div>
+          </div>
+        </section>
+
+        <section id="side-runs-section">
+          <div class="side-section-header">
+            <span>EJECUCIONES RECIENTES</span>
+            <span id="side-runs-count" class="mono">0</span>
+          </div>
+          <div id="sidebar-runs-list">
+            <div class="muted" style="font-size:11.5px;padding:4px 2px;">Sin ejecuciones todavía</div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 3) MASCOTA: imágenes Krea2 servidas por /mascot/*.webp y animadas con CSS -->
+      <div id="mascot-dock" class="mascot-dock">
+        <button id="mascot-btn" class="mascot-btn" data-mood="idle" title="Haz clic para ver el estado actual de Forja" aria-label="Mascota de Forja">
+          <div id="forja-mascot" class="mascot-stage" role="img" aria-label="Lia, chibi guardiana de Forja">
+            <div class="mascot-body">
+              <img class="mascot-img m-idle" src="/mascot/idle.webp" alt="" draggable="false">
+              <img class="mascot-img m-blink" src="/mascot/blink.webp" alt="" draggable="false">
+              <img class="mascot-img m-working" src="/mascot/working.webp" alt="" draggable="false">
+              <img class="mascot-img m-celebrate" src="/mascot/celebrate.webp" alt="" draggable="false">
+              <img class="mascot-img m-worried" src="/mascot/worried.webp" alt="" draggable="false">
+            </div>
+          </div>
+        </button>
+        <div id="mascot-speech" class="mascot-speech" role="status" aria-live="polite">
+          <span id="mascot-mood-label" class="mascot-speech-state">En reposo</span>
+          <span id="mascot-bubble-text">Todo tranquilo</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ÁREA DE TRABAJO -->
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="btn-mobile-menu" class="icon-btn mobile-menu-btn" aria-label="Abrir menú">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          </button>
+          <div>
+            <div id="view-heading" class="view-heading">Resumen</div>
+            <div id="view-subtitle" class="view-subtitle">Estado general del orquestador y actividad en las últimas 24 h</div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="btn-refresh-now" class="btn" title="Sincronizar estado ahora">Actualizar</button>
+          <button id="btn-open-new-task" class="btn btn-primary">+ Nueva tarea</button>
+        </div>
+      </header>
+
+      <div class="view-scroll">
+        <!-- VISTA 1: RESUMEN -->
+        <section id="view-resumen" class="view-pane active" aria-label="Vista Resumen">
+          <div class="kpi-grid">
+            <div class="card card-gothic">
+              <div class="card-label">Activas ahora</div>
+              <div id="kpi-active" class="card-value" style="color:var(--violet)">0</div>
+              <div class="card-sub">En ejecución concurrente</div>
+            </div>
+            <div class="card">
+              <div class="card-label">En cola</div>
+              <div id="kpi-queued" class="card-value" style="color:var(--amber)">0</div>
+              <div class="card-sub">Esperando slot de semáforo</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Completadas (24 h)</div>
+              <div id="kpi-done24" class="card-value" style="color:var(--emerald)">0</div>
+              <div class="card-sub">Últimas 24 horas</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Fallidas (24 h)</div>
+              <div id="kpi-failed24" class="card-value" style="color:var(--crimson)">0</div>
+              <div class="card-sub">Tras agotar reintentos</div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-label">Ejecuciones en el tiempo (últimas 24 h por hora)</div>
+              <svg id="chart-timeline-svg" class="chart-svg" viewBox="0 0 600 150" preserveAspectRatio="none" aria-label="Gráfico de ejecuciones en 24 horas"></svg>
+              <div class="card-sub">Esmeralda: completadas · Rojo: fallidas · Violeta: en curso / otras</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Pulso de recursos locales</div>
+              <div id="summary-hw-box" style="margin-top:6px;display:flex;flex-direction:column;gap:8px;">
+                <div class="muted">Consultando telemetría local…</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-label" style="margin-bottom:10px;">Últimas ejecuciones</div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Estado</th>
+                    <th>Tarea</th>
+                    <th>Agente</th>
+                    <th>Privacidad</th>
+                    <th>Duración</th>
+                    <th>Actualizado</th>
+                  </tr>
+                </thead>
+                <tbody id="summary-recent-tbody">
+                  <tr><td colspan="6" class="muted">Sin ejecuciones registradas.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- VISTA 2: EJECUCIONES -->
+        <section id="view-ejecuciones" class="view-pane" aria-label="Vista Ejecuciones">
+          <div class="toolbar-row">
+            <div class="filter-group">
+              <select id="filter-status" class="select" aria-label="Filtrar por estado">
+                <option value="all">Todos los estados</option>
+                <option value="running">Running</option>
+                <option value="pending">Pending</option>
+                <option value="done">Done</option>
+                <option value="failed">Failed</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+              <select id="filter-agent" class="select" aria-label="Filtrar por agente">
+                <option value="all">Todos los agentes</option>
+                <option value="agy">agy</option>
+                <option value="mock">mock</option>
+                <option value="claude">claude</option>
+                <option value="opencode">opencode</option>
+                <option value="hermes">hermes</option>
+                <option value="local">local</option>
+              </select>
+              <input id="filter-query" class="input" type="search" placeholder="Buscar por título o ID…" aria-label="Buscar ejecución">
+            </div>
+            <button id="btn-new-task-runs" class="btn btn-primary">+ Nueva tarea</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Estado</th>
+                  <th>Título / ID</th>
+                  <th>Agente</th>
+                  <th>Duración</th>
+                  <th>Intentos</th>
+                  <th>Privacidad</th>
+                  <th>Acción</th>
+                </tr>
+              </thead>
+              <tbody id="runs-tbody">
+                <tr><td colspan="7" class="muted">Sin ejecuciones registradas.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- VISTA 3: AGENTES -->
+        <section id="view-agentes" class="view-pane" aria-label="Vista Agentes">
+          <div id="agents-cards-grid" class="grid-cards"></div>
+          <div class="section-head" style="display:flex;justify-content:space-between;align-items:center;margin:22px 0 10px;">
+            <strong style="font-size:15px;">Modelos detectados en esta máquina</strong>
+            <button id="models-refresh" class="btn" type="button">Redetectar</button>
+          </div>
+          <div id="models-grid" class="grid-cards"></div>
+        </section>
+
+        <!-- VISTA: ORQUESTADOR -->
+        <section id="view-orquestador" class="view-pane" aria-label="Vista Orquestador">
+          <div class="orq-head">
+            <label for="orq-agent">Agente del orquestador:</label>
+            <select id="orq-agent" class="select" aria-label="Agente del orquestador"></select>
+            <label for="orq-profile" id="orq-profile-label">Perfil de Hermes:</label>
+            <select id="orq-profile" class="select" aria-label="Perfil de Hermes del orquestador"></select>
+            <span id="orq-profile-source" class="mono"></span>
+            <span>Cambiar el agente o el perfil reinicia las sesiones de las conversaciones. Solo se ofrecen los agentes instalados.</span>
+            <span id="orq-profile-msg" role="status"></span>
+          </div>
+          <div class="orq-layout">
+            <aside class="orq-side" aria-label="Conversaciones del orquestador">
+              <div class="orq-side-head">
+                <span>Conversaciones <span id="orq-conv-count" class="mono">0</span></span>
+                <button id="orq-new" class="btn" type="button" style="padding:2px 8px;font-size:11px;">+ Nueva</button>
+              </div>
+              <div id="orq-conv-list" class="orq-conv-list" role="list"></div>
+            </aside>
+            <div class="orq-main">
+              <div class="orq-wrap">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                  <strong id="orq-conv-title" style="font-size:13.5px;">Sin conversación</strong>
+                  <button id="orq-rename" class="btn" type="button" style="padding:2px 8px;font-size:11px;">Renombrar</button>
+                </div>
+                <div id="orq-log" class="orq-log" aria-live="polite">
+                  <div class="orq-msg sys">Háblale o escríbele. Él delega las tareas en los agentes y revisa el resultado antes de responderte. Escribe / para ver los comandos.</div>
+                </div>
+                <div id="orq-status" class="orq-status" role="status"></div>
+                <div id="orq-suggest" class="orq-suggest" role="listbox" aria-label="Comandos disponibles"></div>
+                <form id="orq-form" class="orq-bar" autocomplete="off">
+                  <input id="orq-input" type="text" placeholder="Escribe un mensaje o un comando (/help)" aria-label="Mensaje al orquestador">
+                  <select id="orq-model" class="select orq-pill" aria-label="Modelo del orquestador en esta conversación" title="Modelo del orquestador en esta conversación (también /model)"></select>
+                  <select id="orq-effort" class="select orq-pill" aria-label="Esfuerzo de razonamiento en esta conversación" title="Esfuerzo de razonamiento en esta conversación (también /effort)"></select>
+                  <button id="orq-call" class="btn orq-call orq-mic" type="button" aria-label="Iniciar llamada de voz" title="Llamada de voz: él escucha y te responde hablando (clic otra vez para colgar)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></button>
+                  <button id="orq-send" class="btn btn-primary" type="submit">Enviar</button>
+                  <button id="orq-reset" class="btn" type="button" title="Crear una conversación nueva">Nueva</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- VISTA: TERMINALES EN PARALELO -->
+        <section id="view-terminales" class="view-pane" aria-label="Vista Terminales">
+          <div class="term-toolbar">
+            <label for="term-count">Paneles:</label>
+            <select id="term-count" class="select" aria-label="Número de paneles">
+              <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+            </select>
+            <label for="term-cols">Columnas:</label>
+            <select id="term-cols" class="select" aria-label="Número de columnas">
+              <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+            </select>
+            <span>Salida en vivo (stdout, <span style="color:#fca5a5;">stderr</span>); tope de 5000 líneas por panel.</span>
+          </div>
+          <div id="term-grid" class="term-grid"></div>
+        </section>
+
+        <!-- VISTA 4: TELEMETRÍA -->
+        <section id="view-telemetria" class="view-pane" aria-label="Vista Telemetría">
+          <div class="kpi-grid">
+            <div class="card card-gothic">
+              <div class="card-label">GPU / VRAM</div>
+              <div id="tel-gpu-name" style="font-weight:650;font-size:13.5px;margin-bottom:4px;">Consultando…</div>
+              <div id="tel-vram-value" class="card-value">—</div>
+              <div class="meter-track"><div id="tel-vram-bar" class="meter-fill" style="width:0%"></div></div>
+              <div id="tel-gpu-extra" class="card-sub">Utilización: sin dato · Temp: sin dato</div>
+            </div>
+            <div class="card">
+              <div class="card-label">CPU (/proc/stat)</div>
+              <div id="tel-cpu-value" class="card-value">—</div>
+              <div class="meter-track"><div id="tel-cpu-bar" class="meter-fill" style="width:0%"></div></div>
+              <div id="tel-cpu-sub" class="card-sub">Muestreo cada 2 s</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Memoria RAM (/proc/meminfo)</div>
+              <div id="tel-ram-value" class="card-value">—</div>
+              <div class="meter-track"><div id="tel-ram-bar" class="meter-fill" style="width:0%"></div></div>
+              <div id="tel-ram-sub" class="card-sub">MemTotal − MemAvailable</div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-label">Historial 5 min — VRAM % (ámbar &gt;80 %, rojo &gt;92 %)</div>
+              <svg id="chart-vram-svg" class="chart-svg" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+            </div>
+            <div class="card">
+              <div class="card-label">Historial 5 min — Utilización GPU %</div>
+              <svg id="chart-gpu-svg" class="chart-svg" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-label">Historial 5 min — CPU % (violeta) y RAM % (esmeralda)</div>
+            <svg id="chart-cpuram-svg" class="chart-svg" viewBox="0 0 1000 150" preserveAspectRatio="none"></svg>
+          </div>
+        </section>
+
+        <!-- VISTA 5: CUOTAS -->
+        <section id="view-cuotas" class="view-pane" aria-label="Vista Cuotas">
+          <div id="quota-cards-grid" class="grid-cards" style="margin-bottom:18px;"></div>
+
+          <div class="card card-gothic">
+            <div class="card-label">Edición de cuotas manuales (fallback quota.json)</div>
+            <p class="card-sub" style="margin-bottom:12px;">
+              Se usa únicamente cuando <span class="mono">hermes usage --provider &lt;nombre&gt; --json</span> no devuelve datos (excepto Anthropic, que siempre se consulta en vivo a hermes).
+            </p>
+            <div id="manual-quota-form-rows" class="grid-cards" style="margin-bottom:12px;"></div>
+            <button id="btn-save-manual-quota" class="btn btn-primary">Guardar quota.json</button>
+            <div id="quota-save-toast" class="toast-banner"></div>
+          </div>
+        </section>
+
+        <!-- VISTA 6: AJUSTES -->
+        <section id="view-ajustes" class="view-pane" aria-label="Vista Ajustes">
+          <div class="card card-gothic" style="max-width:640px;">
+            <div class="card-label" style="margin-bottom:12px;">Configuración de Forja</div>
+            <form id="settings-form">
+              <div class="form-field">
+                <label for="set-concurrency">Concurrencia máxima (1 – 16)</label>
+                <input id="set-concurrency" class="input mono" type="number" min="1" max="16" required>
+              </div>
+              <div class="form-field">
+                <label for="set-store-dir">Directorio del store JSONL</label>
+                <input id="set-store-dir" class="input mono" type="text" required>
+              </div>
+              <div class="form-field">
+                <label for="set-port">Puerto HTTP (1024 – 65535)</label>
+                <input id="set-port" class="input mono" type="number" min="1024" max="65535" required>
+              </div>
+              <div class="form-field">
+                <label for="set-quota-path">Ruta de quota.json</label>
+                <input id="set-quota-path" class="input mono" type="text" required>
+              </div>
+              <div class="form-field">
+                <label for="set-orch-agent">Agente del orquestador</label>
+                <select id="set-orch-agent" class="select"></select>
+                <div id="set-orch-source" class="card-sub"></div>
+                <div class="card-sub">Automático = el primer agente instalado (claude, opencode, agy, local, hermes) o la variable FORJA_ORCHESTRATOR_AGENT. Cambiarlo reinicia las sesiones de las conversaciones del orquestador.</div>
+              </div>
+              <div id="set-orch-profile-field" class="form-field">
+                <label for="set-orch-profile">Perfil de Hermes del orquestador</label>
+                <select id="set-orch-profile" class="select"></select>
+                <div class="card-sub">Solo aplica si el agente es hermes. Se listan los perfiles descubiertos en tu instalación de Hermes.</div>
+              </div>
+              <div class="form-field">
+                <label for="set-hidden-profiles">Perfiles de Hermes ocultos</label>
+                <input id="set-hidden-profiles" class="input mono" type="text" placeholder="p. ej. privado, trabajo" autocomplete="off">
+                <div class="card-sub">Separados por comas. Un perfil oculto no aparece en las listas, no se puede elegir y se rechaza en el orquestador, en el agente hermes y en la lista de modelos. También se pueden ocultar con la variable FORJA_HIDDEN_PROFILES.</div>
+              </div>
+              <fieldset id="set-models-box" style="border:1px solid var(--border-dim);border-radius:6px;padding:10px 12px;margin-bottom:12px;">
+                <legend class="card-label" style="padding:0 6px;">Modelo y esfuerzo por agente</legend>
+                <div class="card-sub" style="margin-bottom:8px;">Vacío = modelo por defecto del agente (en hermes, el del perfil). El esfuerzo de razonamiento vacío = no se pasa ningún flag. Una tarea puede sobrescribir ambos en Nueva tarea; el chat del orquestador, por conversación.</div>
+                <div id="set-models-rows" style="display:grid;grid-template-columns:90px 1fr 170px auto;gap:6px 8px;align-items:center;"></div>
+              </fieldset>
+              <fieldset id="set-sensitive-box" style="border:1px solid var(--border-dim);border-radius:6px;padding:10px 12px;margin-bottom:12px;">
+                <legend class="card-label" style="padding:0 6px;">Agentes permitidos con privacidad sensitive</legend>
+                <div class="card-sub" style="margin-bottom:8px;">Por defecto solo <span class="mono">claude</span>. Ampliar esta lista reduce la protección de las tareas marcadas como <span class="mono">sensitive</span>: los datos confidenciales podrán enviarse a los agentes seleccionados.</div>
+                <div id="set-sensitive-agents" style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:8px 12px;">
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="claude" checked><span class="mono">claude</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="agy"><span class="mono">agy</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="opencode"><span class="mono">opencode</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="hermes"><span class="mono">hermes</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="local"><span class="mono">local</span></label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;"><input type="checkbox" name="sensitive_agents" value="mock"><span class="mono">mock</span></label>
+                </div>
+              </fieldset>
+              <div class="form-field" style="flex-direction:row;align-items:center;gap:10px;margin-top:6px;">
+                <input id="set-hide-mascot" type="checkbox">
+                <label for="set-hide-mascot" style="margin:0;cursor:pointer;">Ocultar mascota de la barra lateral</label>
+              </div>
+              <div style="display:flex;gap:10px;margin-top:14px;">
+                <button type="submit" class="btn btn-primary">Guardar ajustes</button>
+              </div>
+              <div id="settings-toast" class="toast-banner"></div>
+            </form>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- PANEL LATERAL DE DETALLE DE EJECUCIÓN -->
+    <aside id="detail-drawer" class="detail-drawer" aria-label="Detalle de ejecución">
+      <div class="drawer-header">
+        <div>
+          <div id="drawer-title" style="font-weight:700;font-size:14px;">Ejecución</div>
+          <div id="drawer-id" class="mono muted" style="font-size:11px;"></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button id="drawer-term-btn" class="btn" type="button">Ver en terminal</button>
+          <button id="drawer-cancel-btn" class="btn btn-danger">Cancelar</button>
+          <button id="drawer-close-btn" class="icon-btn" aria-label="Cerrar panel">✕</button>
+        </div>
+      </div>
+      <div class="drawer-body">
+        <div id="drawer-meta" class="kv-grid"></div>
+        <div>
+          <div class="card-label">Prompt</div>
+          <pre id="drawer-prompt" class="code-box"></pre>
+        </div>
+        <div>
+          <div id="drawer-output-label" class="card-label">Salida</div>
+          <pre id="drawer-output" class="code-box"></pre>
+        </div>
+        <div id="drawer-review" style="display:none;">
+          <div class="card-label">Revisión del worktree</div>
+          <div id="drawer-review-status" class="card-sub" style="margin-bottom:8px;" aria-live="polite"></div>
+          <div id="drawer-review-actions" style="display:none;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+            <button id="drawer-merge-btn" class="btn btn-primary" type="button">Fusionar en la base</button>
+            <button id="drawer-discard-btn" class="btn btn-danger" type="button">Descartar y limpiar</button>
+          </div>
+          <button id="drawer-review-retry" class="btn" type="button" style="display:none;margin-bottom:8px;">Reintentar diff</button>
+          <pre id="drawer-review-stat" class="code-box" style="display:none;max-height:150px;margin-bottom:8px;"></pre>
+          <pre id="drawer-diff" class="code-box" style="display:none;"></pre>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 2) BARRA DE PROVEEDORES FIJA ABAJO -->
+    <footer id="provider-bar" class="provider-bar" aria-label="Barra de proveedores y estado">
+      <div id="provider-chips" class="provider-chips">
+        <button class="provider-chip dimmed" data-provider="anthropic">Anthropic · sin dato</button>
+        <button class="provider-chip dimmed" data-provider="copilot">Copilot · sin dato</button>
+        <button class="provider-chip dimmed" data-provider="deepseek">DeepSeek · sin dato</button>
+        <button class="provider-chip dimmed" data-provider="nous">Nous · sin dato</button>
+        <button class="provider-chip dimmed" data-provider="gemini">Gemini · sin dato</button>
+      </div>
+      <div class="provider-status-right">
+        <span style="display:inline-flex;align-items:center;gap:6px;">
+          <span id="conn-dot" class="dot ok"></span>
+          <span id="conn-text">Conectando…</span>
+        </span>
+        <span id="forja-version">Forja v0.1.0</span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- POPOVER DE DETALLE DE PROVEEDOR -->
+  <div id="provider-popover" class="provider-popover" role="dialog" aria-label="Detalle de cuota del proveedor"></div>
+
+  <!-- MODAL NUEVA TAREA -->
+  <div id="new-task-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Nueva tarea">
+    <div class="modal-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h2 style="font-size:15px;font-weight:700;">Lanzar nueva tarea</h2>
+        <button id="modal-close-btn" class="icon-btn" type="button" aria-label="Cerrar modal">✕</button>
+      </div>
+      <form id="new-task-form">
+        <div class="form-field">
+          <label for="nt-title">Título</label>
+          <input id="nt-title" class="input" type="text" placeholder="Ej. Refactorizar parser de logs" required>
+        </div>
+        <div class="form-field">
+          <label for="nt-privacy">Privacidad</label>
+          <select id="nt-privacy" class="select">
+            <option value="open">open — repositorios y prompts abiertos</option>
+            <option value="sensitive">sensitive — datos confidenciales (política estricta)</option>
+          </select>
+        </div>
+        <div id="nt-policy-banner" class="policy-banner">
+          Política <strong>open</strong>: agentes permitidos → <span class="mono">agy, mock, claude, opencode, hermes, local</span>.
+        </div>
+        <div class="form-field">
+          <label for="nt-agent">Agente</label>
+          <select id="nt-agent" class="select">
+            <option value="mock">mock (local determinista)</option>
+            <option value="agy">agy (Gemini CLI)</option>
+            <option value="claude">claude (Anthropic)</option>
+            <option value="opencode">opencode (OpenCode)</option>
+            <option value="hermes">hermes (Hermes)</option>
+            <option value="local">local (Local)</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label for="nt-model">Modelo (opcional)</label>
+          <input id="nt-model" class="input mono" type="text" placeholder="por defecto del agente" autocomplete="off">
+          <div id="nt-model-note" class="card-sub"></div>
+        </div>
+        <div class="form-field">
+          <label for="nt-effort">Esfuerzo</label>
+          <select id="nt-effort" class="select"></select>
+          <div id="nt-effort-note" class="card-sub"></div>
+        </div>
+        <div class="form-field">
+          <label for="nt-prompt">Prompt</label>
+          <textarea id="nt-prompt" class="textarea" rows="4" placeholder="Describe la tarea con criterios verificables…" required></textarea>
+        </div>
+        <div class="form-field" style="flex-direction:row;align-items:center;gap:8px;margin-bottom:0;">
+          <input id="nt-open-term" type="checkbox" checked>
+          <label for="nt-open-term" style="margin:0;cursor:pointer;">Abrir en un panel libre de Terminales</label>
+        </div>
+        <div id="nt-error" class="toast-banner err"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
+          <button id="modal-cancel-btn" class="btn" type="button">Cancelar</button>
+          <button class="btn btn-primary" type="submit">Encolar ejecución</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+{{JS}}
+      bootPanel();
+    })();
+  </script>
+</body>
+</html>
