@@ -48,7 +48,7 @@
 | No duplica avisos ni pierde fines de tarea | Cumplido (consumo único + reconciliación) |
 | No compite con el usuario ni deja la conversación bloqueada | Cumplido (espera y prioridad del usuario) |
 | No puede encadenar turnos automáticos sin fin | Cumplido (`MAX_AUTO_TURNS`) |
-| Pruebas automatizadas del comportamiento | Cumplido (7 pruebas nuevas) |
+| Pruebas automatizadas del comportamiento | Cumplido (8 pruebas nuevas) |
 | `./scripts/check.sh` en verde | Cumplido |
 
 ## Verificación
@@ -57,8 +57,12 @@
 $ ./scripts/check.sh
 EXIT=0
 ...
-test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
+
+En el árbol de trabajo había además cambios de otro punto (6), por eso allí el
+mismo comando sumaba 134 pruebas del servidor; el commit limpio del punto 7 se
+verificó por separado y pasa con 128.
 
 También se verificó el commit aislado en un worktree limpio (sin los cambios de
 otros puntos que había en el árbol de trabajo) con el mismo `check.sh`.
