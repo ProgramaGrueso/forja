@@ -1314,13 +1314,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["persisted"], true);
         assert_eq!(body["restart_required"], json!([]));
-        assert_eq!(body["settings"]["sensitive_agents"], json!(["mock", "local"]));
+        assert_eq!(
+            body["settings"]["sensitive_agents"],
+            json!(["mock", "local"])
+        );
 
         // Persiste en settings.json.
         let loaded = crate::settings::load_settings(&path)
             .expect("leer settings")
             .expect("existe");
-        assert_eq!(loaded.sensitive_agents, vec![AgentKind::Mock, AgentKind::Local]);
+        assert_eq!(
+            loaded.sensitive_agents,
+            vec![AgentKind::Mock, AgentKind::Local]
+        );
 
         // GET /api/policy refleja la lista efectiva.
         let (status, policy) = get_json(app.clone(), "/api/policy").await;
@@ -1342,19 +1348,11 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         // Inválidos (vacía, desconocido, duplicados) => 400 y no sobrescriben lo vigente.
-        for bad_list in [
-            json!([]),
-            json!(["desconocido"]),
-            json!(["mock", "MOCK"]),
-        ] {
+        for bad_list in [json!([]), json!(["desconocido"]), json!(["mock", "MOCK"])] {
             let mut bad = current.clone();
             bad["sensitive_agents"] = bad_list.clone();
             let (status, _) = put_settings_json(app.clone(), bad).await;
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "debía rechazar {bad_list}"
-            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "debía rechazar {bad_list}");
         }
         let (_, policy_after) = get_json(app, "/api/policy").await;
         assert_eq!(policy_after["sensitive"], json!(["mock", "local"]));

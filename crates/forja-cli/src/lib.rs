@@ -965,10 +965,9 @@ mod tests {
         ));
 
         // Con settings.json que permite ["mock"], mock pasa y agy sigue rechazado.
-        let mut settings = forja_server::settings::Settings::with_defaults(
-            store_dir.path().to_str().expect("store utf8"),
-        );
+        let mut settings = forja_server::settings::Settings::with_defaults("/tmp/forja-test-store");
         settings.sensitive_agents = vec![AgentKind::Mock];
+        settings.validate().expect("ajustes de prueba válidos");
         forja_server::settings::save_settings(&store_dir.path().join("settings.json"), &settings)
             .expect("guardar settings");
 

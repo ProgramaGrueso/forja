@@ -258,15 +258,20 @@ async fn custom_sensitive_agents_local_only_and_hot_update() {
     ));
 
     // local sí se acepta con ["local"].
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../forja-agent/tests/fake_local.sh");
-    let local: Arc<dyn Agent> =
-        Arc::new(forja_agent::LocalAgent::default().with_program(script.to_string_lossy()));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener efímero");
+    let port = listener.local_addr().expect("addr").port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../forja-agent/tests/fake_local.sh");
+    let local: Arc<dyn Agent> = Arc::new(
+        forja_agent::LocalAgent::default()
+            .with_program(script.to_string_lossy())
+            .with_port(port),
+    );
     let submitted = scheduler
         .submit(Task::new("t3", "p", Privacy::Sensitive), local)
         .await
         .expect("local debe ser aceptado");
     let finished = scheduler.wait_run(&submitted.id).await.expect("wait_run");
+    drop(listener);
     assert_eq!(finished.status, RunStatus::Done);
 
     // Cambio en caliente sin reiniciar: ahora permite mock y rechaza listas inválidas.
