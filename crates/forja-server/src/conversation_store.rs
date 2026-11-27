@@ -260,6 +260,14 @@ impl ConversationPersistence {
 
     /// Espera a que termine la escritura correspondiente a todos los cambios encolados hasta ahora.
     pub fn flush(&self) {
+        if self
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return;
+        }
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let target = st.requested_rev;
         while st.completed_rev < target {
