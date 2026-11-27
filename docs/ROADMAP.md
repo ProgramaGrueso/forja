@@ -74,12 +74,15 @@ alguien que acaba de clonar el repo.
   selector de ejecución, apertura automática de las tareas nuevas en un panel libre,
   reconexión con `?since=seq` y tope de 5000 líneas en el DOM.
 
-## Pendientes actuales
+## Últimos pendientes cerrados
 
-- **Persistencia de conversaciones.** Las conversaciones del orquestador viven solo en
-  memoria (máx. 20 conversaciones y 500 mensajes por conversación) y se pierden al
-  reiniciar el servidor. Falta guardarlas en `forja-store` y recuperarlas al arrancar,
-  sin romper la selección ni los límites actuales.
+- ~~**Persistencia de conversaciones.**~~ **Hecho**: el servidor guarda las
+  conversaciones en `<store_dir>/conversations.json` (escritura atómica y coalescida fuera
+  del lock del chat) y las recarga al arrancar. Se persisten id, título, `session_id`,
+  historial, fechas, modelo y esfuerzo; `in_flight`, `pending` y `auto_turns` se reinician.
+  Un archivo corrupto no impide arrancar: se ignoran solo las entradas dañadas y queda
+  siempre la conversación principal. Al cargar se respetan `MAX_CONVERSATIONS` (20) y
+  `MAX_MESSAGES` (500), descartando primero lo más antiguo.
 - ~~**Cierre del ciclo de revisión en el panel.**~~ **Hecho**: `forja-git` añade
   `diff_worktree` (incluye archivos sin seguimiento sin dejar el índice tocado),
   `merge_branch` (comprueba rama base y árbol limpio, anula la fusión si hay conflicto) y
@@ -102,11 +105,16 @@ alguien que acaba de clonar el repo.
   `MAX_AUTO_TURNS` (8) turnos automáticos seguidos, los resultados quedan como «Tareas
   delegadas» para el próximo mensaje del usuario, y este reinicia el contador: las cadenas
   de delegaciones no pueden girar sin fin.
-- **División de archivos grandes.** `panel.html` (~3.800 líneas), `orchestrator.rs`
-  (~2.900) y `api.rs` (~1.300) concentran demasiado código en un solo archivo. Conviene
-  partirlos en módulos (plantilla/JS del panel, comandos y delegación del orquestador,
-  rutas por recurso) sin cambiar el comportamiento ni la API.
-- **Privacidad configurable.** `Privacy` solo admite `open` y `sensitive` y se elige en
-  cada tarea; no hay valor por defecto ni política por agente o repositorio en
-  `settings.json` ni en el panel. Falta configurarla y aplicarla de forma consistente en
-  `forja run`, `POST /tasks` y las delegaciones del orquestador.
+- ~~**División de archivos grandes.**~~ **Hecho**: `panel.html` se ensambla en
+  compilación desde `panel/index.html` más CSS y JS por vista (`build.rs`), sin archivos
+  externos en runtime; `orchestrator.rs` pasó a `orchestrator/` (`conversations`,
+  `commands`, `chat`, `delegation`, `backends` y `tests`); `forja-server/src/lib.rs` quedó
+  como fachada con `state`, `router`, `handlers/` y `tests/`; `forja-sched/src/lib.rs` se
+  repartió en `config`, `concurrency`, `buffers`, `worktree`, `runner` y `tests/`. La API
+  pública y el comportamiento no cambian; la suite completa pasa con 347 pruebas.
+- ~~**Privacidad configurable.**~~ **Hecho**: `Settings.sensitive_agents` elige qué
+  agentes acepta la privacidad `sensitive`, con `["claude"]` por defecto estricto. Se
+  valida (no vacía, agentes conocidos, sin duplicados) y se aplica en caliente en el
+  planificador, en `POST /tasks` y en las delegaciones del orquestador; `GET /api/policy`
+  devuelve la lista efectiva, `PUT /api/settings` la persiste, `forja run` la lee del
+  store y el panel trae casillas por agente con aviso de riesgo.
