@@ -1,0 +1,23 @@
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-bottom: 12px;
+    }
+
+    .form-field label {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .toast-banner {
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-top: 10px;
+      display: none;
+    }
+    .toast-banner.show { display: block; }
+    .toast-banner.ok { background: var(--emerald-dim); border: 1px solid rgba(16, 185, 129, 0.4); color: #a7f3d0; }
+    .toast-banner.err { background: var(--crimson-dim); border: 1px solid rgba(239, 68, 68, 0.45); color: #fecaca; }

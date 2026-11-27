@@ -1,0 +1,49 @@
+    :root {
+      --bg-void: #050609;
+      --bg-obsidian: #090b10;
+      --bg-panel: #0d1017;
+      --bg-elevated: #121722;
+      --bg-hover: #171e2c;
+      --border-dim: #192030;
+      --border-mid: #242f45;
+      --border-gothic: #2d2640;
+      --text-main: #e6eaf2;
+      --text-muted: #8b95a8;
+      --text-dim: #596275;
+      --emerald: #10b981;
+      --emerald-dim: rgba(16, 185, 129, 0.14);
+      --emerald-glow: rgba(16, 185, 129, 0.34);
+      --violet: #8b5cf6;
+      --violet-dim: rgba(139, 92, 246, 0.16);
+      --violet-glow: rgba(139, 92, 246, 0.35);
+      --amber: #f59e0b;
+      --amber-dim: rgba(245, 158, 11, 0.15);
+      --crimson: #ef4444;
+      --crimson-dim: rgba(239, 68, 68, 0.15);
+      --sidebar-w: 276px;
+      --sidebar-collapsed-w: 64px;
+      --provider-bar-h: 40px;
+      --topbar-h: 52px;
+      --radius: 8px;
+      --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, sans-serif;
+      --font-mono: ui-monospace, "JetBrains Mono", "Fira Code", SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      background: var(--bg-void);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 13.5px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, input, select, textarea {
+      font: inherit;
+      color: inherit;
+    }

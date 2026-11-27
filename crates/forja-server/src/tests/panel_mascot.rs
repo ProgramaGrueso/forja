@@ -201,3 +201,95 @@ async fn panel_views_modal_filters_and_settings_present() {
         assert!(html.contains(id), "falta elemento #{id} en panel.html");
     }
 }
+
+fn assert_in_order(haystack: &str, needles: &[&str], label: &str) {
+    let mut cursor = 0usize;
+    for needle in needles {
+        let rel = haystack[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("falta o está fuera de orden en {label}: {needle}"));
+        cursor += rel + needle.len();
+    }
+}
+
+#[tokio::test]
+async fn panel_assembled_html_includes_sections_css_and_js_in_order() {
+    let (state, _store_dir, _wt_dir) = test_state();
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .header(header::HOST, "127.0.0.1:7777")
+        .method(Method::GET)
+        .uri("/")
+        .body(Body::empty())
+        .expect("GET /");
+    let resp = app.oneshot(req).await.expect("ejecutar GET /");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("leer");
+    let html = String::from_utf8(bytes.to_vec()).expect("UTF-8");
+
+    assert!(
+        !html.contains("{{CSS}}") && !html.contains("{{JS}}"),
+        "quedaron marcadores sin sustituir en el HTML ensamblado"
+    );
+
+    let style_start = html.find("<style>").expect("falta <style>");
+    let style_end = html.find("</style>").expect("falta </style>");
+    let style = &html[style_start..style_end];
+    assert_in_order(
+        style,
+        &[
+            ":root {",          // css/base.css
+            ".app-shell {",     // css/layout.css
+            ".kpi-grid {",      // css/resumen.css
+            ".detail-drawer {", // css/ejecuciones.css
+            ".grid-cards {",    // css/agentes.css
+            ".meter-track {",   // css/telemetria.css
+            ".chart-svg {",     // css/telemetria.css
+            ".provider-bar {",  // css/cuotas.css
+            ".form-field {",    // css/ajustes.css
+            ".toast-banner {",  // css/ajustes.css
+            ".orq-wrap {",      // css/orquestador.css
+            ".term-grid {",     // css/terminales.css
+        ],
+        "CSS ensamblado",
+    );
+
+    let script_start = html.find("<script>").expect("falta <script>");
+    let body_html = &html[style_end..script_start];
+    assert_in_order(
+        body_html,
+        &[
+            "id=\"view-resumen\"",
+            "id=\"view-ejecuciones\"",
+            "id=\"view-agentes\"",
+            "id=\"view-orquestador\"",
+            "id=\"view-terminales\"",
+            "id=\"view-telemetria\"",
+            "id=\"view-cuotas\"",
+            "id=\"view-ajustes\"",
+        ],
+        "secciones HTML",
+    );
+
+    let script_end = html.rfind("</script>").expect("falta </script>");
+    let script = &html[script_start..script_end];
+    assert_in_order(
+        script,
+        &[
+            "const state = {",             // js/core.js
+            "function connectSse()",       // js/core.js
+            "function bootPanel()",        // js/core.js
+            "function renderSummary()",    // js/resumen.js
+            "function renderRunsTable()",  // js/ejecuciones.js
+            "function renderAgentsView()", // js/agentes.js
+            "function renderTelemetry()",  // js/telemetria.js
+            "function renderQuotasView(",  // js/cuotas.js
+            "function fillSettingsForm(",  // js/ajustes.js
+            "(function orquestador()",     // js/orquestador.js
+            "(function terminales()",      // js/terminales.js
+            "bootPanel();",                // inicialización final
+        ],
+        "JS ensamblado",
+    );
+}
