@@ -3,6 +3,7 @@ pub mod delegation;
 pub mod models;
 pub mod orchestrator;
 pub mod quota;
+pub mod reactor;
 mod security;
 pub mod settings;
 pub mod telemetry;
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -52,6 +54,8 @@ pub struct AppState {
     pub orchestrator: orchestrator::Orchestrator,
     /// Reglas de perfiles de Hermes (descubrimiento y ocultos) del agente y de /api/models.
     pub profile_rules: ProfileRules,
+    /// Evita arrancar más de un vigilante de ejecuciones por estado.
+    watcher_started: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -103,6 +107,7 @@ impl AppState {
             auth_token: None,
             orchestrator: orchestrator::Orchestrator::from_env(),
             profile_rules,
+            watcher_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -399,6 +404,8 @@ pub fn build_router(state: AppState) -> Router {
 /// servidor (relevante si se vincula un puerto efímero). El puerto se usa para
 /// validar `Host`/`Origin` contra DNS rebinding y CSRF.
 fn build_router_for_port(state: AppState, port: u16) -> Router {
+    // Reacciona al fin de las tareas delegadas aunque el panel no esté mirando.
+    state.ensure_run_watcher();
     let protected = Router::new()
         .route("/events", get(events_handler))
         .route("/tasks", post(create_task))
@@ -501,11 +508,29 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct TaskQuery {
+    /// Conversación del orquestador que delega (Hermes lo pone en la URL del curl).
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
 async fn create_task(
     State(state): State<AppState>,
+    Query(query): Query<TaskQuery>,
     Json(req): Json<CreateTaskRequest>,
 ) -> std::result::Result<(StatusCode, Json<RunRecord>), ApiError> {
     let record = state.submit_task(&req).await?;
+    if let Some(conversation) = query
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        // Hermes delega con curl y el servidor no ve sus bloques: esta pista en
+        // la URL permite avisarle igual que a los orquestadores one-shot.
+        state.track_delegation(conversation, &record.id);
+    }
     Ok((StatusCode::CREATED, Json(record)))
 }
 

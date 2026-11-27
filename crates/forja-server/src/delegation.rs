@@ -111,6 +111,10 @@ pub type StatusFuture<'a> = Pin<Box<dyn Future<Output = Option<RunRecord>> + Sen
 pub trait Delegator: Send + Sync {
     fn delegate(&self, req: CreateTaskRequest) -> DelegateFuture<'_>;
     fn run_status<'a>(&'a self, id: &'a str) -> StatusFuture<'a>;
+
+    /// El servidor vigila esta ejecución para despertar al orquestador al acabar.
+    /// Los dobles de prueba pueden no hacer nada.
+    fn track_delegation(&self, _conversation: &str, _run_id: &str) {}
 }
 
 impl Delegator for AppState {
@@ -120,6 +124,10 @@ impl Delegator for AppState {
 
     fn run_status<'a>(&'a self, id: &'a str) -> StatusFuture<'a> {
         Box::pin(async move { self.scheduler.get_run(id).await })
+    }
+
+    fn track_delegation(&self, conversation: &str, run_id: &str) {
+        AppState::track_delegation(self, conversation, run_id);
     }
 }
 
@@ -200,6 +208,18 @@ pub async fn render_pending(pending: &[Pending], d: &dyn Delegator) -> String {
     lines.join("\n")
 }
 
+/// Aviso para el turno automático: resume las tareas que acaban de terminar y
+/// pide al orquestador revisarlas y continuar sin esperar al usuario.
+pub fn completion_notice(runs: &[RunRecord]) -> String {
+    let mut lines = vec![
+        "Terminaron tareas que delegaste. Revísalas y continúa sin esperar al usuario:".to_string(),
+    ];
+    for run in runs {
+        lines.push(task_line(&run.id, None, Some(run)));
+    }
+    lines.join("\n")
+}
+
 fn task_line(id: &str, titulo: Option<&str>, run: Option<&RunRecord>) -> String {
     let Some(run) = run else {
         return format!("- ID {id}: no existe ninguna tarea con ese ID");
@@ -236,7 +256,7 @@ pub fn system_prompt_actions() -> String {
          - Consultar estado y salida de una tarea, formato: {OPEN}estado ID{CLOSE}\n\
          - agentes: claude, opencode, agy, hermes, local, mock. Privacidad: open o sensitive (sensitive solo admite claude).\n\
          - Máximo {MAX_DELEGATIONS_PER_TURN} delegaciones por turno. Si algo se rechaza, lo verás en el siguiente mensaje.\n\
-         - En el siguiente mensaje recibirás «Tareas delegadas» con ID, estado y salida resumida: revísalas antes de decir que está listo.\n\
+         - Cuando termine una tarea delegada recibirás un aviso automático (ID, estado y salida resumida) sin esperar al usuario: revísalo y continúa. Si el aviso se aplaza, lo verás como «Tareas delegadas» en el siguiente mensaje.\n\
          - Lo trivial lo respondes tú directamente; el trabajo de código se delega.\n\
          - Nunca muestres claves ni tokens.\n\
          Responde al siguiente mensaje del usuario:\n"

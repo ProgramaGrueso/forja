@@ -85,10 +85,18 @@ alguien que acaba de clonar el repo.
   worktree desde la interfaz. Falta exponer el diff, añadir a `forja-git` las operaciones
   de fusión y borrado de worktree (hoy solo crea, consulta y commitea) y los botones
   correspondientes en el detalle de la ejecución.
-- **Reacción del orquestador al terminar las tareas.** El orquestador recibe el estado de
-  lo delegado en el turno siguiente, no cuando la tarea acaba; falta que se le notifique
-  (o se le despierte) al completarse una delegación para que revise el resultado y
-  continúe sin esperar a que el usuario escriba.
+- ~~**Reacción del orquestador al terminar las tareas.**~~ **Hecho**: el módulo `reactor`
+  escucha el `broadcast` del planificador y, cuando termina una ejecución delegada, da al
+  orquestador un turno propio con el resultado resumido (ID, estado, salida y error), sin
+  esperar al siguiente mensaje del usuario. Vale para todos los adaptadores: los
+  orquestadores sin sesión registran sus bloques `[[forja:delegar]]` y Hermes añade
+  `?conversation_id=` a su `curl` de `/tasks`. Se agrupan los fines de tarea de una misma
+  conversación, se espera a que el usuario termine si está hablando y una sola reacción
+  puede estar en curso por conversación; el registro se consume al primer aviso para que
+  el evento SSE y la reconciliación no dupliquen. Tras
+  `MAX_AUTO_TURNS` (8) turnos automáticos seguidos, los resultados quedan como «Tareas
+  delegadas» para el próximo mensaje del usuario, y este reinicia el contador: las cadenas
+  de delegaciones no pueden girar sin fin.
 - **División de archivos grandes.** `panel.html` (~3.800 líneas), `orchestrator.rs`
   (~2.900) y `api.rs` (~1.300) concentran demasiado código en un solo archivo. Conviene
   partirlos en módulos (plantilla/JS del panel, comandos y delegación del orquestador,

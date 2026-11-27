@@ -6,7 +6,7 @@
 //! recuerdan nada, así que el [`Orchestrator`] les reenvía el historial reciente
 //! en cada llamada ([`CliBackend`], [`history_block`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -39,6 +39,13 @@ pub const HISTORY_EXCHANGES: usize = 20;
 const HISTORY_MSG_CHARS: usize = 1500;
 const HISTORY_TOTAL_CHARS: usize = 30_000;
 const TIMEOUT_SECS: u64 = 600;
+/// Turnos automáticos seguidos que puede dar una conversación sin que el usuario
+/// escriba. Al agotarse, los resultados se dejan para el siguiente mensaje del
+/// usuario: así una cadena de delegaciones nunca puede girar sin fin.
+pub const MAX_AUTO_TURNS: usize = 8;
+/// Espera máxima a que una conversación quede libre antes de dejar la reacción
+/// pendiente para el siguiente turno del usuario.
+pub const AUTO_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatReply {
@@ -590,7 +597,9 @@ impl BackendFactory {
 }
 
 /// Instrucciones del primer turno. La respuesta se lee en voz alta, así que debe ser hablada.
-pub fn system_prompt(port: u16, token: Option<&str>) -> String {
+/// El `conversation_id` viaja en la URL de `/tasks` para que el servidor sepa a qué
+/// conversación avisar cuando termine la tarea delegada.
+pub fn system_prompt(port: u16, token: Option<&str>, conversation: &str) -> String {
     let auth = token
         .map(|t| format!(" -H 'Authorization: Bearer {t}'"))
         .unwrap_or_default();
@@ -600,9 +609,11 @@ pub fn system_prompt(port: u16, token: Option<&str>) -> String {
          - SIEMPRE respondes al usuario, aunque sea para decir qué estás haciendo.\n\
          - Tu respuesta se lee en voz alta: español natural, frases cortas, sin markdown, sin listas, sin código.\n\
          - Para delegar usa la API local de Forja con curl:\n\
-           curl -s -X POST http://127.0.0.1:{port}/tasks -H 'Content-Type: application/json'{auth} -d '{{\"titulo\":\"...\",\"prompt\":\"...\",\"privacidad\":\"open\",\"agent\":\"opencode\"}}'\n\
+           curl -s -X POST 'http://127.0.0.1:{port}/tasks?conversation_id={conversation}' -H 'Content-Type: application/json'{auth} -d '{{\"titulo\":\"...\",\"prompt\":\"...\",\"privacidad\":\"open\",\"agent\":\"opencode\"}}'\n\
+           No quites el parámetro conversation_id: sirve para avisarte cuando termine la tarea.\n\
            agentes: claude, opencode, agy, hermes, local, mock. Privacidad: open o sensitive (sensitive solo admite claude).\n\
          - Revisa el avance con curl http://127.0.0.1:{port}/runs/ID{auth} (estado y salida) y revisa el resultado antes de decir que está listo.\n\
+         - Cuando termine una tarea delegada recibirás un aviso automático; revisa el resultado y continúa sin esperar al usuario.\n\
          - Lo trivial lo respondes tú directamente; el trabajo de código se delega.\n\
          - Nunca muestres claves ni tokens.\n\
          Responde al siguiente mensaje del usuario:\n"
@@ -686,6 +697,8 @@ pub enum CreateError {
 struct InFlight {
     seq: u64,
     cancel: Arc<Notify>,
+    /// `true` si es un turno automático (el usuario tiene prioridad).
+    auto: bool,
 }
 
 struct Conversation {
@@ -700,6 +713,8 @@ struct Conversation {
     effort: Option<String>,
     /// Acciones delegadas del último turno, a reinyectar en el siguiente.
     pending: Vec<Pending>,
+    /// Turnos automáticos seguidos desde el último mensaje del usuario.
+    auto_turns: usize,
 }
 
 impl Conversation {
@@ -715,6 +730,7 @@ impl Conversation {
             model: None,
             effort: None,
             pending: Vec::new(),
+            auto_turns: 0,
         }
     }
 
@@ -750,6 +766,19 @@ struct Inner {
     map: HashMap<String, Conversation>,
     counter: u64,
     seq: u64,
+    /// Se notifica cuando una conversación deja de estar ocupada.
+    idle: Arc<Notify>,
+}
+
+/// Seguimiento de las tareas delegadas, para reaccionar cuando terminan.
+#[derive(Default)]
+struct Reactions {
+    /// run_id -> conversación que lo delegó.
+    tracked: HashMap<String, String>,
+    /// conversación -> run_ids terminados aún no revisados.
+    finished: HashMap<String, Vec<String>>,
+    /// Conversaciones con una reacción automática encolada o en curso.
+    scheduled: HashSet<String>,
 }
 
 /// Título automático: primeras palabras del primer mensaje.
@@ -777,6 +806,9 @@ impl Drop for InFlightGuard {
                 c.in_flight = None;
             }
         }
+        let idle = Arc::clone(&g.idle);
+        drop(g);
+        idle.notify_waiters();
     }
 }
 
@@ -791,6 +823,7 @@ pub struct Orchestrator {
     factory: Option<BackendFactory>,
     rules: ProfileRules,
     inner: Arc<Mutex<Inner>>,
+    reactions: Arc<Mutex<Reactions>>,
 }
 
 impl Orchestrator {
@@ -805,7 +838,9 @@ impl Orchestrator {
                 map,
                 counter: 0,
                 seq: 0,
+                idle: Arc::new(Notify::new()),
             })),
+            reactions: Arc::new(Mutex::new(Reactions::default())),
         }
     }
 
@@ -949,6 +984,7 @@ impl Orchestrator {
                 f.cancel.notify_one();
             }
             c.session_id = None;
+            c.auto_turns = 0;
         }
     }
 
@@ -1004,43 +1040,64 @@ impl Orchestrator {
     /// Borra una conversación (cancelando su llamada en curso). La principal no
     /// desaparece: se vacía. Devuelve `false` si no existe.
     pub fn delete(&self, id: &str) -> bool {
-        let mut g = lock(&self.inner);
-        if id == PRINCIPAL {
-            if let Some(c) = g.map.get_mut(PRINCIPAL) {
-                if let Some(f) = c.in_flight.take() {
-                    f.cancel.notify_one();
-                }
-                *c = Conversation::new("Principal");
-            }
-            return true;
-        }
-        match g.map.remove(id) {
-            Some(c) => {
-                if let Some(f) = c.in_flight {
-                    f.cancel.notify_one();
+        let existed = {
+            let mut g = lock(&self.inner);
+            if id == PRINCIPAL {
+                if let Some(c) = g.map.get_mut(PRINCIPAL) {
+                    if let Some(f) = c.in_flight.take() {
+                        f.cancel.notify_one();
+                    }
+                    *c = Conversation::new("Principal");
                 }
                 true
+            } else {
+                match g.map.remove(id) {
+                    Some(c) => {
+                        if let Some(f) = c.in_flight {
+                            f.cancel.notify_one();
+                        }
+                        true
+                    }
+                    None => false,
+                }
             }
-            None => false,
+        };
+        if existed {
+            self.clear_reactions(id);
         }
+        existed
     }
 
     /// Olvida la sesión de Hermes y el historial, conservando id y título.
     pub fn reset_conversation(&self, id: &str) -> bool {
-        let mut g = lock(&self.inner);
-        match g.map.get_mut(id) {
-            Some(c) => {
-                if let Some(f) = c.in_flight.take() {
-                    f.cancel.notify_one();
+        let existed = {
+            let mut g = lock(&self.inner);
+            match g.map.get_mut(id) {
+                Some(c) => {
+                    if let Some(f) = c.in_flight.take() {
+                        f.cancel.notify_one();
+                    }
+                    c.session_id = None;
+                    c.pending.clear();
+                    c.messages.clear();
+                    c.auto_turns = 0;
+                    c.updated = now_ms();
+                    true
                 }
-                c.session_id = None;
-                c.pending.clear();
-                c.messages.clear();
-                c.updated = now_ms();
-                true
+                None => false,
             }
-            None => false,
+        };
+        if existed {
+            self.clear_reactions(id);
         }
+        existed
+    }
+
+    fn clear_reactions(&self, conversation: &str) {
+        let mut r = lock(&self.reactions);
+        r.tracked.retain(|_, conv| conv != conversation);
+        r.finished.remove(conversation);
+        r.scheduled.remove(conversation);
     }
 
     /// Reinicia la conversación principal.
@@ -1069,6 +1126,201 @@ impl Orchestrator {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Registra que una ejecución fue delegada desde `conversation`. Devuelve
+    /// `false` si la conversación ya no existe (no hay a quién notificar).
+    pub fn track_delegation(&self, conversation: &str, run_id: &str) -> bool {
+        let exists = lock(&self.inner).map.contains_key(conversation);
+        if !exists {
+            return false;
+        }
+        lock(&self.reactions)
+            .tracked
+            .insert(run_id.to_string(), conversation.to_string());
+        true
+    }
+
+    /// Marca una ejecución como terminada. Devuelve la conversación solo la
+    /// primera vez: llamarlo dos veces (evento SSE y reconciliación) no duplica.
+    pub fn note_run_finished(&self, run_id: &str) -> Option<String> {
+        let conversation = lock(&self.reactions).tracked.remove(run_id)?;
+        // Si la conversación se borró mientras la tarea corría, no hay aviso.
+        if !lock(&self.inner).map.contains_key(&conversation) {
+            return None;
+        }
+        let mut r = lock(&self.reactions);
+        let ids = r.finished.entry(conversation.clone()).or_default();
+        if !ids.iter().any(|id| id == run_id) {
+            ids.push(run_id.to_string());
+        }
+        Some(conversation)
+    }
+
+    /// Reclama el derecho a lanzar una reacción automática para la conversación.
+    /// Solo una a la vez; devuelve `false` si no hay nada pendiente o ya hay otra.
+    pub fn try_schedule_reaction(&self, conversation: &str) -> bool {
+        let exists = lock(&self.inner).map.contains_key(conversation);
+        if !exists {
+            return false;
+        }
+        let mut r = lock(&self.reactions);
+        if r.finished.get(conversation).is_none_or(Vec::is_empty) {
+            return false;
+        }
+        r.scheduled.insert(conversation.to_string())
+    }
+
+    /// Run_ids terminados que aún no se han entregado al orquestador.
+    pub fn take_reaction_batch(&self, conversation: &str) -> Vec<String> {
+        lock(&self.reactions)
+            .finished
+            .remove(conversation)
+            .unwrap_or_default()
+    }
+
+    /// Devuelve un lote al estado pendiente (p. ej. si la conversación estaba
+    /// ocupada por un turno del usuario y hay que reintentar después).
+    pub fn requeue_reaction(&self, conversation: &str, ids: Vec<String>) {
+        let mut r = lock(&self.reactions);
+        let pending = r.finished.entry(conversation.to_string()).or_default();
+        for id in ids {
+            if !pending.contains(&id) {
+                pending.push(id);
+            }
+        }
+    }
+
+    /// Libera la marca de reacción en curso.
+    pub fn release_reaction(&self, conversation: &str) {
+        lock(&self.reactions).scheduled.remove(conversation);
+    }
+
+    pub fn has_pending_reaction(&self, conversation: &str) -> bool {
+        lock(&self.reactions)
+            .finished
+            .get(conversation)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    /// Ejecuciones delegadas que el servidor sigue vigilando.
+    pub fn tracked_runs(&self) -> Vec<(String, String)> {
+        lock(&self.reactions)
+            .tracked
+            .iter()
+            .map(|(run, conversation)| (run.clone(), conversation.clone()))
+            .collect()
+    }
+
+    /// Quita de «Tareas delegadas» las tareas que ya se entregan en el aviso
+    /// automático, para no repetirlas dos veces en el mismo turno.
+    pub fn forget_pending_tasks(&self, conversation: &str, ids: &[String]) {
+        let mut g = lock(&self.inner);
+        if let Some(c) = g.map.get_mut(conversation) {
+            c.pending
+                .retain(|p| !matches!(p, Pending::Task { id, .. } if ids.iter().any(|i| i == id)));
+        }
+    }
+
+    /// Añade una nota del sistema al historial (errores del turno automático).
+    pub fn push_system(&self, conversation: &str, text: &str) {
+        if let Some(c) = lock(&self.inner).map.get_mut(conversation) {
+            c.push("sistema", text);
+        }
+    }
+
+    /// Consume un turno automático si queda margen. Evita cadenas sin fin.
+    pub fn begin_auto_turn(&self, conversation: &str) -> bool {
+        let mut g = lock(&self.inner);
+        match g.map.get_mut(conversation) {
+            Some(c) if c.auto_turns < MAX_AUTO_TURNS => {
+                c.auto_turns += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Deshace un turno automático reservado que finalmente no se ejecutó (por
+    /// ejemplo, si el usuario ganó la carrera). No debe gastar el límite.
+    pub fn abort_auto_turn(&self, conversation: &str) {
+        let mut g = lock(&self.inner);
+        if let Some(c) = g.map.get_mut(conversation) {
+            c.auto_turns = c.auto_turns.saturating_sub(1);
+        }
+    }
+
+    /// Deja los resultados para el siguiente mensaje del usuario (límite de
+    /// turnos automáticos o espera agotada) y lo explica en el historial.
+    ///
+    /// Solo retira del lote los resultados diferidos: los que hayan llegado
+    /// mientras se preparaba la reacción siguen pendientes y el reactor los
+    /// recogerá en la siguiente pasada (si no, se perderían o se repetiría la
+    /// misma reacción sin fin).
+    pub fn defer_reaction(&self, conversation: &str, runs: &[(String, String)]) {
+        let notice = format!(
+            "Reacción automática pausada para evitar bucles; {} resultado(s) \
+             quedan pendientes para tu próximo mensaje.",
+            runs.len()
+        );
+        let mut g = lock(&self.inner);
+        if let Some(c) = g.map.get_mut(conversation) {
+            for (id, titulo) in runs {
+                let already = c
+                    .pending
+                    .iter()
+                    .any(|p| matches!(p, Pending::Task { id: pid, .. } if pid == id));
+                if !already {
+                    c.pending.push(Pending::Task {
+                        id: id.clone(),
+                        titulo: titulo.clone(),
+                    });
+                }
+            }
+            c.push("sistema", &notice);
+        }
+        drop(g);
+        let mut r = lock(&self.reactions);
+        if let Some(pending) = r.finished.get_mut(conversation) {
+            pending.retain(|id| !runs.iter().any(|(deferred, _)| deferred == id));
+            if pending.is_empty() {
+                r.finished.remove(conversation);
+            }
+        }
+    }
+
+    /// Espera a que la conversación no tenga una llamada en curso. `false` si
+    /// no existe o se agota `timeout` (no bloquea al vigilante para siempre).
+    pub async fn wait_idle(&self, conversation: &str, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let idle = {
+                let g = lock(&self.inner);
+                match g.map.get(conversation) {
+                    None => return false,
+                    Some(c) if c.in_flight.is_none() => return true,
+                    Some(_) => Arc::clone(&g.idle),
+                }
+            };
+            // `notify_waiters` no guarda permiso: el futuro debe registrarse con
+            // `enable` ANTES de la segunda comprobación. Así, si la conversación
+            // se libera entre ambas, o el aviso despierta el futuro o la
+            // comprobación lo ve, sin ventana de pérdida.
+            let notified = idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let g = lock(&self.inner);
+                match g.map.get(conversation) {
+                    None => return false,
+                    Some(c) if c.in_flight.is_none() => return true,
+                    Some(_) => {}
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
         }
     }
 
@@ -1155,7 +1407,8 @@ impl Orchestrator {
 
     /// Como [`Self::say_in`]; con `delegator`, los orquestadores sin sesión (todos menos
     /// Hermes) delegan con bloques `[[forja:...]]` que ejecuta el servidor (ver
-    /// [`crate::delegation`]). El camino de Hermes (curl) no cambia.
+    /// [`crate::delegation`]). Hermes conserva el camino `curl`, pero ambos reciben
+    /// un turno automático cuando termina una tarea delegada.
     pub async fn say_in_with(
         &self,
         id: &str,
@@ -1164,47 +1417,99 @@ impl Orchestrator {
         token: Option<&str>,
         delegator: Option<&dyn Delegator>,
     ) -> Result<String, ChatError> {
+        self.turn(id, Trigger::User(message), port, token, delegator)
+            .await
+    }
+
+    /// Turno automático (sin mensaje del usuario) tras terminar una delegación.
+    /// El reactor del servidor lo usa para revisar el resultado y continuar.
+    pub async fn auto_review(
+        &self,
+        id: &str,
+        notice: &str,
+        port: u16,
+        token: Option<&str>,
+        delegator: Option<&dyn Delegator>,
+    ) -> Result<String, ChatError> {
+        self.turn(id, Trigger::Auto(notice), port, token, delegator)
+            .await
+    }
+
+    async fn turn(
+        &self,
+        id: &str,
+        trigger: Trigger<'_>,
+        port: u16,
+        token: Option<&str>,
+        delegator: Option<&dyn Delegator>,
+    ) -> Result<String, ChatError> {
         let backend = self.backend();
         let stateless = backend.stateless();
         let delegating = stateless && delegator.is_some();
-        let (resume, cancel, seq, history, opts, pending) = {
-            let mut g = lock(&self.inner);
-            g.seq += 1;
-            let seq = g.seq;
-            let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
-            if conv.in_flight.is_some() {
-                return Err(ChatError::Busy);
+        let message = trigger.text();
+        let is_auto = matches!(trigger, Trigger::Auto(_));
+        let (resume, cancel, seq, history, opts, pending) = loop {
+            // El mutex se suelta antes de cualquier `await` (el futuro debe ser Send).
+            let prepared = {
+                let mut g = lock(&self.inner);
+                g.seq += 1;
+                let seq = g.seq;
+                let conv = g.map.get_mut(id).ok_or(ChatError::NotFound)?;
+                if let Some(f) = &conv.in_flight {
+                    // El usuario manda: si choca con un turno automático, lo cancela
+                    // y espera a que se libere en vez de devolverle un 409.
+                    if !is_auto && f.auto {
+                        f.cancel.notify_one();
+                        None
+                    } else {
+                        return Err(ChatError::Busy);
+                    }
+                } else {
+                    if !is_auto {
+                        // Un mensaje del usuario abre una nueva cadena de reacciones.
+                        conv.auto_turns = 0;
+                    }
+                    if conv.title.is_empty() && !is_auto {
+                        conv.title = auto_title(message);
+                    }
+                    // Los CLIs sin sesión reciben el historial previo (sin el mensaje actual).
+                    let history = if stateless {
+                        history_block(&conv.messages)
+                    } else {
+                        String::new()
+                    };
+                    conv.push(if is_auto { "sistema" } else { "usuario" }, message);
+                    let cancel = Arc::new(Notify::new());
+                    conv.in_flight = Some(InFlight {
+                        seq,
+                        cancel: cancel.clone(),
+                        auto: is_auto,
+                    });
+                    let resume = if stateless {
+                        None
+                    } else {
+                        conv.session_id.clone()
+                    };
+                    let pending = if delegating {
+                        std::mem::take(&mut conv.pending)
+                    } else {
+                        Vec::new()
+                    };
+                    let opts = ChatOpts {
+                        model: conv.model.clone(),
+                        effort: conv.effort.clone(),
+                    };
+                    Some((resume, cancel, seq, history, opts, pending))
+                }
+            };
+            match prepared {
+                Some(prepared) => break prepared,
+                None => {
+                    if !self.wait_idle(id, std::time::Duration::from_secs(5)).await {
+                        return Err(ChatError::Busy);
+                    }
+                }
             }
-            if conv.title.is_empty() {
-                conv.title = auto_title(message);
-            }
-            // Los CLIs sin sesión reciben el historial previo (sin el mensaje actual).
-            let history = if stateless {
-                history_block(&conv.messages)
-            } else {
-                String::new()
-            };
-            conv.push("usuario", message);
-            let cancel = Arc::new(Notify::new());
-            conv.in_flight = Some(InFlight {
-                seq,
-                cancel: cancel.clone(),
-            });
-            let resume = if stateless {
-                None
-            } else {
-                conv.session_id.clone()
-            };
-            let pending = if delegating {
-                std::mem::take(&mut conv.pending)
-            } else {
-                Vec::new()
-            };
-            let opts = ChatOpts {
-                model: conv.model.clone(),
-                effort: conv.effort.clone(),
-            };
-            (resume, cancel, seq, history, opts, pending)
         };
         let pending_block = match delegator {
             Some(d) if delegating => delegation::render_pending(&pending, d).await,
@@ -1215,20 +1520,28 @@ impl Orchestrator {
             id: id.to_string(),
             seq,
         };
+        let tail = match trigger {
+            Trigger::User(text) => format!("Mensaje del usuario:\n{text}"),
+            Trigger::Auto(text) => format!(
+                "Aviso automático del servidor (no lo escribió el usuario):\n{text}\n\n\
+                 Revisa el resultado y continúa sin esperar al usuario."
+            ),
+        };
         let prompt = if delegating {
             format!(
-                "{}{history}{pending_block}Mensaje del usuario:\n{message}",
+                "{}{history}{pending_block}{tail}",
                 delegation::system_prompt_actions()
             )
         } else if stateless {
-            format!(
-                "{}{history}Mensaje del usuario:\n{message}",
-                system_prompt(port, token)
-            )
+            format!("{}{history}{tail}", system_prompt(port, token, id))
         } else if resume.is_some() {
-            message.to_string()
+            // Hermes conserva la sesión: el aviso va tal cual.
+            match trigger {
+                Trigger::User(text) => text.to_string(),
+                Trigger::Auto(text) => format!("Aviso automático de Forja: {text}"),
+            }
         } else {
-            format!("{}{message}", system_prompt(port, token))
+            format!("{}{}", system_prompt(port, token, id), tail)
         };
         let outcome = tokio::select! {
             r = backend.chat_with(prompt, resume, &opts) => Some(r),
@@ -1249,6 +1562,7 @@ impl Orchestrator {
             }
             (outcome, _) => (outcome, Vec::new()),
         };
+        let mut delegated_runs = Vec::new();
         let mut g = lock(&self.inner);
         let Some(conv) = g.map.get_mut(id) else {
             // Borrada mientras hablaba: no hay dónde guardar nada.
@@ -1258,7 +1572,7 @@ impl Orchestrator {
                 None => Err(ChatError::Cancelled),
             };
         };
-        match outcome {
+        let result = match outcome {
             Some(Ok(reply)) => {
                 if let Some(sid) = reply.session_id {
                     conv.session_id = Some(sid);
@@ -1277,6 +1591,13 @@ impl Orchestrator {
                         &format!("Tareas delegadas: {}", delegated.join(", ")),
                     );
                 }
+                delegated_runs = new_pending
+                    .iter()
+                    .filter_map(|p| match p {
+                        Pending::Task { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 conv.pending = new_pending;
                 Ok(reply.text)
             }
@@ -1287,9 +1608,38 @@ impl Orchestrator {
             }
             None => {
                 conv.pending = pending;
-                conv.push("sistema", "Llamada cancelada con /stop.");
+                conv.push(
+                    "sistema",
+                    if is_auto {
+                        "Turno automático interrumpido por el usuario."
+                    } else {
+                        "Llamada cancelada con /stop."
+                    },
+                );
                 Err(ChatError::Cancelled)
             }
+        };
+        drop(g);
+        // El servidor vigila estas ejecuciones y despierta al orquestador al acabar.
+        if let Some(d) = delegator {
+            for run_id in delegated_runs {
+                d.track_delegation(id, &run_id);
+            }
+        }
+        result
+    }
+}
+
+/// Origen de un turno del orquestador: el usuario o el aviso de fin de tarea.
+enum Trigger<'a> {
+    User(&'a str),
+    Auto(&'a str),
+}
+
+impl Trigger<'_> {
+    fn text(&self) -> &str {
+        match self {
+            Trigger::User(t) | Trigger::Auto(t) => t,
         }
     }
 }
@@ -2023,6 +2373,12 @@ mod tests {
         let calls = fake.0.lock().unwrap();
         assert!(calls[0].0.contains("delegar y revisar"));
         assert!(calls[0].0.contains("Bearer tk"));
+        // Hermes recibe la pista para que el servidor pueda avisarle al acabar.
+        assert!(
+            calls[0].0.contains("conversation_id=principal"),
+            "{}",
+            calls[0].0
+        );
         assert!(calls[0].0.ends_with("hola"));
         assert_eq!(calls[0].1, None);
         assert_eq!(calls[1].0, "sigue");
@@ -2267,6 +2623,522 @@ mod tests {
             orq.say_in_with(PRINCIPAL, msg, 7777, None, Some(state))
                 .await
                 .expect("turno")
+        }
+
+        // ---- reacción automática al terminar una delegación ----
+
+        #[derive(Clone, Copy)]
+        enum ReactionMode {
+            /// Delega en el primer turno; después solo revisa.
+            DelegateFirst,
+            /// Delega en cada llamada hasta `n` (para probar el límite).
+            DelegateUntil(usize),
+            /// Nunca delega.
+            ReplyOnly,
+        }
+
+        struct ReactionFake {
+            calls: Arc<Mutex<Vec<String>>>,
+            mode: ReactionMode,
+        }
+
+        fn delegate_block(titulo: &str) -> String {
+            format!(
+                "Delegando.\n[[forja:delegar {{\"titulo\":\"{titulo}\",\"prompt\":\"p\",\
+                 \"agent\":\"mock\",\"privacidad\":\"open\"}}]]"
+            )
+        }
+
+        impl ChatBackend for ReactionFake {
+            fn chat(&self, prompt: String, resume: Option<String>) -> ChatFuture<'_> {
+                self.chat_with(prompt, resume, &ChatOpts::default())
+            }
+
+            fn chat_with(
+                &self,
+                prompt: String,
+                _resume: Option<String>,
+                _opts: &ChatOpts,
+            ) -> ChatFuture<'_> {
+                let calls = self.calls.clone();
+                let mode = self.mode;
+                Box::pin(async move {
+                    let n = {
+                        let mut calls = calls.lock().unwrap();
+                        calls.push(prompt);
+                        calls.len()
+                    };
+                    let text = match mode {
+                        ReactionMode::ReplyOnly => "Revisado, sin cambios.".to_string(),
+                        ReactionMode::DelegateFirst if n == 1 => delegate_block("Tarea auto"),
+                        ReactionMode::DelegateUntil(limit) if n <= limit => {
+                            delegate_block("Tarea en cadena")
+                        }
+                        _ => "Revisado, sin cambios.".to_string(),
+                    };
+                    Ok(ChatReply {
+                        text,
+                        session_id: None,
+                    })
+                })
+            }
+
+            fn stateless(&self) -> bool {
+                true
+            }
+
+            fn agent_name(&self) -> String {
+                "custom".to_string()
+            }
+        }
+
+        fn reaction_setup(
+            mode: ReactionMode,
+        ) -> (
+            AppState,
+            Orchestrator,
+            Arc<Mutex<Vec<String>>>,
+            TempDir,
+            TempDir,
+        ) {
+            let s = TempDir::new().unwrap();
+            let w = TempDir::new().unwrap();
+            let store = JsonlStore::new(s.path()).unwrap();
+            let sched = Scheduler::new(store, SchedulerConfig::new(w.path())).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let orq = Orchestrator::new(Arc::new(ReactionFake {
+                calls: calls.clone(),
+                mode,
+            }));
+            let state = AppState::new(sched).with_orchestrator(orq.clone());
+            state.ensure_run_watcher();
+            (state, orq, calls, s, w)
+        }
+
+        async fn wait_calls(calls: &Arc<Mutex<Vec<String>>>, n: usize) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                if calls.lock().unwrap().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!(
+                "esperaba {n} llamadas al orquestador; hubo {}",
+                calls.lock().unwrap().len()
+            );
+        }
+
+        #[tokio::test]
+        async fn finished_delegation_wakes_the_orchestrator_without_a_user_message() {
+            let (state, orq, calls, _s, _w) = reaction_setup(ReactionMode::DelegateFirst);
+            let first = state
+                .orchestrator
+                .say_in_with(PRINCIPAL, "hazlo", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            assert_eq!(first, "Delegando.");
+            assert_eq!(state.scheduler.list_runs().await.len(), 1);
+
+            wait_calls(&calls, 2).await;
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(calls[1].contains("Aviso automático"), "{}", calls[1]);
+            assert!(calls[1].contains("Tarea auto"), "{}", calls[1]);
+            assert!(calls[1].contains("estado: done"), "{}", calls[1]);
+
+            let h = orq.get(PRINCIPAL).unwrap().historial;
+            assert!(
+                h.iter()
+                    .any(|m| m.rol == "sistema" && m.texto.contains("Terminaron tareas")),
+                "{h:?}"
+            );
+            assert!(
+                h.iter()
+                    .any(|m| m.rol == "orquestador" && m.texto == "Revisado, sin cambios."),
+                "{h:?}"
+            );
+            // No hay un tercer turno: la cadena termina cuando el agente no delega.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert_eq!(calls.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn run_finished_before_tracking_is_reconciled_without_duplicates() {
+            let (state, _orq, calls, _s, _w) = reaction_setup(ReactionMode::ReplyOnly);
+            let rec = state
+                .submit_task(&crate::CreateTaskRequest {
+                    titulo: "Ya terminada".into(),
+                    prompt: "p".into(),
+                    privacidad: Privacy::Open,
+                    agent: AgentKind::Mock,
+                    modelo: None,
+                    esfuerzo: None,
+                })
+                .await
+                .unwrap();
+            state.scheduler.wait_run(&rec.id).await.unwrap();
+            // El evento terminal ya pasó: registrar ahora debe reconciliar.
+            state.track_delegation(PRINCIPAL, &rec.id);
+            wait_calls(&calls, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(calls.lock().unwrap().len(), 1, "sin duplicados");
+        }
+
+        #[tokio::test]
+        async fn post_tasks_with_conversation_id_notifies_hermes_conversation() {
+            use axum::body::{to_bytes, Body};
+            use axum::http::{header, Method, Request};
+            use tower::ServiceExt;
+
+            let (state, orq, calls, _s, _w) = reaction_setup(ReactionMode::ReplyOnly);
+            let app = crate::build_router(state);
+            let req = Request::builder()
+                .header(header::HOST, "127.0.0.1:7777")
+                .method(Method::POST)
+                .uri(format!("/tasks?conversation_id={PRINCIPAL}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"titulo":"Desde Hermes","prompt":"p","agent":"mock"}).to_string(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+            wait_calls(&calls, 1).await;
+            let calls = calls.lock().unwrap().clone();
+            assert!(calls[0].contains("Aviso automático"), "{}", calls[0]);
+            assert!(calls[0].contains("Desde Hermes"), "{}", calls[0]);
+            assert!(orq
+                .get(PRINCIPAL)
+                .unwrap()
+                .historial
+                .iter()
+                .any(|m| { m.rol == "orquestador" && m.texto == "Revisado, sin cambios." }));
+        }
+
+        #[tokio::test]
+        async fn automatic_turns_are_capped_and_leave_the_result_for_the_user() {
+            let limit = 1 + MAX_AUTO_TURNS;
+            let (state, orq, calls, _s, _w) = reaction_setup(ReactionMode::DelegateUntil(limit));
+            orq.say_in_with(PRINCIPAL, "hazlo", 7777, None, Some(&state))
+                .await
+                .unwrap();
+
+            wait_calls(&calls, limit).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                limit,
+                "no debe haber más turnos automáticos que MAX_AUTO_TURNS"
+            );
+            let h = orq.get(PRINCIPAL).unwrap().historial;
+            assert!(
+                h.iter()
+                    .any(|m| m.rol == "sistema" && m.texto.contains("pausada")),
+                "el límite debe explicarse en el historial: {h:?}"
+            );
+
+            // El siguiente mensaje del usuario sí recibe el resultado pendiente.
+            orq.say_in_with(PRINCIPAL, "¿cómo va?", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            let last = calls.lock().unwrap().last().cloned().unwrap();
+            assert!(last.contains("Tareas delegadas"), "{last}");
+            assert!(last.contains("Tarea en cadena"), "{last}");
+        }
+
+        #[tokio::test]
+        async fn reaction_waits_for_a_busy_user_turn_instead_of_failing() {
+            struct BusyFake(Arc<Mutex<Vec<String>>>);
+            impl ChatBackend for BusyFake {
+                fn chat(&self, prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+                    let calls = self.0.clone();
+                    Box::pin(async move {
+                        calls.lock().unwrap().push(prompt.clone());
+                        // El aviso va primero: el historial también contiene "hazlo".
+                        if prompt.contains("Aviso automático del servidor") {
+                            return Ok(ChatReply {
+                                text: "Revisado tras esperar.".into(),
+                                session_id: None,
+                            });
+                        }
+                        if prompt.contains("mientras") {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            return Ok(ChatReply {
+                                text: "Seguimos hablando.".into(),
+                                session_id: None,
+                            });
+                        }
+                        Ok(ChatReply {
+                            text: delegate_block("Tarea lenta"),
+                            session_id: None,
+                        })
+                    })
+                }
+                fn stateless(&self) -> bool {
+                    true
+                }
+            }
+
+            let s = TempDir::new().unwrap();
+            let w = TempDir::new().unwrap();
+            let store = JsonlStore::new(s.path()).unwrap();
+            let sched = Scheduler::new(store, SchedulerConfig::new(w.path())).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let orq = Orchestrator::new(Arc::new(BusyFake(calls.clone())));
+            let state = AppState::new(sched)
+                .with_agent(Arc::new(
+                    forja_agent::MockAgent::success("ok")
+                        .with_delay(std::time::Duration::from_millis(120)),
+                ))
+                .with_orchestrator(orq.clone());
+            state.ensure_run_watcher();
+
+            orq.say_in_with(PRINCIPAL, "hazlo", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            // Segundo turno del usuario en curso cuando termina la tarea.
+            let o2 = orq.clone();
+            let s2 = state.clone();
+            let user_turn = tokio::spawn(async move {
+                o2.say_in_with(PRINCIPAL, "mientras", 7777, None, Some(&s2))
+                    .await
+            });
+            wait_calls(&calls, 3).await;
+            user_turn.await.unwrap().unwrap();
+            let calls = calls.lock().unwrap().clone();
+            let auto = calls
+                .iter()
+                .position(|p| p.contains("Aviso automático"))
+                .expect("turno automático");
+            assert!(
+                auto >= 2,
+                "la reacción esperó al turno del usuario: {calls:?}"
+            );
+            // No hubo un error de conversación ocupada.
+            assert!(
+                orq.get(PRINCIPAL)
+                    .unwrap()
+                    .historial
+                    .iter()
+                    .any(|m| m.texto == "Revisado tras esperar."),
+                "el turno automático debía completarse"
+            );
+        }
+
+        #[tokio::test]
+        async fn user_message_cancels_an_in_flight_automatic_turn() {
+            struct InterruptFake(Arc<Mutex<Vec<String>>>);
+            impl ChatBackend for InterruptFake {
+                fn chat(&self, prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+                    let calls = self.0.clone();
+                    Box::pin(async move {
+                        calls.lock().unwrap().push(prompt.clone());
+                        if prompt.contains("Aviso automático del servidor") {
+                            // Turno automático lento: el usuario llegará antes.
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            return Ok(ChatReply {
+                                text: "Revisión automática tardía.".into(),
+                                session_id: None,
+                            });
+                        }
+                        if prompt.contains("usuario pregunta") {
+                            return Ok(ChatReply {
+                                text: "Respuesta al usuario.".into(),
+                                session_id: None,
+                            });
+                        }
+                        Ok(ChatReply {
+                            text: delegate_block("Tarea rápida"),
+                            session_id: None,
+                        })
+                    })
+                }
+                fn stateless(&self) -> bool {
+                    true
+                }
+            }
+
+            let s = TempDir::new().unwrap();
+            let w = TempDir::new().unwrap();
+            let store = JsonlStore::new(s.path()).unwrap();
+            let sched = Scheduler::new(store, SchedulerConfig::new(w.path())).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let orq = Orchestrator::new(Arc::new(InterruptFake(calls.clone())));
+            let state = AppState::new(sched).with_orchestrator(orq.clone());
+            state.ensure_run_watcher();
+
+            orq.say_in_with(PRINCIPAL, "hazlo", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            wait_calls(&calls, 2).await;
+
+            // El usuario escribe mientras el turno automático está en vuelo.
+            let reply = orq
+                .say_in_with(PRINCIPAL, "usuario pregunta", 7777, None, Some(&state))
+                .await
+                .unwrap();
+            assert_eq!(reply, "Respuesta al usuario.");
+            let h = orq.get(PRINCIPAL).unwrap().historial;
+            assert!(
+                h.iter().any(|m| m
+                    .texto
+                    .contains("Turno automático interrumpido por el usuario")),
+                "{h:?}"
+            );
+            assert!(!h.iter().any(|m| m.texto == "Revisión automática tardía."));
+        }
+
+        #[tokio::test]
+        async fn reaction_bookkeeping_is_idempotent() {
+            let orq = Orchestrator::new(Arc::new(ReactionFake {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                mode: ReactionMode::ReplyOnly,
+            }));
+            assert!(!orq.track_delegation("nope", "r0"));
+            assert!(orq.track_delegation(PRINCIPAL, "r1"));
+            assert_eq!(orq.note_run_finished("r1").as_deref(), Some(PRINCIPAL));
+            // El evento del planificador y la reconciliación no duplican.
+            assert_eq!(orq.note_run_finished("r1"), None);
+            assert_eq!(orq.note_run_finished("r2"), None);
+            assert!(orq.try_schedule_reaction(PRINCIPAL));
+            assert!(
+                !orq.try_schedule_reaction(PRINCIPAL),
+                "solo una reacción por conversación"
+            );
+            assert_eq!(orq.take_reaction_batch(PRINCIPAL), vec!["r1".to_string()]);
+            orq.release_reaction(PRINCIPAL);
+            assert!(!orq.has_pending_reaction(PRINCIPAL));
+            // Un turno reservado que no llega a ejecutarse no gasta el límite.
+            for _ in 0..MAX_AUTO_TURNS {
+                assert!(orq.begin_auto_turn(PRINCIPAL));
+            }
+            assert!(!orq.begin_auto_turn(PRINCIPAL));
+            orq.abort_auto_turn(PRINCIPAL);
+            assert!(orq.begin_auto_turn(PRINCIPAL));
+        }
+
+        #[tokio::test]
+        async fn deferring_keeps_results_that_arrive_meanwhile() {
+            let orq = Orchestrator::new(Arc::new(ReactionFake {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                mode: ReactionMode::ReplyOnly,
+            }));
+            assert!(orq.track_delegation(PRINCIPAL, "r1"));
+            assert_eq!(orq.note_run_finished("r1").as_deref(), Some(PRINCIPAL));
+            // El reactor ya tomó el primer lote y va a aplazarlo.
+            let batch = orq.take_reaction_batch(PRINCIPAL);
+            assert_eq!(batch, vec!["r1".to_string()]);
+
+            // Mientras prepara el aplazamiento termina otra tarea delegada.
+            assert!(orq.track_delegation(PRINCIPAL, "r2"));
+            assert_eq!(orq.note_run_finished("r2").as_deref(), Some(PRINCIPAL));
+            orq.defer_reaction(PRINCIPAL, &[("r1".to_string(), "Uno".to_string())]);
+
+            // El nuevo resultado sigue pendiente y disparará otra reacción.
+            assert_eq!(
+                orq.take_reaction_batch(PRINCIPAL),
+                vec!["r2".to_string()],
+                "un resultado que llega durante el aplazamiento no se pierde"
+            );
+            assert!(
+                !orq.has_pending_reaction(PRINCIPAL),
+                "el resultado ya aplazado no debe relanzar la reacción"
+            );
+            let h = orq.get(PRINCIPAL).unwrap().historial;
+            assert!(h.iter().any(|m| m.texto.contains("pausada")), "{h:?}");
+        }
+
+        #[tokio::test]
+        async fn deferring_without_taking_first_does_not_reschedule_forever() {
+            let orq = Orchestrator::new(Arc::new(ReactionFake {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                mode: ReactionMode::ReplyOnly,
+            }));
+            assert!(orq.track_delegation(PRINCIPAL, "r1"));
+            assert_eq!(orq.note_run_finished("r1").as_deref(), Some(PRINCIPAL));
+            // Al agotarse el límite, el lote diferido sigue en `finished` hasta
+            // que `defer_reaction` lo retira; si no, el reactor lo vería otra vez
+            // y se reprogramaría en bucle.
+            orq.defer_reaction(PRINCIPAL, &[("r1".to_string(), "Uno".to_string())]);
+            assert!(!orq.has_pending_reaction(PRINCIPAL));
+        }
+
+        #[tokio::test]
+        async fn non_delegated_runs_do_not_wake_the_orchestrator() {
+            let (state, _orq, calls, _s, _w) = reaction_setup(ReactionMode::ReplyOnly);
+            let rec = state
+                .submit_task(&crate::CreateTaskRequest {
+                    titulo: "Tarea suelta".into(),
+                    prompt: "p".into(),
+                    privacidad: Privacy::Open,
+                    agent: AgentKind::Mock,
+                    modelo: None,
+                    esfuerzo: None,
+                })
+                .await
+                .unwrap();
+            state.scheduler.wait_run(&rec.id).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "solo las ejecuciones delegadas despiertan al orquestador"
+            );
+        }
+
+        #[tokio::test]
+        async fn wait_idle_times_out_while_busy_and_wakes_when_free() {
+            struct SlowFake;
+            impl ChatBackend for SlowFake {
+                fn chat(&self, _prompt: String, _resume: Option<String>) -> ChatFuture<'_> {
+                    Box::pin(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        Ok(ChatReply {
+                            text: "listo".into(),
+                            session_id: None,
+                        })
+                    })
+                }
+            }
+
+            let orq = Orchestrator::new(Arc::new(SlowFake));
+            assert!(
+                !orq.wait_idle("no-existe", std::time::Duration::from_millis(5))
+                    .await
+            );
+
+            let o = orq.clone();
+            let turn =
+                tokio::spawn(
+                    async move { o.say_in_with(PRINCIPAL, "hola", 7777, None, None).await },
+                );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while lock(&orq.inner)
+                .map
+                .get(PRINCIPAL)
+                .unwrap()
+                .in_flight
+                .is_none()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "el turno no llegó a empezar"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            assert!(
+                !orq.wait_idle(PRINCIPAL, std::time::Duration::from_millis(20))
+                    .await,
+                "mientras hay un turno en curso debe agotarse el plazo"
+            );
+            assert!(
+                orq.wait_idle(PRINCIPAL, std::time::Duration::from_secs(2))
+                    .await,
+                "al liberarse la conversación debe despertar sin esperar el plazo"
+            );
+            turn.await.unwrap().unwrap();
         }
 
         #[tokio::test]
