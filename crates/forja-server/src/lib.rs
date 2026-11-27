@@ -1,4 +1,5 @@
 pub mod api;
+pub mod conversation_store;
 pub mod delegation;
 pub mod models;
 pub mod orchestrator;
@@ -98,6 +99,10 @@ impl AppState {
             hidden_profiles: Vec::new(),
         };
 
+        let conversations_path = scheduler
+            .store_dir()
+            .join(conversation_store::CONVERSATIONS_FILE);
+
         Self {
             scheduler,
             agents: Arc::new(agents),
@@ -108,7 +113,8 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             settings_path: None,
             auth_token: None,
-            orchestrator: orchestrator::Orchestrator::from_env(),
+            orchestrator: orchestrator::Orchestrator::from_env()
+                .with_persistence(conversations_path),
             profile_rules,
             review_lock: Arc::new(tokio::sync::Mutex::new(())),
             watcher_started: Arc::new(AtomicBool::new(false)),
