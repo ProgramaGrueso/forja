@@ -2,10 +2,11 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 
 use crate::api;
+use crate::files;
 use crate::handlers::{
     cancel_run, create_task, events_handler, get_run, list_runs, mascot_handler, panel_handler,
     run_output, run_stream, ErrorBody,
@@ -14,6 +15,7 @@ use crate::orchestrator;
 use crate::review;
 use crate::security;
 use crate::state::AppState;
+use crate::workspaces;
 
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
@@ -54,6 +56,16 @@ pub(crate) fn build_router_for_port(state: AppState, port: u16) -> Router {
         .route(
             "/api/settings",
             get(api::get_settings).put(api::put_settings),
+        )
+        .route("/api/workspaces", get(workspaces::get_workspaces))
+        .route("/api/workspaces/select", post(workspaces::select_workspace))
+        .route("/api/workspaces/browse", get(workspaces::browse_workspaces))
+        .route("/api/files/tree", get(files::get_tree))
+        .route("/api/files/read", get(files::read_file))
+        .route("/api/files/search", get(files::search_files))
+        .route(
+            "/api/files/write",
+            put(files::write_file).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

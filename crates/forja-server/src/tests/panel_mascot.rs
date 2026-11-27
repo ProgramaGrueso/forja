@@ -197,6 +197,16 @@ async fn panel_views_modal_filters_and_settings_present() {
         "drawer-review-retry",
         "reviewAction",
         "/diff",
+        "view-archivos",
+        "workspace-bar",
+        "workspace-modal",
+        "files-tree",
+        "files-tabs",
+        "files-editor",
+        "/api/workspaces",
+        "/api/files/tree",
+        "/api/files/read",
+        "/api/files/write",
     ] {
         assert!(html.contains(id), "falta elemento #{id} en panel.html");
     }
@@ -251,6 +261,7 @@ async fn panel_assembled_html_includes_sections_css_and_js_in_order() {
             ".toast-banner {",  // css/ajustes.css
             ".orq-wrap {",      // css/orquestador.css
             ".term-grid {",     // css/terminales.css
+            ".ide-shell {",     // css/archivos.css
         ],
         "CSS ensamblado",
     );
@@ -268,6 +279,7 @@ async fn panel_assembled_html_includes_sections_css_and_js_in_order() {
             "id=\"view-telemetria\"",
             "id=\"view-cuotas\"",
             "id=\"view-ajustes\"",
+            "id=\"view-archivos\"",
         ],
         "secciones HTML",
     );
@@ -288,6 +300,7 @@ async fn panel_assembled_html_includes_sections_css_and_js_in_order() {
             "function fillSettingsForm(",  // js/ajustes.js
             "(function orquestador()",     // js/orquestador.js
             "(function terminales()",      // js/terminales.js
+            "(function archivosIde()",     // js/archivos.js
             "bootPanel();",                // inicialización final
         ],
         "JS ensamblado",

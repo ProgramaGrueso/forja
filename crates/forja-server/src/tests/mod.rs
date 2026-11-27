@@ -1,4 +1,5 @@
 mod auth_security;
+mod files_workspaces;
 mod panel_mascot;
 mod review;
 mod stream_output;

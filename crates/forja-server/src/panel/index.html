@@ -31,6 +31,19 @@
         </button>
       </div>
 
+      <div id="workspace-bar" class="workspace-bar" title="Carpeta activa del proyecto">
+        <div class="ws-info">
+          <svg class="ws-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
+          </svg>
+          <div class="ws-text">
+            <div id="ws-name" class="ws-name">Cargando…</div>
+            <span id="ws-branch" class="ws-branch">sin git</span>
+          </div>
+        </div>
+        <button id="btn-open-workspace" class="btn ws-change-btn" type="button" title="Cambiar carpeta de trabajo">Cambiar</button>
+      </div>
+
       <div class="sidebar-tabs" role="tablist" aria-label="Modo de lista lateral">
         <button id="side-tab-runs" class="sidebar-tab active" role="tab" aria-selected="true" data-side-tab="runs">EJECUCIONES</button>
         <button id="side-tab-agents" class="sidebar-tab" role="tab" aria-selected="false" data-side-tab="agents">AGENTES</button>
@@ -44,6 +57,10 @@
         <button class="nav-item" data-view="orquestador">
           <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
           <span class="nav-label">Orquestador</span>
+        </button>
+        <button class="nav-item" data-view="archivos">
+          <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+          <span class="nav-label">Archivos</span>
         </button>
         <button class="nav-item" data-view="ejecuciones">
           <svg class="nav-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
@@ -440,6 +457,49 @@
             </form>
           </div>
         </section>
+
+        <!-- VISTA 7: ARCHIVOS (MODO IDE) -->
+        <section id="view-archivos" class="view-pane" aria-label="Vista Archivos">
+          <div class="ide-shell">
+            <aside class="ide-sidebar" aria-label="Explorador de archivos">
+              <div class="ide-side-controls">
+                <select id="files-source" class="select" aria-label="Origen de archivos">
+                  <option value="">Proyecto base</option>
+                </select>
+                <div class="ide-search-row">
+                  <input id="files-search" class="input" type="search" placeholder="Filtrar archivos…" aria-label="Filtrar archivos" autocomplete="off">
+                  <button id="files-refresh" class="icon-btn" type="button" title="Recargar árbol" aria-label="Recargar árbol">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div id="files-tree" class="ide-tree" role="tree" aria-label="Árbol de archivos"></div>
+            </aside>
+
+            <div class="ide-main">
+              <div id="files-tabs" class="ide-tabs" role="tablist" aria-label="Archivos abiertos"></div>
+              <div class="ide-toolbar">
+                <div class="ide-toolbar-left">
+                  <span id="files-active-path" class="ide-active-path mono">Sin archivo</span>
+                  <span id="files-lang" class="ide-badge mono" style="display:none;"></span>
+                  <span id="files-ro-badge" class="ide-badge ide-badge-ro" style="display:none;">Solo lectura</span>
+                </div>
+                <div class="ide-toolbar-right">
+                  <span id="files-save-status" class="ide-save-status" role="status" aria-live="polite"></span>
+                  <button id="files-cite-btn" class="btn" type="button" disabled title="Insertar referencia en el Orquestador">Citar en Orquestador</button>
+                  <button id="files-save-btn" class="btn btn-primary" type="button" disabled title="Guardar archivo (Ctrl+S)">Guardar</button>
+                </div>
+              </div>
+              <div class="ide-editor-wrap">
+                <div id="files-empty" class="ide-empty">Selecciona un archivo del árbol para abrirlo</div>
+                <div id="files-editor-box" class="ide-editor-box" style="display:none;">
+                  <pre id="files-gutter" class="ide-gutter" aria-hidden="true">1</pre>
+                  <textarea id="files-editor" class="ide-editor" spellcheck="false" wrap="off" aria-label="Editor de código"></textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </main>
 
@@ -559,6 +619,38 @@
           <button class="btn btn-primary" type="submit">Encolar ejecución</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- MODAL CAMBIAR CARPETA DE TRABAJO -->
+  <div id="workspace-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Cambiar carpeta de trabajo">
+    <div class="modal-card ws-modal-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h2 style="font-size:15px;font-weight:700;">Cambiar carpeta de trabajo</h2>
+        <button id="ws-modal-close" class="icon-btn" type="button" aria-label="Cerrar modal">✕</button>
+      </div>
+      <div class="form-field">
+        <label for="ws-path-input">Ruta directa</label>
+        <div class="ws-path-row">
+          <input id="ws-path-input" class="input mono" type="text" placeholder="/ruta/al/proyecto" autocomplete="off">
+          <button id="ws-open-path-btn" class="btn btn-primary" type="button">Abrir</button>
+        </div>
+      </div>
+      <div class="ws-section">
+        <div class="ws-section-label">Carpetas recientes</div>
+        <div id="ws-recent-list" class="ws-list"></div>
+      </div>
+      <div class="ws-section">
+        <div class="ws-browse-head">
+          <div id="ws-browse-current" class="ws-browse-current mono">—</div>
+          <div class="ws-browse-actions">
+            <button id="ws-browse-up" class="btn" type="button">↑ Subir</button>
+            <button id="ws-select-current" class="btn btn-primary" type="button">Usar esta carpeta</button>
+          </div>
+        </div>
+        <div id="ws-browse-list" class="ws-list ws-browse-list"></div>
+      </div>
+      <div id="ws-error" class="toast-banner err" role="alert"></div>
     </div>
   </div>
 

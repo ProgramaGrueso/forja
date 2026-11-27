@@ -50,9 +50,11 @@
       const termApi = { onRuns() {}, open() { return false; } };
       const orqHooks = { refresh() {} };
       const orqApi = { reload() {} };
+      const filesApi = { onWorkspaceChanged: null, onRuns: null, onViewActive: null };
 
       const VIEW_META = {
         orquestador: ["Orquestador", "Conversa por texto o por voz; delega en los agentes y revisa sus resultados"],
+        archivos: ["Archivos", "Explorador de archivos, pestañas y editor local del proyecto"],
         resumen: ["Resumen", "Estado general del orquestador y actividad en las últimas 24 h"],
         ejecuciones: ["Ejecuciones", "Cola en vivo conectada por Server-Sent Events (/events)"],
         terminales: ["Terminales", "Salida en vivo de varias ejecuciones a la vez"],
@@ -132,6 +134,9 @@
         $("sidebar-backdrop").classList.remove("open");
         if (updateHash && window.location.hash !== `#${view}`) {
           history.replaceState(null, "", `#${view}`);
+        }
+        if (view === "archivos" && filesApi.onViewActive) {
+          filesApi.onViewActive();
         }
       }
 
@@ -369,6 +374,7 @@
         renderDrawer();
         renderMascot();
         termApi.onRuns();
+        if (filesApi.onRuns) filesApi.onRuns(state.runs);
       }
 
       async function refreshCore() {
@@ -411,6 +417,7 @@
           updateModalEffortField();
           orqHooks.refresh();
           termApi.onRuns();
+          if (filesApi.onRuns) filesApi.onRuns(state.runs);
         } catch (_) {
           $("conn-dot").className = "dot error";
           $("conn-text").textContent = "Sin conexión";

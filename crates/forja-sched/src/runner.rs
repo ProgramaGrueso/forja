@@ -12,11 +12,17 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
     let _permit = inner.limiter.acquire().await;
 
     let wt_path = inner.config.worktrees_dir.join(&run_id);
-    let branch = inner
-        .config
+    let repo_path = inner
         .repo_path
-        .as_ref()
-        .map(|_| format!("forja/{run_id}"));
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let base_branch = inner
+        .base_branch
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let branch = repo_path.as_ref().map(|_| format!("forja/{run_id}"));
 
     let task = {
         let _store_guard = inner.store_lock.lock().await;
@@ -40,8 +46,17 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
         maybe_record.task
     };
 
-    let execution_result =
-        execute_with_retries(&inner, &run_id, &task, &agent, &wt_path, branch.as_deref()).await;
+    let execution_result = execute_with_retries(
+        &inner,
+        &run_id,
+        &task,
+        &agent,
+        &wt_path,
+        repo_path.as_deref(),
+        &base_branch,
+        branch.as_deref(),
+    )
+    .await;
 
     {
         let _store_guard = inner.store_lock.lock().await;
@@ -79,18 +94,21 @@ pub(crate) async fn run_task(inner: Arc<SchedulerInner>, run_id: String, agent: 
     handles.remove(&run_id);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_with_retries(
     inner: &SchedulerInner,
     run_id: &str,
     task: &Task,
     agent: &Arc<dyn Agent>,
     wt_path: &Path,
+    repo_path: Option<&Path>,
+    base_branch: &str,
     branch: Option<&str>,
 ) -> Result<String> {
     prepare_worktree(
-        inner.config.repo_path.as_deref(),
+        repo_path,
         &inner.config.worktrees_dir,
-        &inner.config.base_branch,
+        base_branch,
         &inner.git_lock,
         wt_path,
         branch,
@@ -186,7 +204,7 @@ async fn execute_with_retries(
         }
     };
 
-    if inner.config.repo_path.is_some() {
+    if repo_path.is_some() {
         commit_worktree_changes(wt_path, &task.titulo).await?;
     }
 

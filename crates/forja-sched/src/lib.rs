@@ -30,6 +30,8 @@ use runner::run_task;
 
 pub(crate) struct SchedulerInner {
     pub(crate) config: SchedulerConfig,
+    pub(crate) repo_path: std::sync::RwLock<Option<PathBuf>>,
+    pub(crate) base_branch: std::sync::RwLock<String>,
     pub(crate) store: JsonlStore,
     pub(crate) limiter: Arc<ConcurrencyLimiter>,
     pub(crate) sensitive_agents: std::sync::RwLock<Vec<AgentKind>>,
@@ -82,12 +84,16 @@ impl Scheduler {
         }
 
         let limiter = ConcurrencyLimiter::new(config.max_concurrency);
+        let repo_path = std::sync::RwLock::new(config.repo_path.clone());
+        let base_branch = std::sync::RwLock::new(config.base_branch.clone());
         let sensitive_agents = std::sync::RwLock::new(config.sensitive_agents.clone());
         let (events, _) = broadcast::channel(128);
 
         Ok(Self {
             inner: Arc::new(SchedulerInner {
                 config,
+                repo_path,
+                base_branch,
                 store,
                 limiter,
                 sensitive_agents,
@@ -109,12 +115,55 @@ impl Scheduler {
 
     /// Repositorio git configurado para los worktrees (`None` sin `--repo`).
     pub fn repo_path(&self) -> Option<PathBuf> {
-        self.inner.config.repo_path.clone()
+        self.inner
+            .repo_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Rama base sobre la que se crean y fusionan las ramas de tarea.
     pub fn base_branch(&self) -> String {
-        self.inner.config.base_branch.clone()
+        self.inner
+            .base_branch
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Indica si existe alguna ejecución pendiente o en curso.
+    pub async fn has_active_runs(&self) -> bool {
+        let runs = self.inner.runs.read().await;
+        runs.values()
+            .any(|r| matches!(r.status, RunStatus::Pending | RunStatus::Running))
+    }
+
+    /// Actualiza el repositorio git y la rama base activos si no hay ejecuciones activas.
+    pub async fn set_workspace(
+        &self,
+        repo_path: Option<PathBuf>,
+        base_branch: String,
+    ) -> Result<()> {
+        let runs = self.inner.runs.read().await;
+        if runs
+            .values()
+            .any(|r| matches!(r.status, RunStatus::Pending | RunStatus::Running))
+        {
+            return Err(ForjaError::InvalidInput(
+                "no se puede cambiar de carpeta mientras hay ejecuciones activas".to_string(),
+            ));
+        }
+        *self
+            .inner
+            .repo_path
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = repo_path;
+        *self
+            .inner
+            .base_branch
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = base_branch;
+        Ok(())
     }
 
     /// Carpeta donde viven los worktrees de las ejecuciones.

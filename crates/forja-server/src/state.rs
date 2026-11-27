@@ -18,6 +18,7 @@ use crate::orchestrator;
 use crate::quota::{default_manual_path, QuotaService};
 use crate::settings::Settings;
 use crate::telemetry::Telemetry;
+use crate::workspaces;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +30,7 @@ pub struct AppState {
     pub models: Arc<ModelService>,
     pub settings: Arc<RwLock<Settings>>,
     pub settings_path: Option<PathBuf>,
+    pub workspaces: workspaces::WorkspaceService,
     pub auth_token: Option<String>,
     pub orchestrator: orchestrator::Orchestrator,
     /// Reglas de perfiles de Hermes (descubrimiento y ocultos) del agente y de /api/models.
@@ -82,6 +84,14 @@ impl AppState {
             .store_dir()
             .join(conversation_store::CONVERSATIONS_FILE);
 
+        let initial_workspace = scheduler
+            .repo_path()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let workspaces = workspaces::WorkspaceService::new(
+            initial_workspace,
+            workspaces::default_workspaces_path(),
+        );
+
         Self {
             scheduler,
             agents: Arc::new(agents),
@@ -91,6 +101,7 @@ impl AppState {
             models: Arc::new(ModelService::with_defaults()),
             settings: Arc::new(RwLock::new(settings)),
             settings_path: None,
+            workspaces,
             auth_token: None,
             orchestrator: orchestrator::Orchestrator::from_env()
                 .with_persistence(conversations_path),
@@ -176,6 +187,12 @@ impl AppState {
 
     pub fn with_settings_path(mut self, path: PathBuf) -> Self {
         self.settings_path = Some(path);
+        self
+    }
+
+    pub fn with_workspaces_path(mut self, path: PathBuf) -> Self {
+        let root = self.workspaces.active_root();
+        self.workspaces = workspaces::WorkspaceService::new(root, path);
         self
     }
 

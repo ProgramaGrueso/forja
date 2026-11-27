@@ -15,6 +15,7 @@ const CSS_FILES: &[&str] = &[
     "ajustes.css",
     "orquestador.css",
     "terminales.css",
+    "archivos.css",
 ];
 
 const JS_FILES: &[&str] = &[
@@ -27,6 +28,7 @@ const JS_FILES: &[&str] = &[
     "ajustes.js",
     "orquestador.js",
     "terminales.js",
+    "archivos.js",
 ];
 
 fn read_part(path: &str) -> String {

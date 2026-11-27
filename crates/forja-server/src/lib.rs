@@ -1,6 +1,7 @@
 pub mod api;
 pub mod conversation_store;
 pub mod delegation;
+pub mod files;
 pub mod models;
 pub mod orchestrator;
 pub mod quota;
@@ -9,6 +10,7 @@ pub mod review;
 mod security;
 pub mod settings;
 pub mod telemetry;
+pub mod workspaces;
 
 mod handlers;
 mod router;
